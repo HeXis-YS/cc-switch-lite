@@ -94,6 +94,7 @@ impl Editor {
             name: self.fields[1].value.clone(),
             base_url: self.fields[2].value.clone(),
             api_key: self.fields[3].value.clone(),
+            compat: Default::default(),
             protocol: match self.protocol {
                 0 => Protocol::Responses,
                 1 => Protocol::ChatCompletions,
@@ -108,6 +109,8 @@ impl Editor {
             if next.route.provider == next.providers[i].id {
                 next.route.provider = provider.id.clone();
             }
+            let mut provider = provider;
+            provider.compat = next.providers[i].compat.clone();
             next.providers[i] = provider;
         } else {
             if next.providers.is_empty() {
@@ -145,6 +148,7 @@ pub fn run(path: &Path) -> Result<()> {
     } else {
         Config {
             version: 1,
+            compat: Default::default(),
             server: Server {
                 listen: "0.0.0.0:15721".parse()?,
             },
@@ -352,8 +356,9 @@ mod tests {
     use super::*;
     #[test]
     fn editing_current_provider_renames_route_without_mutating_original() {
-        let config = Config {
+        let mut config = Config {
             version: 1,
+            compat: Default::default(),
             server: Server {
                 listen: "127.0.0.1:15721".parse().unwrap(),
             },
@@ -366,8 +371,12 @@ mod tests {
                 protocol: Protocol::Responses,
                 base_url: "https://example.com/v1".into(),
                 api_key: "secret".into(),
+                compat: Default::default(),
             }],
         };
+        config.providers[0].compat.meta.max_output_tokens = Some(16384);
+        config.providers[0].compat.settings_config = serde_json::json!({"modelCatalog":{"models":[{"model":"example","modalities":{"input":["text"]}}]}});
+        config.compat.optimizer.cache_injection = false;
         let mut editor = Editor::new(Some((0, &config.providers[0])));
         editor.fields[0] = TextInput::new("new");
         let next = editor.apply(&config);
@@ -375,5 +384,11 @@ mod tests {
         assert_eq!(next.providers[0].id, "new");
         assert_eq!(config.route.provider, "old");
         assert_eq!(next.providers[0].api_key, "secret");
+        assert_eq!(next.providers[0].compat.meta.max_output_tokens, Some(16384));
+        assert_eq!(
+            next.providers[0].compat.settings_config,
+            config.providers[0].compat.settings_config
+        );
+        assert!(!next.compat.optimizer.cache_injection);
     }
 }

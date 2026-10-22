@@ -4,6 +4,7 @@ use std::fs;
 fn valid_config() -> Config {
     Config {
         version: 1,
+        compat: Default::default(),
         server: Server {
             listen: "127.0.0.1:15721".parse().unwrap(),
         },
@@ -16,6 +17,7 @@ fn valid_config() -> Config {
             protocol: Protocol::Responses,
             base_url: "https://example.com/v1".into(),
             api_key: "test-private-key".into(),
+            compat: Default::default(),
         }],
     }
 }
@@ -157,4 +159,60 @@ fn invalid_route_prevents_server_startup() {
         String::from_utf8_lossy(&output.stderr).contains("Current route provider does not exist")
     );
     assert!(!String::from_utf8_lossy(&output.stderr).contains("test-private-key"));
+}
+
+#[test]
+fn compatibility_roundtrip_defaults_and_restricted_fields() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("compat.toml");
+    let mut config = valid_config();
+    config.providers[0].compat.meta.max_output_tokens = Some(16384);
+    config.providers[0].compat.meta.prompt_cache_routing = Some("enabled".into());
+    config.providers[0].compat.settings_config = serde_json::json!({"modelCatalog":{"models":[{"model":"example","reasoningLevels":["high"]}]}});
+    config.compat.rectifier.request_media_heuristic = false;
+    config.compat.optimizer.cache_injection = false;
+    config.save(&path).unwrap();
+    let restored = Config::load(&path).unwrap();
+    assert_eq!(
+        restored.providers[0].compat.meta.max_output_tokens,
+        Some(16384)
+    );
+    assert_eq!(
+        restored.providers[0].compat.settings_config,
+        config.providers[0].compat.settings_config
+    );
+    assert!(!restored.compat.rectifier.request_media_heuristic);
+    assert!(!restored.compat.optimizer.cache_injection);
+    config.providers[0].compat.settings_config =
+        serde_json::json!({"base_url":"https://second.example"});
+    assert!(config.validate().is_err());
+    config.providers[0].compat.settings_config = serde_json::json!({});
+    config.compat.transport.streaming_idle_timeout = 120;
+    assert!(config.validate().is_err());
+}
+
+#[test]
+fn compatibility_fields_reject_unknown_and_authentication_override() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("compat.toml");
+    let baseline = toml::to_string(&valid_config()).unwrap();
+    std::fs::write(
+        &path,
+        format!("{baseline}\n[providers.compat.meta.unknown]\nvalue=true\n"),
+    )
+    .unwrap();
+    assert!(Config::load(&path).is_err());
+    let mut config = valid_config();
+    config.providers[0]
+        .compat
+        .meta
+        .local_proxy_request_overrides =
+        Some(cc_switch_lite::provider::LocalProxyRequestOverrides {
+            headers: std::collections::HashMap::from([(
+                "authorization".into(),
+                "Bearer secret".into(),
+            )]),
+            body: None,
+        });
+    assert!(config.validate().is_err());
 }

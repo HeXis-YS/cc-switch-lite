@@ -85,6 +85,7 @@ def main():
             assert content["providers"][0] == {
                 "id": "smoke", "name": "Smoke Provider", "protocol": "responses",
                 "base_url": "https://example.com/v1", "api_key": secret.decode(),
+                "compat": {"meta": {}, "settings_config": {}},
             }, "Saved provider differs from input"
             assert config.stat().st_mode & 0o777 == 0o600, "Configuration permissions not private"
             os.write(master, b"q")

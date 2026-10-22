@@ -18,17 +18,22 @@ install -m 600 config.example.toml config.toml
 ./target/release/cc-switch-lite tui --config config.toml
 ```
 
-配置结构见 [config.example.toml](config.example.toml)。`base_url` 是 API 前缀（通常以 `/v1` 结尾），
-程序分别追加 `/responses`、`/chat/completions` 或 `/messages`。保留请求中的 `model`，不映射模型。
+配置结构见 [config.example.toml](config.example.toml)，可选兼容字段和固定参考版本的差异清单见
+[请求兼容清单](docs/request-compatibility.md) 与 [行为清单](docs/compatibility.md)。`base_url` 是 API 前缀；
+程序按所选协议构造 `/responses`、`/chat/completions` 或 `/v1/messages`，并处理已带版本号的前缀。
+不实现聚合模型路由或用户自定义模型映射；协议兼容分支仍可能按原版语义处理模型标记。
 配置版本必须为 1；Provider ID 唯一；当前路由必须存在；未知字段和无效凭据拒绝启动。
 TOML 错误不会打印可能包含密钥的源码行。程序保存配置时在同目录创建临时文件、同步后原子替换，Unix 权限为 `0600`。
 
 代理不提供入口鉴权，仅部署于可信内网或由外部网络层限制访问。默认示例监听 `0.0.0.0:15721`。
 客户端自行配置 Responses endpoint 指向代理的 `/v1`，本程序不写入客户端配置。
 仅向所选 Provider 注入该 Provider 凭据，不转发客户端认证头，禁用 HTTP 重定向与故障转移。
-上游非成功状态保留 HTTP 状态（重定向变为 502），JSON 错误脱敏后转换为 Responses 风格错误；非 JSON 错误返回固定消息。
-上游正文中的已配置 API Key 会脱敏；因此 Responses 在不含密钥时保持正文透传。
-JSON 响应上限 32 MiB；请求使用 Axum 默认 2 MiB 限制；SSE 按流传输；连接超时 15 秒、上游读空闲超时 120 秒。
+上游非成功状态保留上游 HTTP 状态；重定向不自动跟随，也不向客户端复制 `Location`。
+JSON 错误脱敏后转换为 Responses 风格错误，保留上游错误类型和代码；非 JSON 诊断只进入脱敏后的错误消息。
+上游响应中的已配置 API Key 会脱敏；普通原生 Responses 正文按原版条件透传，协议修复分支可能改写响应。
+请求体上限为 200 MiB；缓冲响应正文上限为 128 MiB，SSE 按流处理。故障转移关闭时沿用原版行为，不启用
+额外连接或响应空闲超时；流式请求保留 600 秒响应头等待上限和 24 小时总时限，
+加密任务流识别仍有独立的有限预读窗口。
 
 ## TUI
 

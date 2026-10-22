@@ -57,6 +57,7 @@ async fn start(router: Router) -> (String, tokio::task::JoinHandle<()>) {
 fn config(url: &str, protocol: Protocol) -> Config {
     Config {
         version: 1,
+        compat: Default::default(),
         server: Server {
             listen: "127.0.0.1:0".parse().unwrap(),
         },
@@ -69,6 +70,7 @@ fn config(url: &str, protocol: Protocol) -> Config {
             protocol,
             base_url: format!("{url}/v1"),
             api_key: "secret-credential-123".into(),
+            compat: Default::default(),
         }],
     }
 }
@@ -204,14 +206,10 @@ async fn errors_do_not_expose_upstream_credentials_or_redirect() {
             let (url, _, tasks) =
                 setup(protocol, "secret-credential-123".into(), false, status).await;
             let response = send(&url, json!({"model":"same","input":"hello"})).await;
-            assert_eq!(
-                response.status(),
-                if status.is_redirection() {
-                    StatusCode::BAD_GATEWAY
-                } else {
-                    status
-                }
-            );
+            assert_eq!(response.status(), status);
+            if status.is_redirection() {
+                assert!(!response.headers().contains_key("location"));
+            }
             assert!(!response
                 .text()
                 .await
@@ -270,7 +268,10 @@ async fn structured_upstream_errors_keep_type_code_and_scrub_secrets() {
         let value: Value = response.json().await.unwrap();
         assert_eq!(value["error"]["type"], "authentication_error");
         assert_eq!(value["error"]["code"], "invalid_key");
-        assert_eq!(value["error"]["message"], "rejected [REDACTED]");
+        assert!(value["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("cause: rejected [REDACTED]"));
         for task in tasks {
             task.abort();
         }

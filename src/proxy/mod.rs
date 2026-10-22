@@ -1,6 +1,13 @@
+pub mod body_filter;
+pub mod cache_injector;
+pub mod content_encoding;
 pub mod error;
 pub mod json_canonical;
+pub mod media_sanitizer;
+pub mod opaque_state_rectifier;
 pub mod providers;
+pub mod session;
 pub mod sse;
 pub mod thinking_optimizer;
 pub mod tool_media;
+pub mod types;

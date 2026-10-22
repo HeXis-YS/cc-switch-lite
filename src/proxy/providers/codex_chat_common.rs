@@ -170,13 +170,11 @@ pub(crate) fn tool_call_extra_content(source: &Value) -> Option<&Value> {
 }
 
 /// Gemini 文档给的跳过签名校验的占位值，只在真签名找不回来时兜底用（会影响模型表现）。
-#[cfg(test)]
 const GEMINI_SKIP_THOUGHT_SIGNATURE: &str = "skip_thought_signature_validator";
 
 /// 签名靠 CodexChatHistoryStore 在内存里补回，CC Switch 在一轮工具调用中途重启就丢了。
 /// Gemini 只校验当前轮（最后一条 user 消息之后）每个 assistant 步骤里第一个工具调用的签名，
 /// 这里只给这些缺签名的调用填占位值；并行的后续调用照原样不带。只对 Gemini 3 及以后的模型生效。
-#[cfg(test)]
 pub(crate) fn fill_gemini_thought_signature_fallback(chat_body: &mut Value) -> usize {
     if !chat_body
         .get("model")
@@ -234,7 +232,6 @@ pub(crate) fn fill_gemini_thought_signature_fallback(chat_body: &mut Value) -> u
 }
 
 /// 模型名（可带 `google/` 之类的中转前缀）是 Gemini 3 及以后的版本：这些版本才强制校验工具调用签名。
-#[cfg(test)]
 fn requires_gemini_thought_signature(model: &str) -> bool {
     let name = model
         .rsplit('/')

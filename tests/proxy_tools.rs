@@ -67,6 +67,7 @@ async fn setup(protocol: Protocol, body: String, sse: bool) -> (String, Config, 
     .await;
     let config = Config {
         version: 1,
+        compat: Default::default(),
         server: Server {
             listen: "127.0.0.1:0".parse().unwrap(),
         },
@@ -79,6 +80,7 @@ async fn setup(protocol: Protocol, body: String, sse: bool) -> (String, Config, 
             protocol,
             base_url: format!("{url}/v1"),
             api_key: "private-upstream-credential".into(),
+            compat: Default::default(),
         }],
     };
     let proxy = start(server::router(config.clone()).unwrap(), &mut tasks).await;
@@ -190,7 +192,7 @@ async fn anthropic_success_status_error_envelope_fails_closed() {
     let body = json!({"type":"error","error":{"type":"overloaded_error","message":"private-upstream-credential"}}).to_string();
     let (url, _, _, _tasks) = setup(Protocol::Messages, body, false).await;
     let response = send(&url, json!({"model":"same","input":"hello"})).await;
-    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
     let body = response.text().await.unwrap();
     assert!(!body.contains("private-upstream-credential"));
     assert!(serde_json::from_str::<Value>(&body).unwrap()["error"].is_object());

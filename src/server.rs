@@ -1,23 +1,28 @@
-use crate::config::{Config, Protocol};
-use crate::proxy::providers::{
-    codex_chat_history::{record_responses_sse_stream, CodexChatHistoryStore},
-    streaming_codex_anthropic::*,
-    streaming_codex_chat::*,
-    transform_codex_anthropic::*,
-    transform_codex_chat::*,
+use crate::{
+    compat::{request, response, retry, secrets},
+    config::{Config, Protocol},
+    proxy::{
+        error::ProxyError,
+        opaque_state_rectifier::{
+            carries_encrypted_agent_task, detect_opaque_state_rejection,
+            unreadable_agent_task_error,
+        },
+        providers::{
+            codex_chat_history::CodexChatHistoryStore,
+            transform_codex_chat::build_codex_tool_context_from_request,
+        },
+    },
 };
 use axum::{
-    body::Body,
-    extract::State,
-    http::{header, StatusCode},
-    response::{IntoResponse, Response},
+    body::Bytes,
+    extract::{DefaultBodyLimit, OriginalUri, State},
+    http::HeaderMap,
+    response::Response,
     routing::post,
-    Json, Router,
+    Router,
 };
-use bytes::Bytes;
-use futures::{Stream, StreamExt};
-use serde_json::{json, Value};
-use std::{sync::Arc, time::Duration};
+use serde_json::Value;
+use std::sync::Arc;
 
 struct App {
     config: Config,
@@ -26,13 +31,14 @@ struct App {
 }
 pub fn router(config: Config) -> anyhow::Result<Router> {
     config.validate()?;
+    // The upstream API-key path does not enable failover request/idle timeouts.
+    // Redirects are surfaced as upstream errors, never another credential target.
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
-        .connect_timeout(Duration::from_secs(15))
-        .read_timeout(Duration::from_secs(120))
         .build()?;
     Ok(Router::new()
         .route("/v1/responses", post(responses))
+        .layer(DefaultBodyLimit::max(200 * 1024 * 1024))
         .with_state(Arc::new(App {
             config,
             client,
@@ -51,223 +57,226 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         .await?;
     Ok(())
 }
-fn error(status: StatusCode, message: &'static str) -> Response {
-    (
-        status,
-        Json(json!({"error":{"type":"proxy_error","message":message}})),
-    )
-        .into_response()
-}
-async fn responses(State(app): State<Arc<App>>, body: Bytes) -> Response {
-    let mut input: Value = match serde_json::from_slice(&body) {
-        Ok(v) => v,
-        Err(_) => return error(StatusCode::BAD_REQUEST, "Invalid JSON request"),
-    };
-    if !input
-        .get("model")
+async fn responses(
+    State(app): State<Arc<App>>,
+    mut headers: HeaderMap,
+    OriginalUri(uri): OriginalUri,
+    body: Bytes,
+) -> Response {
+    let provider = app.config.selected();
+    let decoded =
+        if let Some(encoding) = crate::proxy::content_encoding::get_content_encoding(&headers) {
+            if !crate::proxy::content_encoding::is_supported_content_encoding(&encoding) {
+                Err(ProxyError::InvalidRequest(format!(
+                    "Unsupported request content-encoding: {encoding}"
+                )))
+            } else {
+                match crate::proxy::content_encoding::decompress_body(&encoding, &body) {
+                    Ok(Some(bytes)) => {
+                        headers.remove(axum::http::header::CONTENT_ENCODING);
+                        headers.remove(axum::http::header::CONTENT_LENGTH);
+                        headers.remove(axum::http::header::TRANSFER_ENCODING);
+                        Ok(bytes::Bytes::from(bytes))
+                    }
+                    Ok(None) => Err(ProxyError::InvalidRequest(format!(
+                        "Unsupported request content-encoding: {encoding}"
+                    ))),
+                    Err(error) => Err(ProxyError::InvalidRequest(format!(
+                        "Failed to decompress request body ({encoding}): {error}"
+                    ))),
+                }
+            }
+        } else {
+            Ok(body)
+        };
+    let input = decoded.and_then(|bytes| {
+        serde_json::from_slice::<Value>(&bytes)
+            .map_err(|_| ProxyError::InvalidRequest("Invalid JSON request".into()))
+    });
+    let model = input
+        .as_ref()
+        .ok()
+        .and_then(|v| v.get("model"))
         .and_then(Value::as_str)
-        .is_some_and(|m| !m.is_empty())
-    {
-        return error(StatusCode::BAD_REQUEST, "A nonempty model is required");
-    }
+        .unwrap_or("")
+        .to_owned();
     let streaming = input
-        .get("stream")
+        .as_ref()
+        .ok()
+        .and_then(|v| v.get("stream"))
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let p = app.config.selected();
-    if p.protocol == Protocol::ChatCompletions {
-        app.history.enrich_request(&mut input).await;
-    }
-    let context = build_codex_tool_context_from_request(&input);
-    let converted = match p.protocol {
-        Protocol::Responses => Ok(input),
-        Protocol::ChatCompletions => responses_to_chat_completions(input),
-        Protocol::Messages => responses_request_to_anthropic(input, 8192),
+    let result = match input {
+        Ok(input) => forward(&app, &headers, input, &model, streaming, uri.query()).await,
+        Err(e) => Err(e),
     };
-    let converted = match converted {
-        Ok(v) => v,
-        Err(_) => {
-            return error(
-                StatusCode::BAD_REQUEST,
-                "Request cannot be converted to upstream protocol",
-            )
-        }
-    };
-    let endpoint = match p.protocol {
-        Protocol::Responses => "responses",
-        Protocol::ChatCompletions => "chat/completions",
-        Protocol::Messages => "messages",
-    };
-    let mut request = app
-        .client
-        .post(format!("{}/{endpoint}", p.base_url.trim_end_matches('/')));
-    request = if p.protocol == Protocol::Messages {
-        request
-            .header("x-api-key", &p.api_key)
-            .header("anthropic-version", "2023-06-01")
-    } else {
-        request.bearer_auth(&p.api_key)
-    };
-    let request = if p.protocol == Protocol::Responses {
-        request
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(body)
-    } else {
-        request.json(&converted)
-    };
-    let upstream = match request.send().await {
+    let response = match result {
         Ok(r) => r,
-        Err(_) => return error(StatusCode::BAD_GATEWAY, "Upstream connection failed"),
+        Err(e) => response::proxy_error_response(&provider.name, &model, streaming, &e),
     };
-    let status = upstream.status();
-    let is_sse = upstream
-        .headers()
-        .get(header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|v| v.starts_with("text/event-stream"));
-    // Sanitize before converters see data: their error paths may include upstream text.
-    let secrets = app
-        .config
-        .providers
-        .iter()
-        .flat_map(|p| {
-            let escaped = serde_json::to_string(&p.api_key).expect("string serialization");
-            [p.api_key.clone(), escaped[1..escaped.len() - 1].to_string()]
-        })
-        .collect();
-    let source = redact_stream(upstream.bytes_stream(), secrets);
-    if !status.is_success() {
-        let status = if status.is_redirection() {
-            StatusCode::BAD_GATEWAY
-        } else {
-            status
-        };
-        tokio::pin!(source);
-        let mut data = Vec::new();
-        while let Some(chunk) = source.next().await {
-            match chunk {
-                Ok(bytes) if data.len() + bytes.len() <= 1024 * 1024 => data.extend(bytes),
-                _ => return error(status, "Upstream rejected request"),
-            }
-        }
-        let mut value: Value = match serde_json::from_slice(&data) {
-            Ok(value) => value,
-            Err(_) => return error(status, "Upstream rejected request"),
-        };
-        // Decode JSON escapes before the final scrub, including Unicode escapes.
-        scrub_value(&mut value, &app.config);
-        return (status, Json(chat_error_to_response_error(Some(&value)))).into_response();
-    }
-    if streaming || is_sse {
-        let body = match p.protocol {
-            Protocol::Responses => Body::from_stream(source),
-            Protocol::ChatCompletions => Body::from_stream(record_responses_sse_stream(
-                create_responses_sse_stream_from_chat_with_context(source, context),
-                app.history.clone(),
-            )),
-            Protocol::Messages => Body::from_stream(
-                create_responses_sse_stream_from_anthropic_with_context(source, context),
-            ),
-        };
-        return Response::builder()
-            .status(status)
-            .header(
-                header::CONTENT_TYPE,
-                if is_sse || p.protocol != Protocol::Responses {
-                    "text/event-stream"
-                } else {
-                    "application/json"
-                },
-            )
-            .header(header::CACHE_CONTROL, "no-cache")
-            .body(body)
-            .unwrap();
-    }
-    tokio::pin!(source);
-    let mut data = Vec::new();
-    while let Some(chunk) = source.next().await {
-        match chunk {
-            Ok(bytes) => data.extend(bytes),
-            Err(_) => return error(StatusCode::BAD_GATEWAY, "Upstream body failed"),
-        }
-        if data.len() > 32 * 1024 * 1024 {
-            return error(
-                StatusCode::BAD_GATEWAY,
-                "Upstream JSON response exceeds limit",
-            );
-        }
-    }
-    if p.protocol == Protocol::Responses {
-        return (status, [(header::CONTENT_TYPE, "application/json")], data).into_response();
-    }
-    let value = match serde_json::from_slice(&data) {
-        Ok(v) => v,
-        Err(_) => return error(StatusCode::BAD_GATEWAY, "Invalid upstream JSON"),
-    };
-    let result = match p.protocol {
-        Protocol::ChatCompletions => chat_completion_to_response_with_context(value, &context),
-        Protocol::Messages => anthropic_response_to_responses_with_context(value, &context),
-        Protocol::Responses => unreachable!(),
-    };
-    match result {
-        Ok(value) => {
-            if p.protocol == Protocol::ChatCompletions {
-                app.history.record_response(&value).await;
-            }
-            (status, Json(value)).into_response()
-        }
-        Err(_) => error(StatusCode::BAD_GATEWAY, "Invalid upstream response"),
-    }
+    secrets::protect(
+        response,
+        app.config
+            .providers
+            .iter()
+            .map(|p| p.api_key.clone())
+            .collect(),
+    )
+    .await
 }
-
-// Keep only a suffix that might be a split credential. Normal SSE chunks flush immediately.
-fn redact_stream<E: std::error::Error + Send + 'static>(
-    source: impl Stream<Item = Result<Bytes, E>> + Send + 'static,
-    secrets: Vec<String>,
-) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send {
-    async_stream::stream! {
-        tokio::pin!(source);
-        let mut pending = Vec::new();
-        while let Some(chunk) = source.next().await {
-            let chunk = match chunk {Ok(c)=>c,Err(_)=>{yield Err(std::io::Error::other("Upstream stream failed"));return;}};
-            pending.extend_from_slice(&chunk);
-            let mut output = Vec::new();
-            let mut i = 0;
-            while i < pending.len() {
-                let tail = &pending[i..];
-                if let Some(key) = secrets.iter().filter(|k| !k.is_empty()).find(|k| tail.starts_with(k.as_bytes())) {output.extend_from_slice(b"[REDACTED]");i+=key.len();}
-                else if secrets.iter().any(|k| k.as_bytes().starts_with(tail)) {break;}
-                else {output.push(pending[i]);i+=1;}
-            }
-            pending.drain(..i);
-            if !output.is_empty() {yield Ok(Bytes::from(output));}
-        }
-        if !pending.is_empty() {yield Ok(Bytes::from(pending));}
-    }
-}
-
-fn scrub_value(value: &mut Value, config: &Config) {
-    match value {
-        Value::String(text) => {
-            for provider in &config.providers {
-                *text = text.replace(&provider.api_key, "[REDACTED]");
+async fn forward(
+    app: &App,
+    headers: &HeaderMap,
+    mut input: Value,
+    model: &str,
+    streaming: bool,
+    query: Option<&str>,
+) -> Result<Response, ProxyError> {
+    let provider = app.config.selected();
+    let mut retried = false;
+    let mut attempt_headers = headers.clone();
+    let context = build_codex_tool_context_from_request(&input);
+    let mut stable_response_options = None;
+    loop {
+        let prepared = request::prepare_with_query(
+            input.clone(),
+            provider,
+            &attempt_headers,
+            &app.config.compat,
+            &app.history,
+            query,
+        )
+        .await?;
+        if !attempt_headers.contains_key("x-opencode-session") {
+            if let Some(session) = prepared.headers.get("x-opencode-session") {
+                attempt_headers.insert("x-opencode-session", session.clone());
             }
         }
-        Value::Array(items) => {
-            for item in items {
-                scrub_value(item, config);
-            }
+        if stable_response_options.is_none() {
+            stable_response_options = Some((
+                prepared.late_arguments_repair,
+                prepared.native_compaction,
+                prepared.xai_restore.clone(),
+            ));
         }
-        Value::Object(object) => {
-            let original = std::mem::take(object);
-            for (mut key, mut item) in original {
-                for provider in &config.providers {
-                    key = key.replace(&provider.api_key, "[REDACTED]");
+        let attempted = send(app, &prepared).await;
+        match attempted {
+            Ok(upstream) => {
+                let options = response::ResponseOptions {
+                    model: model.into(),
+                    streaming,
+                    late_arguments_repair: stable_response_options.as_ref().unwrap().0,
+                    native_compaction: stable_response_options.as_ref().unwrap().1,
+                    xai_restore: stable_response_options.as_ref().unwrap().2.clone(),
+                };
+                return response::handle(
+                    upstream,
+                    provider.protocol,
+                    options,
+                    context,
+                    app.history.clone(),
+                )
+                .await;
+            }
+            Err(e) => {
+                if retried {
+                    if provider.protocol == Protocol::Responses
+                        && carries_encrypted_agent_task(&input)
+                        && detect_opaque_state_rejection(
+                            &e,
+                            &app.config.compat.rectifier,
+                            &input,
+                            true,
+                        )
+                        .is_some()
+                    {
+                        return Err(unreadable_agent_task_error());
+                    }
+                    return Err(e);
                 }
-                scrub_value(&mut item, config);
-                object.insert(key, item);
+                if let Some(rectified) =
+                    retry::rectify(provider.protocol, &input, &e, &app.config.compat.rectifier)?
+                {
+                    input = rectified;
+                    retried = true;
+                } else {
+                    return Err(e);
+                }
             }
         }
-        _ => {}
     }
+}
+async fn send(app: &App, prepared: &request::Prepared) -> Result<reqwest::Response, ProxyError> {
+    let provider = app.config.selected();
+    let mut outgoing = app
+        .client
+        .post(&prepared.url)
+        .headers(prepared.headers.clone())
+        .body(
+            serde_json::to_vec(&prepared.body)
+                .map_err(|e| ProxyError::TransformError(e.to_string()))?,
+        );
+    // Preserve forwarder defaults even with failover disabled: streaming sends
+    // have a header deadline and a long total deadline, but no idle deadline.
+    if prepared.request_is_streaming {
+        outgoing = outgoing.timeout(std::time::Duration::from_secs(24 * 60 * 60));
+    }
+    let send = outgoing.send();
+    let result = if prepared.request_is_streaming {
+        tokio::time::timeout(std::time::Duration::from_secs(600), send)
+            .await
+            .map_err(|_| ProxyError::Timeout("流式响应首包超时: 600s（上游未返回响应头）".into()))?
+    } else {
+        send.await
+    };
+    let upstream = result.map_err(|error| {
+        let is_timeout = error.is_timeout();
+        let is_connect = error.is_connect();
+        let detail = crate::proxy::error::describe_reqwest_error(error);
+        if is_timeout {
+            ProxyError::Timeout(format!("上游请求超时: {detail}"))
+        } else if is_connect {
+            ProxyError::ForwardFailed(format!("上游连接失败: {detail}"))
+        } else {
+            ProxyError::ForwardFailed(format!("上游请求发送失败: {detail}"))
+        }
+    })?;
+    let status = upstream.status();
+    if !status.is_success() {
+        let (_, status, bytes) = response::decode_response(upstream).await?;
+        return Err(ProxyError::UpstreamError {
+            status: status.as_u16(),
+            body: String::from_utf8(bytes.to_vec()).ok(),
+        });
+    }
+    let is_json = upstream
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| {
+            let mime = v
+                .split(';')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_ascii_lowercase();
+            mime == "application/json" || mime.ends_with("+json")
+        });
+    if provider.protocol == Protocol::Messages && (!prepared.request_is_streaming || is_json) {
+        let (headers, status, bytes) = response::decode_response(upstream).await?;
+        retry::validate_anthropic_body(&bytes)?;
+        let mut response = http::Response::new(bytes);
+        *response.status_mut() = status;
+        *response.headers_mut() = headers;
+        return Ok(response.into());
+    }
+    if provider.protocol == Protocol::Responses
+        && prepared.request_is_streaming
+        && !is_json
+        && app.config.compat.rectifier.enabled
+        && carries_encrypted_agent_task(&prepared.body)
+    {
+        return retry::hold_encrypted_agent_task_stream(upstream, &prepared.body).await;
+    }
+    Ok(upstream)
 }

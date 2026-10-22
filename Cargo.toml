@@ -25,3 +25,12 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "sync",
 toml = "0.8"
 url = "2"
 uuid = { version = "1", features = ["v4"] }
+
+flate2 = "1"
+brotli = "7"
+zstd = "0.13"
+chrono = "0.4"
+http = "1"
+
+[dev-dependencies]
+cc-switch-reference = { path = "reference/cc-switch-reference" }

@@ -1,15 +1,32 @@
-// Derived from cc-switch, Copyright (c) 2025 Jason Young. MIT License.
-// See LICENSE-cc-switch in this directory.
-//! Codex compaction helpers shared by the Chat and Anthropic conversion bridges.
+//! Codex 远程压缩（Responses compaction V2）与第三方模型之间的桥接。
 //!
-//! Compaction triggers request a textual summary and return it inside a
-//! `ccswitch-compaction-v1:` base64 envelope. These bridges restore that summary
-//! when replaying history and explicitly mark foreign, unreadable envelopes.
+//! Codex 按 provider 名称判断能否远程压缩：名为 "OpenAI" 的 provider 走 V2。Stack 模式下
+//! 官方卡的镜像表就叫 "OpenAI"，于是挂在它下面的每个第三方模型也会收到 V2 压缩请求：
+//! 一个普通的 `/responses` 流式请求，input 末尾是 `{"type":"compaction_trigger"}`。
+//! codex-rs 的 `collect_compaction_output` 要求返回里**恰好一个**
+//! `{"type":"compaction","encrypted_content":...}` 条目，否则直接 Fatal。
+//!
+//! 第三方模型产不出 OpenAI 的密文，所以这里把它当普通摘要模型用：禁止发起新的工具调用
+//! （工具定义保留，历史里的调用条目还引用着它们）、在末尾追加
+//! Codex 自己的压缩提示词，再把摘要正文包成 `ccswitch-compaction-v1:` + base64 放进
+//! `encrypted_content`。以后 Codex 在历史里回放这个条目时：
+//! - 发往 Chat / Anthropic 转换：解回摘要正文，作为用户消息；解不开的（别家的密文）
+//!   转换后的格式装不下，换成一句说明，不再静默丢弃。
+//! - 发往原生 Responses（官方和第三方）：CC Switch 包装的摘要转成用户消息；别的密文看不出
+//!   来源（可能正是这家自己签发的），原样发出，上游明确拒绝后再由 `opaque_state_rectifier`
+//!   换掉。
 
+use crate::proxy::sse::{append_utf8_safe, strip_sse_field, take_sse_block};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use bytes::Bytes;
+use futures::stream::{Stream, StreamExt};
 use serde_json::{json, Value};
 
 pub(crate) const CCSWITCH_COMPACTION_PREFIX: &str = "ccswitch-compaction-v1:";
+
+/// CC Switch 自己包装进 `encrypted_content` 的内容都以它开头，官方后端一律解不开。
+#[allow(dead_code)] // Used by retained official-provider scrub helper.
+const CCSWITCH_ENVELOPE_PREFIX: &str = "ccswitch-";
 
 /// 与 codex-rs `prompts/templates/compact/prompt.md` 一致（Codex 本地压缩用的提示词）。
 pub(crate) const COMPACT_PROMPT: &str = "You are performing a CONTEXT CHECKPOINT COMPACTION. Create a handoff summary for another LLM that will resume the task.
@@ -30,6 +47,14 @@ pub(crate) const SUMMARY_PREFIX: &str = "Another language model started to solve
 /// 历史里的压缩条目是别家的密文、当前模型读不了时，用这句话占位。
 pub(crate) const OPAQUE_COMPACTION_NOTE: &str =
     "[earlier conversation was compacted; the summary is stored in a format this model cannot read]";
+
+/// Codex 在历史里回放的压缩条目类型（`compaction_summary` 是 `compaction` 的别名）。
+pub(crate) fn is_compaction_item(item: &Value) -> bool {
+    matches!(
+        item.get("type").and_then(Value::as_str),
+        Some("compaction" | "compaction_summary" | "context_compaction")
+    )
+}
 
 pub(crate) fn is_compaction_trigger(item: &Value) -> bool {
     item.get("type").and_then(Value::as_str) == Some("compaction_trigger")
@@ -56,10 +81,31 @@ pub(crate) fn decode_compaction_summary(encrypted_content: &str) -> Option<Strin
     String::from_utf8(bytes).ok()
 }
 
+fn is_ccswitch_envelope(encrypted_content: &str) -> bool {
+    encrypted_content.starts_with(CCSWITCH_ENVELOPE_PREFIX)
+}
+
 fn compaction_encrypted_content(item: &Value) -> Option<&str> {
     item.get("encrypted_content")
         .and_then(Value::as_str)
         .filter(|value| !value.is_empty())
+}
+
+/// CC Switch 自己包装的压缩条目，解回摘要正文；别的条目返回 None。
+fn own_compaction_summary(item: &Value) -> Option<String> {
+    if !is_compaction_item(item) {
+        return None;
+    }
+    compaction_encrypted_content(item).and_then(decode_compaction_summary)
+}
+
+/// 看不出来源的压缩条目：别家签发的密文，或没有载荷的标记。
+pub(crate) fn is_unrecognized_compaction_item(item: &Value) -> bool {
+    is_compaction_item(item) && own_compaction_summary(item).is_none()
+}
+
+fn own_compaction_message(summary: &str) -> Value {
+    user_message_item(&format!("{SUMMARY_PREFIX}\n{summary}"))
 }
 
 /// 压缩条目回放给第三方模型时的文字。没有载荷的 `context_compaction` 只是个标记，返回 None。
@@ -139,9 +185,321 @@ pub(crate) fn compaction_incomplete_reason(finish_reason: Option<&str>) -> Optio
     }
 }
 
+/// 原生 Responses 格式的第三方上游：压缩触发是 Codex 私有协议，普通 Responses 网关收到
+/// 只会回一条普通消息（Codex 照样 Fatal），这里改成和 Chat / Anthropic 转换一样的摘要回合；
+/// CC Switch 包装的压缩摘要谁都解不开，转成用户消息。
+///
+/// 别的压缩条目看不出来源，可能正是这家自己签发、能正常解开的，原样发出；上游明确拒绝后
+/// 由 `opaque_state_rectifier` 换成文字重试。请求里没有前两类条目时一个字节都不动。
+pub(crate) fn prepare_native_third_party_request(body: &mut Value) -> bool {
+    let Some(items) = body.get("input").and_then(Value::as_array) else {
+        return false;
+    };
+    if !items
+        .iter()
+        .any(|item| is_compaction_trigger(item) || own_compaction_summary(item).is_some())
+    {
+        return false;
+    }
+
+    let mut compaction = false;
+    let rewritten: Vec<Value> = items
+        .iter()
+        .map(|item| {
+            if is_compaction_trigger(item) {
+                compaction = true;
+                compaction_prompt_item()
+            } else if let Some(summary) = own_compaction_summary(item) {
+                own_compaction_message(&summary)
+            } else {
+                item.clone()
+            }
+        })
+        .collect();
+    body["input"] = Value::Array(rewritten);
+
+    if compaction {
+        shape_summary_turn_request(body);
+    }
+    true
+}
+
+/// 压缩回合只要一段摘要：强制 `tool_choice: "none"` 不发起新的工具调用，并去掉结构化输出，
+/// 保持和 Codex 本地压缩请求一致的"只要文字"形态（codex-rs `compact.rs` 的 Prompt 不带 tools）。
+/// 工具定义保留：历史里回放的 `web_search_call`、`function_call` 等条目引用这些定义，
+/// 部分上游对"有调用历史、无工具定义"的请求直接拒绝（#7976）。
+fn shape_summary_turn_request(body: &mut Value) {
+    let Some(obj) = body.as_object_mut() else {
+        return;
+    };
+    if obj.contains_key("tools") {
+        obj.insert("tool_choice".to_string(), json!("none"));
+    } else {
+        obj.remove("tool_choice");
+        obj.remove("parallel_tool_calls");
+    }
+    let text_is_empty = obj
+        .get_mut("text")
+        .and_then(Value::as_object_mut)
+        .map(|text| {
+            text.remove("format");
+            text.is_empty()
+        })
+        .unwrap_or(false);
+    if text_is_empty {
+        obj.remove("text");
+    }
+}
+
+/// codex-rs `ResponseItem::id_prefix` 与 OpenAI 实测校验一致的类型 → id 前缀。
+fn expected_item_id_prefix(item_type: &str) -> Option<&'static str> {
+    Some(match item_type {
+        "message" => "msg_",
+        "agent_message" => "amsg_",
+        "reasoning" => "rs_",
+        "function_call" => "fc_",
+        "custom_tool_call" => "ctc_",
+        "tool_search_call" => "tsc_",
+        "web_search_call" => "ws_",
+        _ => return None,
+    })
+}
+
+/// id 前缀和条目类型对不上（转换器产出的、别家签发的）就去掉 id，返回是否去掉了。
+/// id 在输入里可省略，调用和结果靠 `call_id` 对应。
+#[allow(dead_code)] // Retained upstream official-provider compatibility helper.
+pub(crate) fn strip_mismatched_item_id(item: &mut Value, item_type: &str) -> bool {
+    let Some(prefix) = expected_item_id_prefix(item_type) else {
+        return false;
+    };
+    let bad_id = item
+        .get("id")
+        .is_some_and(|id| !id.as_str().is_some_and(|id| id.starts_with(prefix)));
+    bad_id
+        && item
+            .as_object_mut()
+            .is_some_and(|obj| obj.remove("id").is_some())
+}
+
+/// 发往官方（ChatGPT 登录直通）前，清理同一线程里第三方回合留下、官方一定会拒的东西：
+/// - CC Switch 包装的压缩摘要：转成用户消息（官方验不了这段"密文"）；
+/// - 推理条目带着 CC Switch 包装的内容（Anthropic thinking 签名），或根本没有
+///   encrypted_content（Chat 转换产出的）：`store:false` 下官方只能靠密文还原推理，
+///   这类条目要么验签失败、要么按 id 查无此条目（404），整条去掉；
+/// - id 前缀和条目类型对不上（转换器产出的 `resp_…_msg` 等）：去掉 id。
+///
+/// 纯官方的线程里这些情况都不会出现，请求一个字节都不变（prompt cache 前缀不受影响）；
+/// 同一段混合历史每轮清理结果相同，缓存前缀也稳定。
+#[allow(dead_code)] // Retained upstream official-provider compatibility helper.
+pub(crate) fn scrub_ccswitch_state_for_official(body: &mut Value) -> bool {
+    let stored = body.get("store").and_then(Value::as_bool) == Some(true);
+    let Some(items) = body.get_mut("input").and_then(Value::as_array_mut) else {
+        return false;
+    };
+
+    let mut changed = false;
+    let mut scrubbed = Vec::with_capacity(items.len());
+    for mut item in std::mem::take(items) {
+        let item_type = item
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+
+        if let Some(summary) = own_compaction_summary(&item) {
+            changed = true;
+            scrubbed.push(own_compaction_message(&summary));
+            continue;
+        }
+
+        if item_type == "reasoning" {
+            let foreign = match compaction_encrypted_content(&item) {
+                Some(encrypted_content) => is_ccswitch_envelope(encrypted_content),
+                None => !stored,
+            };
+            if foreign {
+                changed = true;
+                continue;
+            }
+        }
+
+        changed |= strip_mismatched_item_id(&mut item, &item_type);
+
+        scrubbed.push(item);
+    }
+    *items = scrubbed;
+    changed
+}
+
+/// 原生 Responses 第三方上游的压缩回合：上游只回了普通消息，在 `response.completed`
+/// 之前补上唯一一个 compaction 条目。上游截断（incomplete）时如实报 `response.incomplete`，
+/// Codex 会按可重试错误处理，而不是装上半截摘要。
+pub(crate) fn create_native_compaction_sse_stream<E>(
+    stream: impl Stream<Item = Result<Bytes, E>> + Send + 'static,
+) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send
+where
+    E: std::error::Error + Send + 'static,
+{
+    async_stream::stream! {
+        let mut buffer = String::new();
+        let mut utf8_remainder: Vec<u8> = Vec::new();
+        let mut state = NativeCompactionState::default();
+
+        tokio::pin!(stream);
+
+        while let Some(chunk) = stream.next().await {
+            match chunk {
+                Ok(bytes) => {
+                    append_utf8_safe(&mut buffer, &mut utf8_remainder, &bytes);
+                    while let Some(block) = take_sse_block(&mut buffer) {
+                        if block.trim().is_empty() {
+                            continue;
+                        }
+                        for event in state.handle_block(&block) {
+                            yield Ok(event);
+                        }
+                    }
+                }
+                Err(e) => {
+                    yield Err(std::io::Error::other(e.to_string()));
+                    return;
+                }
+            }
+        }
+
+        if !utf8_remainder.is_empty() {
+            buffer.push_str(&String::from_utf8_lossy(&utf8_remainder));
+        }
+        let tail = std::mem::take(&mut buffer);
+        if !tail.trim().is_empty() {
+            for event in state.handle_block(&tail) {
+                yield Ok(event);
+            }
+        }
+    }
+}
+
+#[derive(Default)]
+struct NativeCompactionState {
+    done_items: Vec<Value>,
+    next_output_index: u64,
+}
+
+impl NativeCompactionState {
+    fn handle_block(&mut self, block: &str) -> Vec<Bytes> {
+        let passthrough = || vec![Bytes::from(format!("{block}\n\n"))];
+        let data = block
+            .lines()
+            .filter_map(|line| strip_sse_field(line, "data"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let Ok(event) = serde_json::from_str::<Value>(&data) else {
+            return passthrough();
+        };
+
+        match event.get("type").and_then(Value::as_str) {
+            Some("response.output_item.done") => {
+                if let Some(index) = event.get("output_index").and_then(Value::as_u64) {
+                    self.next_output_index = self.next_output_index.max(index + 1);
+                }
+                if let Some(item) = event.get("item") {
+                    self.done_items.push(item.clone());
+                }
+                passthrough()
+            }
+            Some("response.completed") => self.finish(event),
+            _ => passthrough(),
+        }
+    }
+
+    fn finish(&mut self, event: Value) -> Vec<Bytes> {
+        let mut response = event.get("response").cloned().unwrap_or_else(|| json!({}));
+        let status = response
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("completed");
+        if status == "incomplete" {
+            return vec![response_event("response.incomplete", response)];
+        }
+
+        let mut summary = summary_from_output_items(&self.done_items);
+        if summary.is_empty() {
+            if let Some(output) = response.get("output").and_then(Value::as_array) {
+                summary = summary_from_output_items(output);
+            }
+        }
+        if summary.is_empty() {
+            response["status"] = json!("failed");
+            response["error"] = json!({
+                "type": "compaction_summary_empty",
+                "message": "Upstream returned no summary text for the compaction turn"
+            });
+            return vec![response_event("response.failed", response)];
+        }
+
+        let item = compaction_output_item(&summary);
+        let output_index = response
+            .get("output")
+            .and_then(Value::as_array)
+            .map(|output| output.len() as u64)
+            .unwrap_or(0)
+            .max(self.next_output_index);
+        let item_done = response_event_with(
+            "response.output_item.done",
+            json!({
+                "type": "response.output_item.done",
+                "output_index": output_index,
+                "item": item
+            }),
+        );
+        match response.get_mut("output").and_then(Value::as_array_mut) {
+            Some(output) => output.push(item),
+            None => response["output"] = json!([item]),
+        }
+        vec![item_done, response_event("response.completed", response)]
+    }
+}
+
+fn response_event(event: &str, response: Value) -> Bytes {
+    response_event_with(event, json!({ "type": event, "response": response }))
+}
+
+fn response_event_with(event: &str, data: Value) -> Bytes {
+    Bytes::from(format!(
+        "event: {event}\ndata: {}\n\n",
+        serde_json::to_string(&data).unwrap_or_default()
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn parse_events(output: &str) -> Vec<Value> {
+        output
+            .split("\n\n")
+            .filter_map(|block| {
+                block
+                    .lines()
+                    .find_map(|line| line.strip_prefix("data: "))
+                    .and_then(|data| serde_json::from_str(data).ok())
+            })
+            .collect()
+    }
+
+    async fn run_native(input: &str) -> Vec<Value> {
+        let upstream = futures::stream::iter(vec![Ok::<_, std::io::Error>(Bytes::from(
+            input.to_string(),
+        ))]);
+        let chunks: Vec<_> = create_native_compaction_sse_stream(upstream)
+            .collect()
+            .await;
+        let merged = chunks
+            .into_iter()
+            .map(|chunk| String::from_utf8(chunk.unwrap().to_vec()).unwrap())
+            .collect::<String>();
+        parse_events(&merged)
+    }
 
     #[test]
     fn summary_envelope_round_trips_and_rejects_foreign_blobs() {
@@ -174,6 +532,163 @@ mod tests {
     }
 
     #[test]
+    fn native_request_without_compaction_items_is_untouched() {
+        let mut body = json!({
+            "model": "kimi-k3",
+            "input": [{ "type": "message", "role": "user", "content": "hi" }],
+            "tools": [{ "type": "function", "name": "shell" }]
+        });
+        let before = body.clone();
+        assert!(!prepare_native_third_party_request(&mut body));
+        assert_eq!(body, before);
+    }
+
+    #[test]
+    fn native_request_keeps_unrecognized_compaction_blobs_byte_identical() {
+        // 同一家原生 Responses 上游自己签发的压缩密文：看不出来源，原样发出，
+        // 被拒后再由 opaque_state_rectifier 处理。
+        let mut body = json!({
+            "model": "gpt-5.5",
+            "input": [
+                { "type": "message", "role": "user", "content": "hi" },
+                { "type": "compaction", "id": "cmp_1", "encrypted_content": "gAAAA-issued-here" },
+                { "type": "context_compaction" },
+                { "type": "message", "role": "user", "content": "go on" }
+            ],
+            "tools": [{ "type": "function", "name": "shell" }]
+        });
+        let before = body.clone();
+        assert!(!prepare_native_third_party_request(&mut body));
+        assert_eq!(body, before);
+    }
+
+    #[test]
+    fn native_compaction_request_becomes_summary_turn() {
+        let mut body = json!({
+            "model": "kimi-k3",
+            "input": [
+                { "type": "message", "role": "user", "content": "hi" },
+                { "type": "compaction", "encrypted_content": "gAAAA-openai" },
+                { "type": "context_compaction" },
+                { "type": "compaction", "encrypted_content": encode_compaction_summary("prior work") },
+                { "type": "compaction_trigger" }
+            ],
+            "tools": [{ "type": "function", "name": "shell" }],
+            "tool_choice": "auto",
+            "parallel_tool_calls": true,
+            "text": { "format": { "type": "json_schema" }, "verbosity": "low" }
+        });
+        assert!(prepare_native_third_party_request(&mut body));
+        let input = body["input"].as_array().unwrap();
+        assert_eq!(input.len(), 5);
+        assert_eq!(
+            input[1],
+            json!({ "type": "compaction", "encrypted_content": "gAAAA-openai" })
+        );
+        assert_eq!(input[2], json!({ "type": "context_compaction" }));
+        assert_eq!(
+            input[3]["content"][0]["text"],
+            format!("{SUMMARY_PREFIX}\nprior work")
+        );
+        assert_eq!(input[4]["content"][0]["text"], COMPACT_PROMPT);
+        assert_eq!(
+            body["tools"],
+            json!([{ "type": "function", "name": "shell" }])
+        );
+        assert_eq!(body["tool_choice"], "none");
+        assert_eq!(body["parallel_tool_calls"], true);
+        assert_eq!(body["text"], json!({ "verbosity": "low" }));
+    }
+
+    #[test]
+    fn compaction_summary_turn_keeps_tools_referenced_by_search_history() {
+        // #7976：历史里回放的 `web_search_call` 引用 `web_search` 工具定义，摘要回合删掉
+        // 定义会让部分上游直接拒绝整个压缩请求。定义保留，`tool_choice: "none"` 保证摘要
+        // 回合不发起新调用（原请求没有 `tool_choice` 时也要补上）。
+        let mut body = json!({
+            "model": "gpt-6.1-sol",
+            "stream": true,
+            "store": false,
+            "input": [
+                { "type": "message", "role": "user", "content": [
+                    { "type": "input_text", "text": "This is a transport diagnostic. Reply with exactly OK." }
+                ]},
+                { "type": "web_search_call", "id": "ws_diagnostic_1", "status": "completed",
+                  "action": { "type": "search", "query": "Codex documentation" } },
+                { "type": "compaction_trigger" }
+            ],
+            "tools": [{ "type": "web_search" }]
+        });
+        assert!(prepare_native_third_party_request(&mut body));
+        assert_eq!(body["tools"], json!([{ "type": "web_search" }]));
+        assert_eq!(body["tool_choice"], "none");
+        let input = body["input"].as_array().unwrap();
+        assert_eq!(input[1]["type"], "web_search_call");
+        assert_eq!(input[2]["content"][0]["text"], COMPACT_PROMPT);
+    }
+
+    #[test]
+    fn summary_turn_without_tools_drops_stale_tool_fields() {
+        // 没有 tools 的请求保持原行为：不引入 tool_choice，陈旧的调用相关字段清掉。
+        let mut body = json!({
+            "model": "kimi-k3",
+            "input": [
+                { "type": "message", "role": "user", "content": "hi" },
+                { "type": "compaction_trigger" }
+            ],
+            "tool_choice": "auto",
+            "parallel_tool_calls": true
+        });
+        assert!(prepare_native_third_party_request(&mut body));
+        assert!(body.get("tools").is_none());
+        assert!(body.get("tool_choice").is_none());
+        assert!(body.get("parallel_tool_calls").is_none());
+    }
+
+    #[test]
+    fn official_scrub_leaves_native_history_byte_identical() {
+        let mut body = json!({
+            "store": false,
+            "input": [
+                { "type": "message", "id": "msg_1", "role": "assistant", "content": [] },
+                { "type": "reasoning", "id": "rs_1", "summary": [], "encrypted_content": "gAAAA" },
+                { "type": "function_call", "id": "fc_1", "call_id": "call_1", "name": "shell", "arguments": "{}" },
+                { "type": "compaction", "id": "cmp_1", "encrypted_content": "gAAAA-openai" },
+                { "type": "message", "role": "user", "content": "go" }
+            ]
+        });
+        let before = body.clone();
+        assert!(!scrub_ccswitch_state_for_official(&mut body));
+        assert_eq!(body, before);
+    }
+
+    #[test]
+    fn official_scrub_removes_third_party_state() {
+        let mut body = json!({
+            "store": false,
+            "input": [
+                { "type": "reasoning", "id": "rs_resp_chat", "summary": [{ "type": "summary_text", "text": "t" }] },
+                { "type": "reasoning", "id": "rs_resp_msg_0", "summary": [],
+                  "encrypted_content": "ccswitch-anthropic-thinking-v1:abc" },
+                { "type": "message", "id": "resp_msg_01_msg_0", "role": "assistant",
+                  "content": [{ "type": "output_text", "text": "hi" }] },
+                { "type": "compaction", "id": "cmp_2", "encrypted_content": encode_compaction_summary("done so far") },
+                { "type": "message", "role": "user", "content": "next" }
+            ]
+        });
+        assert!(scrub_ccswitch_state_for_official(&mut body));
+        let input = body["input"].as_array().unwrap();
+        assert_eq!(input.len(), 3);
+        assert!(input[0].get("id").is_none());
+        assert_eq!(input[0]["content"][0]["text"], "hi");
+        assert_eq!(
+            input[1]["content"][0]["text"],
+            format!("{SUMMARY_PREFIX}\ndone so far")
+        );
+        assert_eq!(input[2]["content"], "next");
+    }
+
+    #[test]
     fn compaction_turn_only_completes_on_a_normal_stop() {
         for normal in [
             None,
@@ -202,5 +717,61 @@ mod tests {
                 "{reason}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn native_stream_appends_single_compaction_item_before_completed() {
+        let events = run_native(concat!(
+            "event: response.output_text.delta\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"sum\"}\n\n",
+            "event: response.output_item.done\n",
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"summary text\"}]}}\n\n",
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\":\"completed\",\"output\":[{\"type\":\"message\"}]}}\n\n"
+        ))
+        .await;
+        let types: Vec<&str> = events
+            .iter()
+            .map(|event| event["type"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            types,
+            [
+                "response.output_text.delta",
+                "response.output_item.done",
+                "response.output_item.done",
+                "response.completed"
+            ]
+        );
+        let item = &events[2]["item"];
+        assert_eq!(item["type"], "compaction");
+        assert_eq!(events[2]["output_index"], 1);
+        assert_eq!(
+            decode_compaction_summary(item["encrypted_content"].as_str().unwrap()).as_deref(),
+            Some("summary text")
+        );
+        let output = events[3]["response"]["output"].as_array().unwrap();
+        assert_eq!(
+            output
+                .iter()
+                .filter(|item| item["type"] == "compaction")
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn native_stream_reports_truncated_or_empty_summary_as_retryable() {
+        let incomplete = run_native(
+            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"incomplete\",\"output\":[]}}\n\n",
+        )
+        .await;
+        assert_eq!(incomplete.last().unwrap()["type"], "response.incomplete");
+
+        let empty = run_native(
+            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[]}}\n\n",
+        )
+        .await;
+        assert_eq!(empty.last().unwrap()["type"], "response.failed");
     }
 }

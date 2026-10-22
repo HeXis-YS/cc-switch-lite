@@ -5,7 +5,6 @@
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-#[cfg(test)]
 pub(crate) fn canonicalize_value(value: Value) -> Value {
     match value {
         Value::Array(values) => Value::Array(values.into_iter().map(canonicalize_value).collect()),

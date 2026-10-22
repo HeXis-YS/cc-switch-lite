@@ -6,6 +6,8 @@ use std::{collections::HashSet, io::Write, net::SocketAddr, path::Path};
 #[serde(deny_unknown_fields)]
 pub struct Config {
     pub version: u32,
+    #[serde(default)]
+    pub compat: crate::compat::CompatConfig,
     pub server: Server,
     pub route: Route,
     pub providers: Vec<Provider>,
@@ -28,6 +30,8 @@ pub struct Provider {
     pub protocol: Protocol,
     pub base_url: String,
     pub api_key: String,
+    #[serde(default)]
+    pub compat: crate::compat::request::ProviderCompat,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -46,11 +50,13 @@ impl Config {
         Ok(config)
     }
     pub fn validate(&self) -> Result<()> {
+        self.compat.validate()?;
         if self.version != 1 {
             bail!("Unsupported configuration version");
         }
         let mut ids = HashSet::new();
         for p in &self.providers {
+            p.compat.validate()?;
             if p.id.trim().is_empty() || p.name.trim().is_empty() || !ids.insert(&p.id) {
                 bail!("Provider IDs and names must be nonempty; IDs must be unique");
             }
@@ -60,7 +66,7 @@ impl Config {
                 || url.host_str().is_none()
                 || !url.username().is_empty()
                 || url.password().is_some()
-                || url.query().is_some()
+                || (url.query().is_some() && p.compat.meta.is_full_url != Some(true))
                 || url.fragment().is_some()
             {
                 bail!("Provider URL must be HTTP(S), without credentials, query or fragment");

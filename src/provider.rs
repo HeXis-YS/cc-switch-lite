@@ -27,3 +27,30 @@ pub struct CodexChatReasoningConfig {
     #[serde(skip)]
     pub effort_levels: Option<Vec<String>>,
 }
+
+/// Infrastructure-only projection used by unchanged upstream compatibility code.
+#[derive(Clone, Debug, Default)]
+pub struct Provider {
+    pub id: String,
+    pub name: String,
+    pub settings_config: serde_json::Value,
+    pub meta: Option<ProviderMeta>,
+    pub website_url: Option<String>,
+    pub category: Option<String>,
+    pub created_at: Option<i64>,
+    pub sort_index: Option<usize>,
+    pub notes: Option<String>,
+    pub icon: Option<String>,
+    pub icon_color: Option<String>,
+    pub in_failover_queue: bool,
+}
+pub type ProviderMeta = crate::compat::request::CompatMeta;
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct LocalProxyRequestOverrides {
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub headers: std::collections::HashMap<String, String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub body: Option<serde_json::Value>,
+}

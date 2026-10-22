@@ -1,5 +1,3 @@
-// Derived from cc-switch, Copyright (c) 2025 Jason Young. MIT License.
-// See LICENSE-cc-switch in providers/.
 //! Shared media handling for tool outputs.
 //!
 //! Responses and Anthropic tool outputs may carry structured media blocks.
@@ -26,7 +24,8 @@ pub(crate) enum ToolMediaScope {
     /// Used by Gemini Native `generateContent`, whose existing bridge only
     /// promises inline base64 image input. Remote URLs and malformed data URLs
     /// must stay in the legacy tool-result representation.
-    #[cfg(test)]
+    #[allow(dead_code)]
+    // Retained upstream variant; native image-only consumers are outside the Codex route.
     InlineImagesOnly,
     /// Used by Chat conversion bridges, where user messages can carry all
     /// currently mapped Chat input modalities.
@@ -51,12 +50,7 @@ impl ToolMediaScope {
     }
 
     fn accepts_chat_part(self, part: &Value) -> bool {
-        #[cfg(test)]
-        if matches!(self, Self::InlineImagesOnly) {
-            return chat_image_part_has_inline_data(part);
-        }
-        let _ = part;
-        true
+        !matches!(self, Self::InlineImagesOnly) || chat_image_part_has_inline_data(part)
     }
 }
 
@@ -190,7 +184,6 @@ pub(crate) fn whole_string_image_data_url(value: &str) -> Option<Value> {
 
 /// Read-only media detection using the same shape classifier and recursive
 /// boundaries as [`strip_media_from_tool_value`].
-#[cfg(test)]
 pub(crate) fn tool_output_contains_media(value: &Value, scope: ToolMediaScope) -> bool {
     tool_output_contains_media_at_depth(value, scope, 0)
 }
@@ -202,7 +195,6 @@ pub(crate) fn tool_output_contains_media(value: &Value, scope: ToolMediaScope) -
 /// an originally plain string stays a plain string. Parseable JSON strings are
 /// recursively transformed and canonicalized back into a string only when a
 /// replacement actually occurred.
-#[cfg(test)]
 pub(crate) fn strip_media_from_tool_value(
     value: &mut Value,
     media_parts: &mut Vec<Value>,
@@ -277,7 +269,6 @@ pub(crate) fn clamp_base64ish_strings(value: &mut Value) {
     }
 }
 
-#[cfg(test)]
 fn tool_output_contains_media_at_depth(value: &Value, scope: ToolMediaScope, depth: usize) -> bool {
     if depth > MAX_MEDIA_TRAVERSAL_DEPTH {
         return false;
@@ -572,7 +563,6 @@ fn image_url_content_part(image_url: Value) -> Value {
     Value::Object(content_part)
 }
 
-#[cfg(test)]
 fn chat_image_part_has_inline_data(part: &Value) -> bool {
     part.pointer("/image_url/url")
         .and_then(Value::as_str)
