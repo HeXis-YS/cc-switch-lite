@@ -1,0 +1,28 @@
+version = 1
+
+[server]
+listen = "0.0.0.0:15721"
+
+[route]
+provider = "provider-a"
+
+[[providers]]
+id = "provider-a"
+name = "Provider A"
+protocol = "responses"
+base_url = "https://example.com/v1"
+api_key = "replace-with-your-key"
+
+[[providers]]
+id = "provider-b"
+name = "Provider B"
+protocol = "chat_completions"
+base_url = "https://example.org/v1"
+api_key = "replace-with-your-key"
+
+[[providers]]
+id = "provider-c"
+name = "Provider C"
+protocol = "messages"
+base_url = "https://api.anthropic.com/v1"
+api_key = "replace-with-your-key"
