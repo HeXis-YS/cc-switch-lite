@@ -405,13 +405,32 @@ pub fn responses_request_to_anthropic(
     // unsupported hosted tools (for example web_search) must drop tool_choice too.
     if has_tools {
         if let Some(tc) = body.get("tool_choice") {
-            let mapped = map_tool_choice_to_anthropic(tc, &tool_context);
+            let mut mapped = map_tool_choice_to_anthropic(tc, &tool_context);
             let forced = matches!(
                 mapped.get("type").and_then(|value| value.as_str()),
                 Some("any" | "tool")
             );
             if thinking_enabled && forced {
-                if cannot_disable_thinking {
+                // Opus 5.5 / Sonnet 5.5 / Fable 5.1: preserve adaptive thinking, convert forced tool_choice to auto + system instruction
+                let is_5_5_generation = crate::proxy::thinking_optimizer::is_opus_5_5(model)
+                    || crate::proxy::thinking_optimizer::is_sonnet_5_5(model)
+                    || crate::proxy::thinking_optimizer::is_fable_5_1(model);
+                
+                if is_5_5_generation {
+                    let instruction = "You must use the provided tools to complete this task. Select and call the appropriate tool(s) based on the user's request.";
+                    let system = result.get("system")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    result["system"] = json!(if system.is_empty() {
+                        instruction.to_string()
+                    } else {
+                        format!("{system}\n\n{instruction}")
+                    });
+                    log::warn!(
+                        "[Codex 5.5 compatibility] forced tool_choice converted to auto; tool intent is best-effort"
+                    );
+                    mapped = json!({ "type": "auto" });
+                } else if cannot_disable_thinking {
                     return Err(ProxyError::InvalidRequest(
                         "Anthropic model requires adaptive thinking and cannot honor a forced tool_choice"
                             .to_string(),
