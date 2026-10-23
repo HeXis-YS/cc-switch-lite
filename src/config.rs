@@ -315,3 +315,53 @@ mod tests {
         );
     }
 }
+
+#[test]
+fn test_route_ccs_model() {
+    let config = Config {
+        version: 1,
+        compat: Default::default(),
+        server: Server::default(),
+        route: Route::default(),
+        routes: vec![
+            RouteRule {
+                name: "claude-models".into(),
+                model_pattern: "claude-*".into(),
+                provider: "openlux-claude".into(),
+            },
+        ],
+        providers: vec![
+            Provider {
+                id: "openlux-claude".into(),
+                name: "OpenLux Claude".into(),
+                protocol: Protocol::Messages,
+                base_url: "https://api.openlux.ai/v1".into(),
+                api_key: "sk-test".into(),
+                compat: Default::default(),
+            },
+            Provider {
+                id: "openlux".into(),
+                name: "OpenLux".into(),
+                protocol: Protocol::Responses,
+                base_url: "https://api.openlux.ai/v1".into(),
+                api_key: "sk-test".into(),
+                compat: Default::default(),
+            },
+        ],
+        default_route: Some(DefaultRoute {
+            provider: "openlux".into(),
+        }),
+    };
+    
+    // 测试带前缀的模型名称
+    let model = "ccs-openlux-claude/claude-opus-5-5";
+    let result = config.route_for_model(model);
+    println!("Model: {}", model);
+    println!("Matched provider: {:?}", result.map(|p| &p.id));
+    
+    // 测试不带前缀的
+    let model2 = "claude-opus-5-5";
+    let result2 = config.route_for_model(model2);
+    println!("Model: {}", model2);
+    println!("Matched provider: {:?}", result2.map(|p| &p.id));
+}
