@@ -66,3 +66,10 @@ Unix / Python 3.11+ 可在构建后运行 `python3 scripts/tui-smoke.py`，通�
 检查新增 Provider、密钥掩码、0600 权限和终端恢复；日志位于 `.codex/runs/tui-<UTC>-<PID>/`。
 
 协议及 TUI 来源、版本和许可见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
+
+## 维护入口
+
+请求处理顺序位于 `src/compat/request.rs`，其私有子模块分别管理 Provider 配置投影和出站 headers。
+`src/server.rs` 保留请求解析、单 Provider 重试和最终脱敏；私有 transport 模块负责一次上游发送及响应提交前校验。
+`src/compat/response.rs` 负责成功响应转换，私有 error 模块集中客户端错误响应；现有模块导出路径保持不变。
+重试使用首次准备的具名响应选项和原始工具上下文，不能因修正请求体而重新计算这些状态。
