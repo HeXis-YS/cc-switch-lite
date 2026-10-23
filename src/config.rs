@@ -1,3 +1,4 @@
+use glob_match::glob_match;
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::{collections::HashSet, io::Write, net::SocketAddr, path::Path};
@@ -9,19 +10,46 @@ pub struct Config {
     #[serde(default)]
     pub compat: crate::compat::CompatConfig,
     pub server: Server,
+    #[serde(default)]
     pub route: Route,
+    #[serde(default)]
+    pub routes: Vec<RouteRule>,
     pub providers: Vec<Provider>,
+    pub default_route: Option<DefaultRoute>,
 }
+
 #[derive(Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Server {
     pub listen: SocketAddr,
 }
-#[derive(Clone, Serialize, Deserialize)]
+
+impl Default for Server {
+    fn default() -> Self {
+        Self { listen: "127.0.0.1:15721".parse().unwrap() }
+    }
+}
+
+#[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Route {
+    #[serde(default)]
     pub provider: String,
 }
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RouteRule {
+    pub name: String,
+    pub model_pattern: String,
+    pub provider: String,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DefaultRoute {
+    pub provider: String,
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Provider {
@@ -33,6 +61,7 @@ pub struct Provider {
     #[serde(default)]
     pub compat: crate::compat::request::ProviderCompat,
 }
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Protocol {
@@ -40,6 +69,7 @@ pub enum Protocol {
     ChatCompletions,
     Messages,
 }
+
 impl Config {
     pub fn load(path: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(path).context("Cannot read configuration")?;
@@ -49,6 +79,7 @@ impl Config {
         config.validate()?;
         Ok(config)
     }
+    
     pub fn validate(&self) -> Result<()> {
         self.compat.validate()?;
         if self.version != 1 {
@@ -77,17 +108,75 @@ impl Config {
                 bail!("Provider API key must be nonempty and valid for an HTTP header");
             }
         }
-        if !ids.contains(&self.route.provider) {
-            bail!("Current route provider does not exist");
+        
+        // 验证路由规则
+        let mut route_names = HashSet::new();
+        for route in &self.routes {
+            if route.name.trim().is_empty() || !route_names.insert(&route.name) {
+                bail!("Route names must be nonempty and unique");
+            }
+            if !ids.contains(&route.provider) {
+                bail!("Route '{}' references nonexistent provider '{}'", route.name, route.provider);
+            }
+            if route.model_pattern.trim().is_empty() {
+                bail!("Route '{}' has empty model_pattern", route.name);
+            }
         }
+        
+        // 验证默认路由
+        if let Some(default) = &self.default_route {
+            if !ids.contains(&default.provider) {
+                bail!("Default route references nonexistent provider '{}'", default.provider);
+            }
+        }
+        
+        // 验证遗留单路由（向后兼容）
+        if !self.route.provider.is_empty() {
+            if !ids.contains(&self.route.provider) {
+                bail!("Legacy route provider does not exist");
+            }
+        } else {
+            // 新配置：必须有 routes 或 default_route
+            if self.routes.is_empty() && self.default_route.is_none() {
+                bail!("Configuration must have routes, default_route, or legacy route.provider");
+            }
+        }
+        
         Ok(())
     }
+    
     pub fn selected(&self) -> &Provider {
         self.providers
             .iter()
             .find(|p| p.id == self.route.provider)
+            .or_else(|| self.default_route.as_ref().and_then(|d| 
+                self.providers.iter().find(|p| p.id == d.provider)
+            ))
             .expect("validated configuration")
     }
+    
+    /// 根据模型名称选择 provider
+    pub fn route_for_model(&self, model: &str) -> Option<&Provider> {
+        // 1. 尝试匹配路由规则（按顺序，第一个匹配）
+        for route in &self.routes {
+            if glob_match(&route.model_pattern, model) {
+                return self.providers.iter().find(|p| p.id == route.provider);
+            }
+        }
+        
+        // 2. 使用默认路由
+        if let Some(default) = &self.default_route {
+            return self.providers.iter().find(|p| p.id == default.provider);
+        }
+        
+        // 3. 回退到遗留单路由（向后兼容）
+        if !self.route.provider.is_empty() {
+            return self.providers.iter().find(|p| p.id == self.route.provider);
+        }
+        
+        None
+    }
+    
     pub fn save(&self, path: &Path) -> Result<()> {
         self.validate()?;
         let parent = path
@@ -107,5 +196,122 @@ impl Config {
         temp.persist(path)
             .map_err(|_| anyhow::anyhow!("Cannot replace configuration; original retained"))?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_route_for_model() {
+        let config = Config {
+            version: 1,
+            compat: Default::default(),
+            server: Server::default(),
+            route: Route::default(),
+            routes: vec![
+                RouteRule {
+                    name: "claude".into(),
+                    model_pattern: "claude-*".into(),
+                    provider: "anthropic".into(),
+                },
+                RouteRule {
+                    name: "gpt".into(),
+                    model_pattern: "gpt-*".into(),
+                    provider: "openai".into(),
+                },
+                RouteRule {
+                    name: "deepseek".into(),
+                    model_pattern: "deepseek/*".into(),
+                    provider: "openrouter".into(),
+                },
+            ],
+            providers: vec![
+                Provider {
+                    id: "anthropic".into(),
+                    name: "Anthropic".into(),
+                    protocol: Protocol::Messages,
+                    base_url: "https://api.anthropic.com/v1".into(),
+                    api_key: "test-key".into(),
+                    compat: Default::default(),
+                },
+                Provider {
+                    id: "openai".into(),
+                    name: "OpenAI".into(),
+                    protocol: Protocol::Responses,
+                    base_url: "https://api.openai.com/v1".into(),
+                    api_key: "test-key".into(),
+                    compat: Default::default(),
+                },
+                Provider {
+                    id: "openrouter".into(),
+                    name: "OpenRouter".into(),
+                    protocol: Protocol::ChatCompletions,
+                    base_url: "https://openrouter.ai/api/v1".into(),
+                    api_key: "test-key".into(),
+                    compat: Default::default(),
+                },
+            ],
+            default_route: Some(DefaultRoute {
+                provider: "anthropic".into(),
+            }),
+        };
+
+        // 测试精确前缀匹配
+        assert_eq!(
+            config.route_for_model("claude-3-5-sonnet-20241022").unwrap().id,
+            "anthropic"
+        );
+        assert_eq!(
+            config.route_for_model("gpt-4o").unwrap().id,
+            "openai"
+        );
+        
+        // 测试路径模式
+        assert_eq!(
+            config.route_for_model("deepseek/deepseek-chat").unwrap().id,
+            "openrouter"
+        );
+        
+        // 测试默认路由
+        assert_eq!(
+            config.route_for_model("unknown-model").unwrap().id,
+            "anthropic"
+        );
+        
+        // 测试第一个匹配原则
+        let config_overlap = Config {
+            version: 1,
+            compat: Default::default(),
+            server: Server::default(),
+            route: Route::default(),
+            routes: vec![
+                RouteRule {
+                    name: "specific".into(),
+                    model_pattern: "claude-3-5-*".into(),
+                    provider: "openai".into(),
+                },
+                RouteRule {
+                    name: "general".into(),
+                    model_pattern: "claude-*".into(),
+                    provider: "anthropic".into(),
+                },
+            ],
+            providers: config.providers.clone(),
+            default_route: None,
+        };
+        
+        // 应该匹配第一个更具体的规则
+        assert_eq!(
+            config_overlap.route_for_model("claude-3-5-sonnet-20241022").unwrap().id,
+            "openai"
+        );
+        
+        // 应该匹配第二个规则
+        assert_eq!(
+            config_overlap.route_for_model("claude-3-opus").unwrap().id,
+            "anthropic"
+        );
     }
 }

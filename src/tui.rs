@@ -155,6 +155,8 @@ pub fn run(path: &Path) -> Result<()> {
             route: Route {
                 provider: String::new(),
             },
+            routes: vec![],
+            default_route: None,
             providers: vec![],
         }
     };
@@ -365,6 +367,8 @@ mod tests {
             route: Route {
                 provider: "old".into(),
             },
+            routes: vec![],
+            default_route: None,
             providers: vec![Provider {
                 id: "old".into(),
                 name: "Provider".into(),

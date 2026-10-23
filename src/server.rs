@@ -65,7 +65,7 @@ async fn responses(
     OriginalUri(uri): OriginalUri,
     body: Bytes,
 ) -> Response {
-    let provider = app.config.selected();
+
     let decoded =
         if let Some(encoding) = crate::proxy::content_encoding::get_content_encoding(&headers) {
             if !crate::proxy::content_encoding::is_supported_content_encoding(&encoding) {
@@ -108,8 +108,16 @@ async fn responses(
         .and_then(|v| v.get("stream"))
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    
+    // 根据模型名称选择 provider
+    let provider = if !model.is_empty() {
+        app.config.route_for_model(&model)
+    } else {
+        None
+    }.unwrap_or_else(|| app.config.selected());
+    
     let result = match input {
-        Ok(input) => forward(&app, &headers, input, &model, streaming, uri.query()).await,
+        Ok(input) => forward(&app, provider, &headers, input, &model, streaming, uri.query()).await,
         Err(e) => Err(e),
     };
     let response = match result {
@@ -128,13 +136,14 @@ async fn responses(
 }
 async fn forward(
     app: &App,
+    provider: &crate::config::Provider,
     headers: &HeaderMap,
     mut input: Value,
     model: &str,
     streaming: bool,
     query: Option<&str>,
 ) -> Result<Response, ProxyError> {
-    let provider = app.config.selected();
+
     let mut retried = false;
     let mut attempt_headers = headers.clone();
     let context = build_codex_tool_context_from_request(&input);
