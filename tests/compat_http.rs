@@ -106,6 +106,8 @@ impl Fixture {
             route: Route {
                 provider: "one".into(),
             },
+            routes: vec![],
+            default_route: None,
             providers: vec![Provider {
                 id: "one".into(),
                 name: "Mock".into(),

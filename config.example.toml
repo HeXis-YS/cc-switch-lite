@@ -3,8 +3,20 @@ version = 1
 [server]
 listen = "0.0.0.0:15721"
 
-[route]
+[default_route]
 provider = "provider-a"
+
+# Rules match the complete request model in order; the first match wins.
+# Matching selects a provider and does not strip or rewrite model prefixes.
+[[routes]]
+name = "claude"
+model_pattern = "claude-*"
+provider = "provider-c"
+
+[[routes]]
+name = "chat"
+model_pattern = "gpt-[45]*"
+provider = "provider-b"
 
 [[providers]]
 id = "provider-a"

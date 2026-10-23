@@ -11,6 +11,8 @@ fn valid_config() -> Config {
         route: Route {
             provider: "a".into(),
         },
+        routes: vec![],
+        default_route: None,
         providers: vec![Provider {
             id: "a".into(),
             name: "Provider A".into(),
@@ -36,8 +38,11 @@ fn roundtrip_three_protocols_and_current_selection() {
     config.route.provider = "b".into();
     config.save(&path).unwrap();
     let loaded = Config::load(&path).unwrap();
-    assert_eq!(loaded.selected().id, "b");
-    assert_eq!(loaded.selected().protocol, Protocol::ChatCompletions);
+    assert_eq!(loaded.route_for_model("example").unwrap().id, "b");
+    assert_eq!(
+        loaded.route_for_model("example").unwrap().protocol,
+        Protocol::ChatCompletions
+    );
     assert_eq!(loaded.providers[2].protocol, Protocol::Messages);
     assert_eq!(loaded.providers[0].api_key, "test-private-key");
 }
@@ -46,10 +51,7 @@ fn roundtrip_three_protocols_and_current_selection() {
 fn unknown_fields_and_invalid_toml_have_no_secret_diagnostics() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("config.toml");
-    let mut missing_route = toml::Value::try_from(valid_config()).unwrap();
-    missing_route.as_table_mut().unwrap().remove("route");
     for input in [
-        toml::to_string(&missing_route).unwrap(),
         format!(
             "unexpected = \"test-private-key\"\n{}",
             toml::to_string(&valid_config()).unwrap()
@@ -71,7 +73,7 @@ fn missing_route_and_duplicate_provider_are_rejected() {
     config.route.provider = "absent".into();
     assert_eq!(
         config.validate().unwrap_err().to_string(),
-        "Current route provider does not exist"
+        "Legacy route provider does not exist"
     );
     config.route.provider = "a".into();
     config.providers.push(config.providers[0].clone());
@@ -156,9 +158,52 @@ fn invalid_route_prevents_server_startup() {
         .unwrap();
     assert!(!output.status.success());
     assert!(
-        String::from_utf8_lossy(&output.stderr).contains("Current route provider does not exist")
+        String::from_utf8_lossy(&output.stderr).contains("Legacy route provider does not exist")
     );
     assert!(!String::from_utf8_lossy(&output.stderr).contains("test-private-key"));
+}
+
+#[test]
+fn new_config_roundtrips_without_empty_legacy_fields_and_accepts_appended_rules() {
+    use cc_switch_lite::config::{DefaultRoute, RouteRule};
+    let mut config = valid_config();
+    config.route = Route::default();
+    config.default_route = Some(DefaultRoute {
+        provider: "a".into(),
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    config.save(&path).unwrap();
+    let text = fs::read_to_string(&path).unwrap();
+    assert!(!text.contains("routes = []"));
+    assert!(!text.contains("[route]"));
+    fs::write(
+        &path,
+        format!(
+            "{text}\n[[routes]]\nname = 'claude'\nmodel_pattern = 'claude-*'\nprovider = 'a'\n"
+        ),
+    )
+    .unwrap();
+    let loaded = Config::load(&path).unwrap();
+    assert_eq!(loaded.route_for_model("claude-opus-5-5").unwrap().id, "a");
+    config.default_route = None;
+    assert!(config.validate().is_err());
+    config.routes.push(RouteRule {
+        name: "claude".into(),
+        model_pattern: "claude-*".into(),
+        provider: "a".into(),
+    });
+    config.save(&path).unwrap();
+    let loaded = Config::load(&path).unwrap();
+    assert!(loaded.route_for_model("gpt-4o").is_none());
+    config.routes[0].provider = "missing".into();
+    assert!(config.validate().is_err());
+}
+
+#[test]
+fn documented_example_is_valid() {
+    let config: Config = toml::from_str(include_str!("../config.example.toml")).unwrap();
+    config.validate().unwrap();
 }
 
 #[test]

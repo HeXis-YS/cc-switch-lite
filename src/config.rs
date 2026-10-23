@@ -1,5 +1,5 @@
-use glob_match::glob_match;
 use anyhow::{bail, Context, Result};
+use glob_match::glob_match;
 use serde::{Deserialize, Serialize};
 use std::{collections::HashSet, io::Write, net::SocketAddr, path::Path};
 
@@ -10,9 +10,9 @@ pub struct Config {
     #[serde(default)]
     pub compat: crate::compat::CompatConfig,
     pub server: Server,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Route::is_empty")]
     pub route: Route,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub routes: Vec<RouteRule>,
     pub providers: Vec<Provider>,
     pub default_route: Option<DefaultRoute>,
@@ -25,7 +25,9 @@ pub struct Server {
 
 impl Default for Server {
     fn default() -> Self {
-        Self { listen: "127.0.0.1:15721".parse().unwrap() }
+        Self {
+            listen: "127.0.0.1:15721".parse().unwrap(),
+        }
     }
 }
 
@@ -34,6 +36,12 @@ impl Default for Server {
 pub struct Route {
     #[serde(default)]
     pub provider: String,
+}
+
+impl Route {
+    fn is_empty(&self) -> bool {
+        self.provider.is_empty()
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -79,7 +87,7 @@ impl Config {
         config.validate()?;
         Ok(config)
     }
-    
+
     pub fn validate(&self) -> Result<()> {
         self.compat.validate()?;
         if self.version != 1 {
@@ -108,7 +116,7 @@ impl Config {
                 bail!("Provider API key must be nonempty and valid for an HTTP header");
             }
         }
-        
+
         // 验证路由规则
         let mut route_names = HashSet::new();
         for route in &self.routes {
@@ -116,45 +124,39 @@ impl Config {
                 bail!("Route names must be nonempty and unique");
             }
             if !ids.contains(&route.provider) {
-                bail!("Route '{}' references nonexistent provider '{}'", route.name, route.provider);
+                bail!(
+                    "Route '{}' references nonexistent provider '{}'",
+                    route.name,
+                    route.provider
+                );
             }
             if route.model_pattern.trim().is_empty() {
                 bail!("Route '{}' has empty model_pattern", route.name);
             }
         }
-        
+
         // 验证默认路由
         if let Some(default) = &self.default_route {
             if !ids.contains(&default.provider) {
-                bail!("Default route references nonexistent provider '{}'", default.provider);
+                bail!(
+                    "Default route references nonexistent provider '{}'",
+                    default.provider
+                );
             }
         }
-        
+
         // 验证遗留单路由（向后兼容）
         if !self.route.provider.is_empty() {
             if !ids.contains(&self.route.provider) {
                 bail!("Legacy route provider does not exist");
             }
-        } else {
-            // 新配置：必须有 routes 或 default_route
-            if self.routes.is_empty() && self.default_route.is_none() {
-                bail!("Configuration must have routes, default_route, or legacy route.provider");
-            }
+        } else if self.routes.is_empty() && self.default_route.is_none() {
+            bail!("Configuration must have routes, default_route, or legacy route.provider");
         }
-        
+
         Ok(())
     }
-    
-    pub fn selected(&self) -> &Provider {
-        self.providers
-            .iter()
-            .find(|p| p.id == self.route.provider)
-            .or_else(|| self.default_route.as_ref().and_then(|d| 
-                self.providers.iter().find(|p| p.id == d.provider)
-            ))
-            .expect("validated configuration")
-    }
-    
+
     /// 根据模型名称选择 provider
     pub fn route_for_model(&self, model: &str) -> Option<&Provider> {
         // 1. 尝试匹配路由规则（按顺序，第一个匹配）
@@ -163,20 +165,20 @@ impl Config {
                 return self.providers.iter().find(|p| p.id == route.provider);
             }
         }
-        
+
         // 2. 使用默认路由
         if let Some(default) = &self.default_route {
             return self.providers.iter().find(|p| p.id == default.provider);
         }
-        
+
         // 3. 回退到遗留单路由（向后兼容）
         if !self.route.provider.is_empty() {
             return self.providers.iter().find(|p| p.id == self.route.provider);
         }
-        
+
         None
     }
-    
+
     pub fn save(&self, path: &Path) -> Result<()> {
         self.validate()?;
         let parent = path
@@ -260,26 +262,26 @@ mod tests {
 
         // 测试精确前缀匹配
         assert_eq!(
-            config.route_for_model("claude-3-5-sonnet-20241022").unwrap().id,
+            config
+                .route_for_model("claude-3-5-sonnet-20241022")
+                .unwrap()
+                .id,
             "anthropic"
         );
-        assert_eq!(
-            config.route_for_model("gpt-4o").unwrap().id,
-            "openai"
-        );
-        
+        assert_eq!(config.route_for_model("gpt-4o").unwrap().id, "openai");
+
         // 测试路径模式
         assert_eq!(
             config.route_for_model("deepseek/deepseek-chat").unwrap().id,
             "openrouter"
         );
-        
+
         // 测试默认路由
         assert_eq!(
             config.route_for_model("unknown-model").unwrap().id,
             "anthropic"
         );
-        
+
         // 测试第一个匹配原则
         let config_overlap = Config {
             version: 1,
@@ -301,13 +303,16 @@ mod tests {
             providers: config.providers.clone(),
             default_route: None,
         };
-        
+
         // 应该匹配第一个更具体的规则
         assert_eq!(
-            config_overlap.route_for_model("claude-3-5-sonnet-20241022").unwrap().id,
+            config_overlap
+                .route_for_model("claude-3-5-sonnet-20241022")
+                .unwrap()
+                .id,
             "openai"
         );
-        
+
         // 应该匹配第二个规则
         assert_eq!(
             config_overlap.route_for_model("claude-3-opus").unwrap().id,
@@ -323,13 +328,11 @@ fn test_route_ccs_model() {
         compat: Default::default(),
         server: Server::default(),
         route: Route::default(),
-        routes: vec![
-            RouteRule {
-                name: "claude-models".into(),
-                model_pattern: "claude-*".into(),
-                provider: "openlux-claude".into(),
-            },
-        ],
+        routes: vec![RouteRule {
+            name: "claude-models".into(),
+            model_pattern: "claude-*".into(),
+            provider: "openlux-claude".into(),
+        }],
         providers: vec![
             Provider {
                 id: "openlux-claude".into(),
@@ -352,16 +355,14 @@ fn test_route_ccs_model() {
             provider: "openlux".into(),
         }),
     };
-    
+
     // 测试带前缀的模型名称
     let model = "ccs-openlux-claude/claude-opus-5-5";
     let result = config.route_for_model(model);
-    println!("Model: {}", model);
-    println!("Matched provider: {:?}", result.map(|p| &p.id));
-    
+    assert_eq!(result.unwrap().id, "openlux");
+
     // 测试不带前缀的
     let model2 = "claude-opus-5-5";
     let result2 = config.route_for_model(model2);
-    println!("Model: {}", model2);
-    println!("Matched provider: {:?}", result2.map(|p| &p.id));
+    assert_eq!(result2.unwrap().id, "openlux-claude");
 }

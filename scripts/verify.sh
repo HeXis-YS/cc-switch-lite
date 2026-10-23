@@ -1,11 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 cd "$(dirname "$0")/.."
+export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-2}"
+export RUST_TEST_THREADS="${RUST_TEST_THREADS:-2}"
 mkdir -p .codex/runs
 run=".codex/runs/$(date -u +%Y%m%dT%H%M%S)-$$"
 mkdir "$run"
 exec > >(tee "$run/output.log") 2>&1
 printf 'Run: %s\n' "$run"
+printf 'CARGO_BUILD_JOBS=%s RUST_TEST_THREADS=%s\n' "$CARGO_BUILD_JOBS" "$RUST_TEST_THREADS"
 rustc --version
 cargo --version
 git rev-parse --verify HEAD 2>/dev/null || printf 'Uncommitted initial repository\n'

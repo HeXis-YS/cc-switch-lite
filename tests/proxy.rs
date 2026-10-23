@@ -64,6 +64,8 @@ fn config(url: &str, protocol: Protocol) -> Config {
         route: Route {
             provider: "one".into(),
         },
+        routes: vec![],
+        default_route: None,
         providers: vec![Provider {
             id: "one".into(),
             name: "One".into(),
@@ -141,6 +143,78 @@ async fn json_protocols_preserve_model_and_use_correct_auth() {
         for task in tasks {
             task.abort();
         }
+    }
+}
+
+#[tokio::test]
+async fn model_routes_select_upstream_credentials_and_reject_unmatched_requests() {
+    use cc_switch_lite::config::{DefaultRoute, RouteRule};
+    let native = Mock {
+        calls: Arc::default(),
+        body: json!({"id":"resp_native","object":"response","output":[]}).to_string(),
+        sse: false,
+        status: StatusCode::OK,
+    };
+    let messages = Mock { calls: Arc::default(), body: json!({"id":"msg_route","type":"message","role":"assistant","content":[{"type":"text","text":"routed"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}).to_string(), sse: false, status: StatusCode::OK };
+    let (native_url, n) = start(
+        Router::new()
+            .route("/v1/responses", post(upstream))
+            .with_state(native.clone()),
+    )
+    .await;
+    let (messages_url, m) = start(
+        Router::new()
+            .route("/v1/messages", post(upstream))
+            .with_state(messages.clone()),
+    )
+    .await;
+    let mut config = config(&native_url, Protocol::Responses);
+    let mut provider = config.providers[0].clone();
+    provider.id = "messages".into();
+    provider.protocol = Protocol::Messages;
+    provider.base_url = format!("{messages_url}/v1");
+    provider.api_key = "messages-only-key".into();
+    config.providers.push(provider);
+    config.route = Route::default();
+    config.routes.push(RouteRule {
+        name: "claude".into(),
+        model_pattern: "claude-*".into(),
+        provider: "messages".into(),
+    });
+    // No default: matched requests must work without consulting a legacy selection.
+    let (url, p) = start(server::router(config.clone()).unwrap()).await;
+    let response = send(&url, json!({"model":"claude-opus-5-5","input":"hi"})).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let result: Value = response.json().await.unwrap();
+    assert_eq!(result["object"], "response");
+    for input in [
+        json!({"model":"unknown","input":"hi"}),
+        json!({"input":"hi"}),
+        json!({"model":42,"input":"hi"}),
+    ] {
+        assert_eq!(send(&url, input).await.status(), StatusCode::BAD_REQUEST);
+    }
+    assert!(native.calls.lock().await.is_empty());
+    let calls = messages.calls.lock().await;
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].0["x-api-key"], "messages-only-key");
+    assert_eq!(calls[0].1["model"], "claude-opus-5-5");
+    drop(calls);
+    config.default_route = Some(DefaultRoute {
+        provider: "one".into(),
+    });
+    let (url, d) = start(server::router(config).unwrap()).await;
+    assert_eq!(
+        send(&url, json!({"model":"unknown","input":"hi"}))
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    let calls = native.calls.lock().await;
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].0["authorization"], "Bearer secret-credential-123");
+    for task in [n, m, p, d] {
+        task.abort();
     }
 }
 #[tokio::test]

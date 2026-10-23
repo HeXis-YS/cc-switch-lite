@@ -65,7 +65,6 @@ async fn responses(
     OriginalUri(uri): OriginalUri,
     body: Bytes,
 ) -> Response {
-
     let decoded =
         if let Some(encoding) = crate::proxy::content_encoding::get_content_encoding(&headers) {
             if !crate::proxy::content_encoding::is_supported_content_encoding(&encoding) {
@@ -108,21 +107,37 @@ async fn responses(
         .and_then(|v| v.get("stream"))
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    
-    // 根据模型名称选择 provider
-    let provider = if !model.is_empty() {
-        app.config.route_for_model(&model)
-    } else {
-        None
-    }.unwrap_or_else(|| app.config.selected());
-    
-    let result = match input {
-        Ok(input) => forward(&app, provider, &headers, input, &model, streaming, uri.query()).await,
-        Err(e) => Err(e),
+
+    let provider = app.config.route_for_model(&model);
+    let result = match (input, provider) {
+        (Err(e), _) => Err(e),
+        (Ok(_), _) if model.trim().is_empty() => Err(ProxyError::InvalidRequest(
+            "model must be a nonempty string".into(),
+        )),
+        (Ok(input), Some(provider)) => {
+            forward(
+                &app,
+                provider,
+                &headers,
+                input,
+                &model,
+                streaming,
+                uri.query(),
+            )
+            .await
+        }
+        (Ok(_), None) => Err(ProxyError::InvalidRequest(
+            "No route matches model and no default route is configured".into(),
+        )),
     };
     let response = match result {
         Ok(r) => r,
-        Err(e) => response::proxy_error_response(&provider.name, &model, streaming, &e),
+        Err(e) => response::proxy_error_response(
+            provider.map_or("unselected", |p| p.name.as_str()),
+            &model,
+            streaming,
+            &e,
+        ),
     };
     secrets::protect(
         response,
@@ -143,7 +158,6 @@ async fn forward(
     streaming: bool,
     query: Option<&str>,
 ) -> Result<Response, ProxyError> {
-
     let mut retried = false;
     let mut attempt_headers = headers.clone();
     let context = build_codex_tool_context_from_request(&input);
@@ -174,7 +188,7 @@ async fn forward(
                 xai_restore: prepared.xai_restore.clone(),
             });
         }
-        let attempted = transport::send(app, &prepared).await;
+        let attempted = transport::send(app, provider.protocol, &prepared).await;
         match attempted {
             Ok(upstream) => {
                 let options = stable_response_options

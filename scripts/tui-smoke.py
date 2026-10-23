@@ -81,13 +81,34 @@ def main():
             os.write(master, b"smoke\tSmoke Provider\thttps://example.com/v1\t" + secret + b"\x13")
             drain_until(lambda: config.exists())
             content = tomllib.loads(config.read_text())
-            assert content["route"]["provider"] == "smoke", "Route not selected"
+            assert content["default_route"]["provider"] == "smoke", "Default route not selected"
+            assert "route" not in content and "routes" not in content, "Empty legacy fields persisted"
             assert content["providers"][0] == {
                 "id": "smoke", "name": "Smoke Provider", "protocol": "responses",
                 "base_url": "https://example.com/v1", "api_key": secret.decode(),
                 "compat": {"meta": {}, "settings_config": {}},
             }, "Saved provider differs from input"
             assert config.stat().st_mode & 0o777 == 0o600, "Configuration permissions not private"
+            os.write(master, b"\ta")
+            # Ratatui draws only changed cells: a reused "Edit " prefix need not
+            # appear again in the PTY byte stream. Verify the saved state below.
+            os.write(master, b"claude\tclaude-*\tsmoke\x13")
+            drain_until(lambda: len(tomllib.loads(config.read_text()).get("routes", [])) == 1)
+            assert tomllib.loads(config.read_text())["routes"][0] == {
+                "name": "claude", "model_pattern": "claude-*", "provider": "smoke",
+            }, "Route editor did not persist the rule"
+            # Add a second rule, reorder it, then delete it through the confirmation.
+            os.write(master, b"aother\tgpt-*\tsmoke\x13")
+            drain_until(lambda: len(tomllib.loads(config.read_text()).get("routes", [])) == 2)
+            os.write(master, b"J")
+            drain_until(lambda: tomllib.loads(config.read_text())["routes"][0]["name"] == "other")
+            os.write(master, b"kdy")
+            drain_until(lambda: len(tomllib.loads(config.read_text())["routes"]) == 1)
+            # Edit the remaining rule's name and clear the default.
+            os.write(master, b"e\x15renamed\x13")
+            drain_until(lambda: tomllib.loads(config.read_text())["routes"][0]["name"] == "renamed")
+            os.write(master, b"x")
+            drain_until(lambda: "default_route" not in tomllib.loads(config.read_text()))
             os.write(master, b"q")
             process.wait(timeout=max(0.1, deadline - time.monotonic()))
             while select.select([master], [], [], 0)[0]:
@@ -95,7 +116,7 @@ def main():
             assert process.returncode == 0, "TUI exit failed"
             assert termios.tcgetattr(slave) == original, "Terminal settings were not restored"
             assert secret not in captured, "Credential appeared in terminal output"
-            result = "PASS: provider saved, route selected, key masked, mode 0600, terminal restored\n"
+            result = "PASS: provider saved, routes created/edited/reordered/deleted, default cleared, key masked, mode 0600, terminal restored\n"
             (run / "output.log").write_text(result)
             print(result.strip())
             print(f"Run: {run.relative_to(root)}")

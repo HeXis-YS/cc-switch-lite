@@ -7,9 +7,9 @@ use crate::{
 };
 pub(super) async fn send(
     app: &App,
+    protocol: Protocol,
     prepared: &request::Prepared,
 ) -> Result<reqwest::Response, ProxyError> {
-    let provider = app.config.selected();
     let mut outgoing = app
         .client
         .post(&prepared.url)
@@ -64,7 +64,7 @@ pub(super) async fn send(
                 .to_ascii_lowercase();
             mime == "application/json" || mime.ends_with("+json")
         });
-    if provider.protocol == Protocol::Messages && (!prepared.request_is_streaming || is_json) {
+    if protocol == Protocol::Messages && (!prepared.request_is_streaming || is_json) {
         let (headers, status, bytes) = response::decode_response(upstream).await?;
         retry::validate_anthropic_body(&bytes)?;
         let mut response = http::Response::new(bytes);
@@ -72,7 +72,7 @@ pub(super) async fn send(
         *response.headers_mut() = headers;
         return Ok(response.into());
     }
-    if provider.protocol == Protocol::Responses
+    if protocol == Protocol::Responses
         && prepared.request_is_streaming
         && !is_json
         && app.config.compat.rectifier.enabled
