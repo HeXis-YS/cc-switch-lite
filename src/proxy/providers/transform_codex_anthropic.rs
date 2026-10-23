@@ -305,6 +305,8 @@ pub fn responses_request_to_anthropic(
     let adaptive_by_default = crate::proxy::thinking_optimizer::adaptive_thinking_is_default(model);
     let cannot_disable_thinking =
         crate::proxy::thinking_optimizer::thinking_cannot_be_disabled(model);
+    let unsigned_adaptive_tools =
+        crate::proxy::thinking_optimizer::supports_unsigned_adaptive_tools(model);
 
     // max_output_tokens → max_tokens (required)
     let max_tokens = body
@@ -323,7 +325,10 @@ pub fn responses_request_to_anthropic(
                 .and_then(codex_effort_to_anthropic)
                 .is_some());
 
-    if !thinking_history_is_valid {
+    // Selected adaptive models accept complete unsigned tool turns (for example after switching
+    // providers). Keep their original calls/results; never invent a signature or
+    // disable mandatory thinking. Other generations retain the existing check.
+    if !thinking_history_is_valid && !unsigned_adaptive_tools {
         if cannot_disable_thinking {
             return Err(ProxyError::InvalidRequest(
                 "Anthropic model requires thinking, but the tool history has no signed thinking block to replay"
@@ -339,7 +344,7 @@ pub fn responses_request_to_anthropic(
         if let Some(effort) = reasoning_effort.and_then(codex_effort_to_anthropic) {
             result["output_config"] = json!({ "effort": effort });
         } else if explicitly_disabled && cannot_disable_thinking {
-            // Fable/Mythos cannot turn thinking off. `low` is the closest safe
+            // Mandatory-thinking models cannot turn it off. `low` is the closest safe
             // representation of Codex's explicit `none` request.
             result["output_config"] = json!({ "effort": "low" });
         }
@@ -410,27 +415,43 @@ pub fn responses_request_to_anthropic(
                 mapped.get("type").and_then(|value| value.as_str()),
                 Some("any" | "tool")
             );
-            if thinking_enabled && forced {
-                // Opus 5.5 / Sonnet 5.5 / Fable 5.1: preserve adaptive thinking, convert forced tool_choice to auto + system instruction
-                let is_5_5_generation = crate::proxy::thinking_optimizer::is_opus_5_5(model)
-                    || crate::proxy::thinking_optimizer::is_sonnet_5_5(model)
-                    || crate::proxy::thinking_optimizer::is_fable_5_1(model);
-                
-                if is_5_5_generation {
-                    let instruction = "You must use the provided tools to complete this task. Select and call the appropriate tool(s) based on the user's request.";
-                    let system = result.get("system")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
-                    result["system"] = json!(if system.is_empty() {
-                        instruction.to_string()
-                    } else {
-                        format!("{system}\n\n{instruction}")
-                    });
-                    log::warn!(
-                        "[Codex 5.5 compatibility] forced tool_choice converted to auto; tool intent is best-effort"
-                    );
-                    mapped = json!({ "type": "auto" });
-                } else if cannot_disable_thinking {
+            if thinking_enabled && forced && unsigned_adaptive_tools {
+                // These models reject `any`/`tool` even with adaptive thinking. Use
+                // auto plus a request-local instruction, and constrain named
+                // selection to the requested tool. This is best-effort, not a
+                // protocol-level guarantee; log the downgrade explicitly.
+                let requested_name = mapped
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                let instruction = if let Some(name) = requested_name.as_deref() {
+                    let tools = result["tools"].as_array_mut().unwrap();
+                    tools.retain(|tool| tool.get("name").and_then(Value::as_str) == Some(name));
+                    if tools.is_empty() {
+                        return Err(ProxyError::InvalidRequest(
+                            "forced tool is not available in the converted tool list".to_string(),
+                        ));
+                    }
+                    format!(
+                        "For this response, call the tool {} before providing a final answer.",
+                        json!(name)
+                    )
+                } else {
+                    "For this response, call at least one available tool before providing a final answer."
+                        .to_string()
+                };
+                let system = result.get("system").and_then(Value::as_str).unwrap_or("");
+                result["system"] = json!(if system.is_empty() {
+                    instruction
+                } else {
+                    format!("{system}\n\n{instruction}")
+                });
+                log::warn!(
+                    "[Codex adaptive tool compatibility] forced tool_choice converted to auto; tool intent is best-effort"
+                );
+                mapped = json!({ "type": "auto" });
+            } else if thinking_enabled && forced {
+                if cannot_disable_thinking {
                     return Err(ProxyError::InvalidRequest(
                         "Anthropic model requires adaptive thinking and cannot honor a forced tool_choice"
                             .to_string(),
@@ -2328,6 +2349,61 @@ mod tests {
         assert_eq!(result["tools"].as_array().unwrap().len(), 1);
         assert_eq!(result["tools"][0]["name"], "apply_patch");
         assert_eq!(result["tool_choice"], json!({ "type": "any" }));
+    }
+
+    #[test]
+    fn selected_adaptive_models_preserve_unsigned_tools_and_constrain_forced_choice() {
+        for model in [
+            "claude-opus-5-5",
+            "claude-sonnet-5-5",
+            "claude-fable-5-1",
+            "claude-haiku-5-5",
+        ] {
+            let input = json!({
+                "model": model,
+                "instructions": "Keep this instruction.",
+                "reasoning": {"effort": "none"},
+                "input": [
+                    {"type": "function_call", "call_id": "c1", "name": "x", "arguments": "{}"},
+                    {"type": "function_call_output", "call_id": "c1", "output": "ok"}
+                ],
+                "tools": [
+                    {"type": "function", "name": "x", "parameters": {"type": "object"}},
+                    {"type": "function", "name": "y", "parameters": {"type": "object"}}
+                ],
+                "tool_choice": {"type": "function", "name": "x"}
+            });
+            let result = responses_request_to_anthropic(input.clone(), 4096).unwrap();
+            assert_eq!(result["thinking"]["type"], "adaptive", "{model}");
+            assert_eq!(result["output_config"]["effort"], "low");
+            assert_eq!(result["tool_choice"]["type"], "auto");
+            assert_eq!(result["tools"].as_array().unwrap().len(), 1);
+            assert_eq!(result["tools"][0]["name"], "x");
+            assert!(result["system"]
+                .as_str()
+                .unwrap()
+                .contains("Keep this instruction."));
+            let messages = result["messages"].to_string();
+            assert!(messages.contains("tool_use") && messages.contains("tool_result"));
+            assert!(!messages.contains("signature"));
+            let mut required = input.clone();
+            required["tool_choice"] = json!("required");
+            let result = responses_request_to_anthropic(required, 4096).unwrap();
+            assert_eq!(result["tools"].as_array().unwrap().len(), 2);
+            assert_eq!(result["tool_choice"]["type"], "auto");
+            let mut missing = input;
+            missing["tool_choice"]["name"] = json!("missing");
+            assert!(responses_request_to_anthropic(missing, 4096).is_err());
+        }
+        for model in [
+            "claude-haiku-5",
+            "claude-opus-5",
+            "claude-sonnet-5",
+            "claude-fable-5",
+            "claude-opus-5-50",
+        ] {
+            assert!(!crate::proxy::thinking_optimizer::supports_unsigned_adaptive_tools(model));
+        }
     }
 
     #[test]
