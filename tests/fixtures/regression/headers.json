@@ -1,0 +1,503 @@
+[
+  {
+    "accept": [
+      "text/event-stream"
+    ],
+    "accept-encoding": [
+      "identity"
+    ],
+    "authorization": [
+      "Bearer provider-secret"
+    ],
+    "content-type": [
+      "application/json"
+    ],
+    "host": [
+      "example.org"
+    ],
+    "x-codex-beta-features": [
+      "test-feature"
+    ],
+    "x-openai-internal": [
+      "private"
+    ]
+  },
+  {
+    "accept": [
+      "text/event-stream"
+    ],
+    "accept-encoding": [
+      "identity"
+    ],
+    "authorization": [
+      "Bearer provider-secret"
+    ],
+    "content-type": [
+      "application/json"
+    ],
+    "host": [
+      "example.org"
+    ],
+    "session_id": [
+      "00000000-0000-0000-0000-000000000001"
+    ],
+    "user-agent": [
+      "codex/test"
+    ],
+    "x-codex-beta-features": [
+      "test-feature"
+    ],
+    "x-openai-internal": [
+      "private"
+    ]
+  },
+  {
+    "accept": [
+      "text/event-stream"
+    ],
+    "accept-encoding": [
+      "identity"
+    ],
+    "authorization": [
+      "Bearer provider-secret"
+    ],
+    "content-type": [
+      "application/json"
+    ],
+    "host": [
+      "example.org"
+    ],
+    "x-codex-beta-features": [
+      "test-feature"
+    ],
+    "x-openai-internal": [
+      "private"
+    ]
+  },
+  {
+    "accept": [
+      "text/event-stream"
+    ],
+    "accept-encoding": [
+      "identity"
+    ],
+    "authorization": [
+      "Bearer provider-secret"
+    ],
+    "content-type": [
+      "application/json"
+    ],
+    "host": [
+      "example.org"
+    ],
+    "session_id": [
+      "00000000-0000-0000-0000-000000000001"
+    ],
+    "user-agent": [
+      "codex/test"
+    ],
+    "x-codex-beta-features": [
+      "test-feature"
+    ],
+    "x-openai-internal": [
+      "private"
+    ]
+  },
+  {
+    "accept": [
+      "text/event-stream"
+    ],
+    "accept-encoding": [
+      "identity"
+    ],
+    "authorization": [
+      "Bearer provider-secret"
+    ],
+    "content-type": [
+      "application/json"
+    ],
+    "host": [
+      "example.org"
+    ],
+    "x-codex-beta-features": [
+      "test-feature"
+    ],
+    "x-openai-internal": [
+      "private"
+    ]
+  },
+  {
+    "accept": [
+      "text/event-stream"
+    ],
+    "accept-encoding": [
+      "identity"
+    ],
+    "authorization": [
+      "Bearer provider-secret"
+    ],
+    "content-type": [
+      "application/json"
+    ],
+    "host": [
+      "example.org"
+    ],
+    "session_id": [
+      "00000000-0000-0000-0000-000000000001"
+    ],
+    "user-agent": [
+      "codex/test"
+    ],
+    "x-codex-beta-features": [
+      "test-feature"
+    ],
+    "x-openai-internal": [
+      "private"
+    ]
+  },
+  {
+    "accept": [
+      "application/json"
+    ],
+    "accept-encoding": [
+      "identity"
+    ],
+    "anthropic-beta": [
+      "context-1m-2025-08-07"
+    ],
+    "anthropic-version": [
+      "2023-06-01"
+    ],
+    "content-type": [
+      "application/json"
+    ],
+    "host": [
+      "example.org"
+    ],
+    "x-api-key": [
+      "provider-secret"
+    ]
+  },
+  {
+    "accept": [
+      "application/json"
+    ],
+    "accept-encoding": [
+      "identity"
+    ],
+    "anthropic-beta": [
+      "context-1m-2025-08-07"
+    ],
+    "anthropic-version": [
+      "2023-06-01"
+    ],
+    "content-type": [
+      "application/json"
+    ],
+    "host": [
+      "example.org"
+    ],
+    "user-agent": [
+      "codex/test"
+    ],
+    "x-api-key": [
+      "provider-secret"
+    ]
+  },
+  {
+    "accept": [
+      "application/json"
+    ],
+    "accept-encoding": [
+      "identity"
+    ],
+    "anthropic-beta": [
+      "claude-code-20250219,context-1m-2025-08-07"
+    ],
+    "anthropic-version": [
+      "2023-06-01"
+    ],
+    "content-type": [
+      "application/json"
+    ],
+    "host": [
+      "example.org"
+    ],
+    "user-agent": [
+      "claude-cli/1.0.119 (external, cli)"
+    ],
+    "x-api-key": [
+      "provider-secret"
+    ],
+    "x-app": [
+      "cli"
+    ]
+  },
+  {
+    "accept": [
+      "application/json"
+    ],
+    "accept-encoding": [
+      "identity"
+    ],
+    "anthropic-beta": [
+      "claude-code-20250219,context-1m-2025-08-07"
+    ],
+    "anthropic-version": [
+      "2023-06-01"
+    ],
+    "content-type": [
+      "application/json"
+    ],
+    "host": [
+      "example.org"
+    ],
+    "user-agent": [
+      "claude-cli/1.0.119 (external, cli)"
+    ],
+    "x-api-key": [
+      "provider-secret"
+    ],
+    "x-app": [
+      "cli"
+    ]
+  },
+  {
+    "accept": [
+      "text/event-stream"
+    ],
+    "accept-encoding": [
+      "identity"
+    ],
+    "authorization": [
+      "Bearer provider-secret"
+    ],
+    "content-type": [
+      "application/json"
+    ],
+    "host": [
+      "example.org"
+    ],
+    "user-agent": [
+      "custom-agent/7"
+    ],
+    "x-codex-beta-features": [
+      "test-feature"
+    ],
+    "x-openai-internal": [
+      "private"
+    ]
+  },
+  {
+    "accept": [
+      "text/event-stream"
+    ],
+    "accept-encoding": [
+      "identity"
+    ],
+    "authorization": [
+      "Bearer provider-secret"
+    ],
+    "content-type": [
+      "application/json"
+    ],
+    "host": [
+      "example.org"
+    ],
+    "session_id": [
+      "00000000-0000-0000-0000-000000000001"
+    ],
+    "user-agent": [
+      "custom-agent/7"
+    ],
+    "x-codex-beta-features": [
+      "test-feature"
+    ],
+    "x-openai-internal": [
+      "private"
+    ]
+  },
+  {
+    "accept": [
+      "text/event-stream"
+    ],
+    "accept-encoding": [
+      "identity"
+    ],
+    "authorization": [
+      "Bearer provider-secret"
+    ],
+    "content-type": [
+      "application/json"
+    ],
+    "host": [
+      "opencode.ai"
+    ],
+    "user-agent": [
+      "cc-switch/0.1.0"
+    ],
+    "x-codex-beta-features": [
+      "test-feature"
+    ],
+    "x-openai-internal": [
+      "private"
+    ],
+    "x-opencode-session": [
+      "short-id"
+    ]
+  },
+  {
+    "accept": [
+      "text/event-stream"
+    ],
+    "accept-encoding": [
+      "identity"
+    ],
+    "authorization": [
+      "Bearer provider-secret"
+    ],
+    "content-type": [
+      "application/json"
+    ],
+    "host": [
+      "opencode.ai"
+    ],
+    "session_id": [
+      "00000000-0000-0000-0000-000000000001"
+    ],
+    "user-agent": [
+      "codex/test"
+    ],
+    "x-codex-beta-features": [
+      "test-feature"
+    ],
+    "x-openai-internal": [
+      "private"
+    ],
+    "x-opencode-session": [
+      "00000000-0000-0000-0000-000000000001"
+    ]
+  },
+  {
+    "accept": [
+      "text/event-stream"
+    ],
+    "accept-encoding": [
+      "identity"
+    ],
+    "authorization": [
+      "Bearer provider-secret"
+    ],
+    "content-type": [
+      "application/json"
+    ],
+    "host": [
+      "opencode.ai"
+    ],
+    "user-agent": [
+      "custom-agent/7"
+    ],
+    "x-codex-beta-features": [
+      "test-feature"
+    ],
+    "x-openai-internal": [
+      "private"
+    ],
+    "x-opencode-session": [
+      "fallback-id"
+    ]
+  },
+  {
+    "accept": [
+      "text/event-stream"
+    ],
+    "accept-encoding": [
+      "identity"
+    ],
+    "authorization": [
+      "Bearer provider-secret"
+    ],
+    "content-type": [
+      "application/json"
+    ],
+    "host": [
+      "opencode.ai"
+    ],
+    "session_id": [
+      "00000000-0000-0000-0000-000000000001"
+    ],
+    "user-agent": [
+      "custom-agent/7"
+    ],
+    "x-codex-beta-features": [
+      "test-feature"
+    ],
+    "x-openai-internal": [
+      "private"
+    ],
+    "x-opencode-session": [
+      "00000000-0000-0000-0000-000000000001"
+    ]
+  },
+  {
+    "accept": [
+      "text/event-stream"
+    ],
+    "accept-encoding": [
+      "identity"
+    ],
+    "authorization": [
+      "Bearer provider-secret"
+    ],
+    "content-type": [
+      "application/json"
+    ],
+    "host": [
+      "opencode.ai"
+    ],
+    "user-agent": [
+      "cc-switch/0.1.0"
+    ],
+    "x-codex-beta-features": [
+      "test-feature"
+    ],
+    "x-openai-internal": [
+      "private"
+    ],
+    "x-opencode-session": [
+      "00000000-0000-0000-0000-000000000000"
+    ]
+  },
+  {
+    "accept": [
+      "text/event-stream"
+    ],
+    "accept-encoding": [
+      "identity"
+    ],
+    "authorization": [
+      "Bearer provider-secret"
+    ],
+    "content-type": [
+      "application/json"
+    ],
+    "host": [
+      "opencode.ai"
+    ],
+    "session_id": [
+      "00000000-0000-0000-0000-000000000001"
+    ],
+    "user-agent": [
+      "codex/test"
+    ],
+    "x-codex-beta-features": [
+      "test-feature"
+    ],
+    "x-openai-internal": [
+      "private"
+    ],
+    "x-opencode-session": [
+      "00000000-0000-0000-0000-000000000001"
+    ]
+  }
+]

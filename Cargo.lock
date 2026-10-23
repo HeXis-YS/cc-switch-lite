@@ -291,7 +291,6 @@ dependencies = [
  "base64 0.22.1",
  "brotli",
  "bytes",
- "cc-switch-reference",
  "chrono",
  "clap",
  "crossterm",
@@ -311,26 +310,6 @@ dependencies = [
  "url",
  "uuid",
  "zstd",
-]
-
-[[package]]
-name = "cc-switch-reference"
-version = "0.0.0"
-dependencies = [
- "async-stream",
- "axum",
- "base64 0.22.1",
- "bytes",
- "futures",
- "http",
- "log",
- "serde",
- "serde_json",
- "sha2",
- "thiserror",
- "tokio",
- "url",
- "uuid",
 ]
 
 [[package]]

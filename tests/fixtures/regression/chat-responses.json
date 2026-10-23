@@ -1,0 +1,80 @@
+[
+  {
+    "Ok": {
+      "id": "resp_chatcmpl-fixed",
+      "object": "response",
+      "created_at": 42,
+      "status": "completed",
+      "model": "gpt-5",
+      "output": [
+        {
+          "id": "rs_resp_chatcmpl-fixed",
+          "type": "reasoning",
+          "summary": [
+            {
+              "type": "summary_text",
+              "text": "reason"
+            }
+          ]
+        },
+        {
+          "id": "resp_chatcmpl-fixed_msg",
+          "type": "message",
+          "status": "completed",
+          "role": "assistant",
+          "content": [
+            {
+              "type": "output_text",
+              "text": "你好",
+              "annotations": []
+            }
+          ]
+        }
+      ],
+      "usage": {
+        "input_tokens": 9,
+        "output_tokens": 3,
+        "total_tokens": 12,
+        "input_tokens_details": {
+          "cached_tokens": 0
+        },
+        "output_tokens_details": {
+          "reasoning_tokens": 0
+        }
+      }
+    }
+  },
+  {
+    "Ok": {
+      "id": "resp_fixed",
+      "object": "response",
+      "created_at": 0,
+      "status": "completed",
+      "model": "",
+      "output": [
+        {
+          "id": "fc_call_1",
+          "type": "function_call",
+          "status": "completed",
+          "call_id": "call_1",
+          "name": "read",
+          "arguments": "{\"a\":1,\"b\":2}"
+        }
+      ],
+      "usage": {
+        "input_tokens": 0,
+        "input_tokens_details": {
+          "cached_tokens": 0
+        },
+        "output_tokens": 0,
+        "total_tokens": 0,
+        "output_tokens_details": {
+          "reasoning_tokens": 0
+        }
+      }
+    }
+  },
+  {
+    "Err": "格式转换错误: Empty choices in chat response"
+  }
+]

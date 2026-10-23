@@ -38,27 +38,15 @@
 
 故障转移、熔断计量、stack 模型映射、官方账号/OAuth、Copilot、Bedrock 专用分支及其他客户端入口明确范围外。原版日志中的上游原始内容不能照搬到生产日志：凭据脱敏是已约定差异。
 
-## 独立参考包与验证边界
+## 本地回归验证
 
-`reference/cc-switch-reference` 不依赖生产 crate。源码通过 `git show <固定提交>:<路径>` 导出；`provenance.json` 记录每份来源和 SHA-256。转换模块按字节复制，Provider reasoning/optimizer 类型仅提取原声明；错误类型用只包含实际转换所需变体的基础设施替身。
+迁移已在本项目提交 `58c8c87` 验收。来源是包含用户本地提交的 cc-switch 仓库，不等同于公共上游版本。后续重构以本项目重构前行为为基线，不持续与 cc-switch 比较。
 
-`request_oracle.rs` 是根据固定 forwarder 顺序独立组装的请求体测试适配器，不读取生产实现。`header_oracle.rs` 则复用固定上游 header 循环、URL builder 和 session helpers，并只用 fixture 参数替代原依赖对象；差分测试比较 URL、完整 header map 及请求体，覆盖完整 endpoint、认证替换、协议 header、会话身份、`[1m]`、身份模拟、自定义 UA 和 OpenCode 路径。随机生成的 session UUID 仅在两侧都为 UUID 时规范化，其余值精确比较。
+`tests/regression.rs` 保留迁移验收使用的输入，期望值固定于 `tests/fixtures/regression`。JSON 比较完整结构；固定 ID 的 SSE 在 1、7、4096 字节分片下按字节比较；URL 与完整 header map 保持断言。仅原场景中自动生成的 session UUID 规范化为固定 UUID，其他字段和事件顺序不忽略。加密任务拒绝与提交测试保留直接断言。
 
-`tests/differential.rs` 还对比 JSON 请求/响应、错误、分片 SSE 事件及加密 agent task 的流提交行为。固定 ID 的流按字节比较，不屏蔽字段或事件顺序差异。独立 oracle 并非完整 server 替身；mock upstream 集成测试仍负责验证实际 socket 转发、压缩响应、错误路径和配置读取。真实 Codex CLI/远程 Provider 联调不包含在本地测试结论中。
+参考源码副本及生成工具已移除。测试不生成或更新期望值；行为重构不能通过修改期望值来掩盖变化。原版单元测试与 mock HTTP 集成测试继续保护转换、历史、重试、压缩、错误和配置行为。真实 Codex CLI/远程 Provider 联调不包含在这些本地测试结论中。
 
-重建参考包（要求 Python 3、Git 及含固定提交的 cc-switch 仓库）：
-
-```sh
-python3 scripts/reference-vendor.py ../cc-switch
-```
-
-运行差分检查（复用仓库锁文件，输出独立运行目录与版本/源码记录）：
-
-```sh
-bash scripts/reference-check.sh --locked
-```
-
-完整验收继续使用 `bash scripts/verify.sh`。不要对 verbatim 参考文件做自动重构/格式化；升级参考版本必须更新 pin、来源清单和差分证据。
+运行 `bash scripts/verify.sh` 完整验证，无需 cc-switch 仓库或真实 Provider 账户。
 
 ## 本地入口差异
 

@@ -1,0 +1,56 @@
+[
+  {
+    "Ok": {
+      "id": "msg_fixed",
+      "model": "claude",
+      "role": "assistant",
+      "content": [
+        {
+          "type": "text",
+          "text": "你好"
+        }
+      ],
+      "usage": {
+        "input_tokens": 3,
+        "output_tokens": 2
+      },
+      "stop_reason": "end_turn"
+    }
+  },
+  {
+    "Ok": {
+      "id": "msg_fixed",
+      "model": "claude",
+      "role": "assistant",
+      "content": [
+        {
+          "type": "text",
+          "text": "你好"
+        }
+      ],
+      "usage": {
+        "input_tokens": 3,
+        "output_tokens": 2
+      },
+      "stop_reason": "end_turn"
+    }
+  },
+  {
+    "Ok": {
+      "id": "msg_fixed",
+      "model": "claude",
+      "role": "assistant",
+      "content": [
+        {
+          "type": "text",
+          "text": "你好"
+        }
+      ],
+      "usage": {
+        "input_tokens": 3,
+        "output_tokens": 2
+      },
+      "stop_reason": "end_turn"
+    }
+  }
+]

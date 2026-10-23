@@ -1,0 +1,56 @@
+[
+  {
+    "Ok": {
+      "id": "resp_msg_fixed",
+      "object": "response",
+      "created_at": 0,
+      "status": "completed",
+      "model": "claude",
+      "output": [
+        {
+          "id": "rs_resp_msg_fixed_0",
+          "type": "reasoning",
+          "summary": [
+            {
+              "type": "summary_text",
+              "text": "reason"
+            }
+          ],
+          "encrypted_content": "ccswitch-anthropic-thinking-v1:eyJ0eXBlIjoidGhpbmtpbmciLCJ0aGlua2luZyI6InJlYXNvbiIsInNpZ25hdHVyZSI6InNpZ25lZCJ9"
+        },
+        {
+          "id": "resp_msg_fixed_msg_1",
+          "type": "message",
+          "status": "completed",
+          "role": "assistant",
+          "content": [
+            {
+              "type": "output_text",
+              "text": "你好",
+              "annotations": []
+            }
+          ]
+        },
+        {
+          "id": "fc_toolu_1",
+          "type": "function_call",
+          "status": "completed",
+          "call_id": "toolu_1",
+          "name": "read",
+          "arguments": "{\"a\":1,\"b\":2}"
+        }
+      ],
+      "usage": {
+        "input_tokens": 3,
+        "output_tokens": 5,
+        "total_tokens": 8,
+        "output_tokens_details": {
+          "reasoning_tokens": 0
+        }
+      }
+    }
+  },
+  {
+    "Err": "格式转换错误: Anthropic upstream overloaded_error: busy"
+  }
+]

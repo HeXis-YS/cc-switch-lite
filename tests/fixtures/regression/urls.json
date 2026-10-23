@@ -1,0 +1,20 @@
+[
+  "https://example.org/v1/responses",
+  "https://example.org/v1/responses",
+  "https://example.org/custom/chat/completions",
+  "https://example.org/custom/chat/completions",
+  "https://example.org/v1/chat/completions?api-version=preview",
+  "https://example.org/v1/chat/completions?api-version=preview",
+  "https://example.org/v1/messages?beta=true",
+  "https://example.org/v1/messages?beta=true",
+  "https://example.org/v1/messages",
+  "https://example.org/v1/messages",
+  "https://example.org/special?x=1",
+  "https://example.org/special?x=1",
+  "https://opencode.ai/zen/v1/chat/completions",
+  "https://opencode.ai/zen/v1/chat/completions",
+  "https://opencode.ai/zen/v1/chat/completions",
+  "https://opencode.ai/zen/v1/chat/completions",
+  "https://opencode.ai/zen/v1/responses",
+  "https://opencode.ai/zen/v1/responses"
+]

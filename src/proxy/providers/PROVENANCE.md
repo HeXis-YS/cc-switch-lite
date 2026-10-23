@@ -19,7 +19,9 @@ is replaced by configuration snapshots and the single-provider HTTP handler.
 Local adaptation: converter warning logs omit request/upstream strings
 (call IDs, model names and finish reasons) to keep credentials out of logs.
 Request/response orchestration and necessary adaptations are documented in
-`docs/compatibility.md` and `docs/request-compatibility.md`. The independently
-vendored reference package records exact source paths and hashes in
-`reference/cc-switch-reference/provenance.json`; it is used for differential tests,
-not linked into the production binary.
+`docs/compatibility.md` and `docs/request-compatibility.md`.
+
+Migration was accepted at cc-switch-lite commit `58c8c87`. The source repository
+includes the user's local commits, not only public upstream changes. Local tests
+and fixed regression fixtures now protect that accepted behavior; the temporary
+independent reference package has been removed.

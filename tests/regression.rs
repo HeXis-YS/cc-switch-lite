@@ -1,17 +1,38 @@
-//! Compare production conversions with separately vendored, pinned upstream code.
-//! This is a conversion oracle, not an end-to-end oracle for forwarder wiring.
+//! Behavior regressions captured from accepted cc-switch-lite commit 58c8c87.
+//! Fixtures are fixed expectations, not regenerated during tests.
 use bytes::Bytes;
 use cc_switch_lite::proxy::providers as actual;
-use cc_switch_reference::proxy::providers as reference;
 use futures::{stream, Stream, StreamExt};
 use serde_json::{json, Value};
+
+fn header_values(
+    headers: &axum::http::HeaderMap,
+) -> std::collections::BTreeMap<String, Vec<String>> {
+    let mut values = std::collections::BTreeMap::<String, Vec<String>>::new();
+    for (key, value) in headers {
+        values
+            .entry(key.to_string())
+            .or_default()
+            .push(value.to_str().unwrap().to_owned());
+    }
+    values
+}
 
 fn outcome<T: std::fmt::Display>(result: Result<Value, T>) -> Result<Value, String> {
     result.map_err(|error| error.to_string())
 }
 
 #[test]
-fn requests_match_pinned_upstream() {
+fn requests_preserve_baseline() {
+    let mut expected_chat_requests =
+        serde_json::from_str::<Vec<Value>>(include_str!("fixtures/regression/chat-requests.json"))
+            .unwrap()
+            .into_iter();
+    let mut expected_messages_requests = serde_json::from_str::<Vec<Value>>(include_str!(
+        "fixtures/regression/messages-requests.json"
+    ))
+    .unwrap()
+    .into_iter();
     let requests = [
         json!({"model":"gpt-5","input":"hello","stream":true,"reasoning":{"effort":"high"}}),
         json!({"model":"claude-opus-4-6","instructions":"be useful","input":[{"role":"user","content":[{"type":"input_text","text":"你好"},{"type":"input_image","image_url":"data:image/png;base64,YQ=="}]}]}),
@@ -24,44 +45,51 @@ fn requests_match_pinned_upstream() {
     ];
     for request in requests {
         assert_eq!(
-            outcome(actual::transform_codex_chat::responses_to_chat_completions(
-                request.clone()
-            )),
-            outcome(
-                reference::transform_codex_chat::responses_to_chat_completions(request.clone())
-            ),
-            "Chat request {request}"
+            serde_json::to_value(outcome(
+                actual::transform_codex_chat::responses_to_chat_completions(request.clone())
+            ))
+            .unwrap(),
+            expected_chat_requests.next().unwrap()
         );
         assert_eq!(
-            outcome(
+            serde_json::to_value(outcome(
                 actual::transform_codex_anthropic::responses_request_to_anthropic(
                     request.clone(),
                     8192
                 )
-            ),
-            outcome(
-                reference::transform_codex_anthropic::responses_request_to_anthropic(
-                    request.clone(),
-                    8192
-                )
-            ),
-            "Messages request {request}"
+            ))
+            .unwrap(),
+            expected_messages_requests.next().unwrap()
         );
     }
 }
 
 #[test]
-fn responses_and_errors_match_pinned_upstream() {
+fn responses_and_errors_preserve_baseline() {
+    let mut expected_chat_responses =
+        serde_json::from_str::<Vec<Value>>(include_str!("fixtures/regression/chat-responses.json"))
+            .unwrap()
+            .into_iter();
+    let mut expected_messages_responses = serde_json::from_str::<Vec<Value>>(include_str!(
+        "fixtures/regression/messages-responses.json"
+    ))
+    .unwrap()
+    .into_iter();
+    let mut expected_errors =
+        serde_json::from_str::<Vec<Value>>(include_str!("fixtures/regression/errors.json"))
+            .unwrap()
+            .into_iter();
     for response in [
         json!({"id":"chatcmpl-fixed","model":"gpt-5","created":42,"choices":[{"message":{"role":"assistant","content":"你好","reasoning_content":"reason"},"finish_reason":"stop"}],"usage":{"prompt_tokens":9,"completion_tokens":3}}),
         json!({"id":"fixed","choices":[{"message":{"content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"read","arguments":"{\"b\":2,\"a\":1}"}}]},"finish_reason":"tool_calls"}]}),
         json!({"choices":[]}),
     ] {
         assert_eq!(
-            outcome(actual::transform_codex_chat::chat_completion_to_response(
-                response.clone()
-            )),
-            outcome(reference::transform_codex_chat::chat_completion_to_response(response))
+            serde_json::to_value(outcome(
+                actual::transform_codex_chat::chat_completion_to_response(response.clone())
+            ))
+            .unwrap(),
+            expected_chat_responses.next().unwrap()
         );
     }
     for response in [
@@ -69,14 +97,13 @@ fn responses_and_errors_match_pinned_upstream() {
         json!({"type":"error","error":{"type":"overloaded_error","message":"busy"}}),
     ] {
         assert_eq!(
-            outcome(
+            serde_json::to_value(outcome(
                 actual::transform_codex_anthropic::anthropic_response_to_responses(
                     response.clone()
                 )
-            ),
-            outcome(
-                reference::transform_codex_anthropic::anthropic_response_to_responses(response)
-            )
+            ))
+            .unwrap(),
+            expected_messages_responses.next().unwrap()
         );
     }
     for error in [
@@ -85,8 +112,11 @@ fn responses_and_errors_match_pinned_upstream() {
         Value::Null,
     ] {
         assert_eq!(
-            actual::transform_codex_chat::chat_error_to_response_error(Some(&error)),
-            reference::transform_codex_chat::chat_error_to_response_error(Some(&error))
+            serde_json::to_value(actual::transform_codex_chat::chat_error_to_response_error(
+                Some(&error)
+            ))
+            .unwrap(),
+            expected_errors.next().unwrap()
         );
     }
 }
@@ -101,7 +131,12 @@ async fn collect(output: impl Stream<Item = Result<Bytes, std::io::Error>>) -> V
 }
 
 #[tokio::test]
-async fn fragmented_sse_matches_pinned_upstream_byte_for_byte() {
+async fn fragmented_sse_preserves_baseline_bytes() {
+    let mut expected_buffered_messages = serde_json::from_str::<Vec<Value>>(include_str!(
+        "fixtures/regression/buffered-messages.json"
+    ))
+    .unwrap()
+    .into_iter();
     let chat = concat!(
         "data: {\"id\":\"fixed\",\"model\":\"gpt-5\",\"choices\":[{\"delta\":{\"reasoning_content\":\"reason\"}}]}\r\n\n",
         "data: {\"id\":\"fixed\",\"choices\":[{\"delta\":{\"content\":\"你好\"}}]}\n\n",
@@ -130,12 +165,7 @@ async fn fragmented_sse_matches_pinned_upstream_byte_for_byte() {
                 ))
             )
             .await,
-            collect(
-                reference::streaming_codex_chat::create_responses_sse_stream_from_chat(
-                    stream::iter(chunks(chat))
-                )
-            )
-            .await
+            include_bytes!("fixtures/regression/chat-stream.sse").as_slice()
         );
         assert_eq!(
             collect(
@@ -144,27 +174,29 @@ async fn fragmented_sse_matches_pinned_upstream_byte_for_byte() {
                 )
             )
             .await,
-            collect(
-                reference::streaming_codex_anthropic::create_responses_sse_stream_from_anthropic(
-                    stream::iter(chunks(messages))
-                )
-            )
-            .await
+            include_bytes!("fixtures/regression/messages-stream.sse").as_slice()
         );
         assert_eq!(
-            outcome(actual::transform_codex_anthropic::anthropic_sse_to_message_value(messages)),
-            outcome(reference::transform_codex_anthropic::anthropic_sse_to_message_value(messages))
+            serde_json::to_value(outcome(
+                actual::transform_codex_anthropic::anthropic_sse_to_message_value(messages)
+            ))
+            .unwrap(),
+            expected_buffered_messages.next().unwrap()
         );
     }
 }
 
 #[tokio::test]
-async fn request_pipeline_matches_independent_upstream_stages() {
+async fn request_pipeline_preserves_baseline() {
+    let mut expected_request_pipeline = serde_json::from_str::<Vec<Value>>(include_str!(
+        "fixtures/regression/request-pipeline.json"
+    ))
+    .unwrap()
+    .into_iter();
     use cc_switch_lite::{
         compat::{request, CompatConfig},
         config::{Protocol, Provider},
     };
-    use cc_switch_reference::request_oracle::{request_body, Facts};
     let fixtures = [
         (
             Protocol::ChatCompletions,
@@ -191,7 +223,7 @@ async fn request_pipeline_matches_independent_upstream_stages() {
             json!({"model":"gpt-5","input":"hello","_trace":"secret","metadata":{"_internal":true,"public":"yes"}}),
         ),
     ];
-    for (protocol, wire, base_url, body) in fixtures {
+    for (protocol, _wire, base_url, body) in fixtures {
         let provider = Provider {
             id: "oracle".into(),
             name: "Oracle".into(),
@@ -209,19 +241,10 @@ async fn request_pipeline_matches_independent_upstream_stages() {
         )
         .await
         .unwrap();
-        let expected = request_body(
-            body,
-            Facts {
-                protocol: wire,
-                base_url,
-                cache_injection: true,
-                ..Default::default()
-            },
-            &reference::codex_chat_history::CodexChatHistoryStore::default(),
-        )
-        .await
-        .unwrap();
-        assert_eq!(actual.body, expected, "{wire} at {base_url}");
+        assert_eq!(
+            serde_json::to_value(actual.body).unwrap(),
+            expected_request_pipeline.next().unwrap()
+        );
     }
 }
 
@@ -278,13 +301,20 @@ async fn encrypted_task_stream_commits_productive_output_and_replays_exact_bytes
 }
 
 #[tokio::test]
-async fn url_and_headers_match_pinned_forwarder_header_loop() {
+async fn url_and_headers_preserve_baseline() {
+    let mut expected_urls =
+        serde_json::from_str::<Vec<Value>>(include_str!("fixtures/regression/urls.json"))
+            .unwrap()
+            .into_iter();
+    let mut expected_headers =
+        serde_json::from_str::<Vec<Value>>(include_str!("fixtures/regression/headers.json"))
+            .unwrap()
+            .into_iter();
     use axum::http::{HeaderMap, HeaderValue};
     use cc_switch_lite::{
         compat::{request, CompatConfig},
         config::{Protocol, Provider},
     };
-    use cc_switch_reference::header_oracle::{request_headers, HeaderFacts};
     let cases = [
         (
             Protocol::Responses,
@@ -368,7 +398,7 @@ async fn url_and_headers_match_pinned_forwarder_header_loop() {
             json!({"model":"gpt-5","input":"hi"}),
         ),
     ];
-    for (protocol, wire, base_url, full_url, impersonate, custom_user_agent, body) in cases {
+    for (protocol, _wire, base_url, full_url, impersonate, custom_user_agent, body) in cases {
         for supplied_identity in [false, true] {
             let mut headers = HeaderMap::new();
             for (name, value) in [
@@ -406,7 +436,7 @@ async fn url_and_headers_match_pinned_forwarder_header_loop() {
             provider.compat.meta.is_full_url = Some(full_url);
             provider.compat.meta.impersonate_claude_code = Some(impersonate);
             provider.compat.meta.custom_user_agent = custom_user_agent.map(str::to_owned);
-            let actual = request::prepare(
+            let mut actual = request::prepare(
                 body.clone(),
                 &provider,
                 &headers,
@@ -415,36 +445,24 @@ async fn url_and_headers_match_pinned_forwarder_header_loop() {
             )
             .await
             .unwrap();
-            let (url, mut expected) = request_headers(
-                HeaderFacts {
-                    protocol: wire,
-                    base_url,
-                    api_key: "provider-secret",
-                    full_url,
-                    impersonate,
-                    custom_user_agent,
-                    version: env!("CARGO_PKG_VERSION"),
-                },
-                &headers,
-                &body,
-                &actual.body,
-            );
-            // No client identity/conversation fingerprint: only generated UUIDs vary.
-            if let (Some(a), Some(b)) = (
-                actual.headers.get("x-opencode-session"),
-                expected.get("x-opencode-session"),
-            ) {
-                if uuid::Uuid::parse_str(a.to_str().unwrap()).is_ok()
-                    && uuid::Uuid::parse_str(b.to_str().unwrap()).is_ok()
-                    && !supplied_identity
-                {
-                    expected.insert("x-opencode-session", a.clone());
+            // Preserve the baseline exception for generated session UUIDs only.
+            if !supplied_identity {
+                if let Some(value) = actual.headers.get("x-opencode-session") {
+                    if uuid::Uuid::parse_str(value.to_str().unwrap()).is_ok() {
+                        actual.headers.insert(
+                            "x-opencode-session",
+                            HeaderValue::from_static("00000000-0000-0000-0000-000000000000"),
+                        );
+                    }
                 }
             }
-            assert_eq!(actual.url, url, "URL {wire} {base_url}");
             assert_eq!(
-                actual.headers, expected,
-                "headers {wire} {base_url}, identity={supplied_identity}"
+                serde_json::to_value(actual.url).unwrap(),
+                expected_urls.next().unwrap()
+            );
+            assert_eq!(
+                serde_json::to_value(header_values(&actual.headers)).unwrap(),
+                expected_headers.next().unwrap()
             );
         }
     }

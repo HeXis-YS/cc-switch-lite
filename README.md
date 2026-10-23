@@ -58,7 +58,8 @@ Messages 保持参考转换行为，不额外套用 Chat 缓存。
 
 入口固定仓库目录，运行 `cargo fmt --check`、`cargo test --locked` 和
 `cargo clippy --locked --all-targets -- -D warnings`。唯一运行日志、代码差异及工具版本记录于 `.codex/runs/<UTC>-<PID>/`。
-测试包含抽取的上游单元测试、配置原子替换/权限和本地 mock HTTP/SSE 集成测试。
+测试包含保留的原版单元测试、以本项目 `58c8c87` 为基线的固定回归场景、配置原子替换/权限和本地 mock HTTP/SSE 集成测试。
+迁移已验收，后续重构不依赖 cc-switch 副本。
 不需要真实 Provider 账户。Mock 通过不代表已验证真实 Codex CLI 与所有远程供应商组合。
 
 Unix / Python 3.11+ 可在构建后运行 `python3 scripts/tui-smoke.py`，通过真实 PTY

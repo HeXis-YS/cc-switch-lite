@@ -1,0 +1,112 @@
+[
+  {
+    "messages": [
+      {
+        "content": "hello",
+        "role": "user"
+      }
+    ],
+    "model": "kimi-k2.5",
+    "tools": [
+      {
+        "function": {
+          "name": "read",
+          "parameters": {
+            "$defs": {
+              "Value": {
+                "type": "string"
+              }
+            },
+            "properties": {
+              "arg": {
+                "allOf": [
+                  {
+                    "$ref": "#/$defs/Value"
+                  }
+                ],
+                "description": "keep me"
+              }
+            },
+            "type": "object"
+          }
+        },
+        "type": "function"
+      }
+    ]
+  },
+  {
+    "messages": [
+      {
+        "content": null,
+        "reasoning_content": "tool call",
+        "role": "assistant",
+        "tool_calls": [
+          {
+            "extra_content": {
+              "google": {
+                "thought_signature": "skip_thought_signature_validator"
+              }
+            },
+            "function": {
+              "arguments": "{}",
+              "name": "read"
+            },
+            "id": "call_1",
+            "type": "function"
+          }
+        ]
+      },
+      {
+        "content": "ok",
+        "role": "tool",
+        "tool_call_id": "call_1"
+      }
+    ],
+    "model": "gemini-3-pro"
+  },
+  {
+    "max_tokens": 8192,
+    "messages": [
+      {
+        "content": [
+          {
+            "cache_control": {
+              "type": "ephemeral"
+            },
+            "text": "hello",
+            "type": "text"
+          }
+        ],
+        "role": "user"
+      }
+    ],
+    "model": "claude-opus-4-6",
+    "system": [
+      {
+        "cache_control": {
+          "type": "ephemeral"
+        },
+        "text": "system",
+        "type": "text"
+      }
+    ],
+    "tools": [
+      {
+        "cache_control": {
+          "type": "ephemeral"
+        },
+        "input_schema": {
+          "type": "object"
+        },
+        "name": "read"
+      }
+    ]
+  },
+  {
+    "input": "hello",
+    "metadata": {
+      "public": "yes"
+    },
+    "model": "gpt-5"
+  }
+]

@@ -31,6 +31,3 @@ brotli = "7"
 zstd = "0.13"
 chrono = "0.4"
 http = "1"
-
-[dev-dependencies]
-cc-switch-reference = { path = "reference/cc-switch-reference" }

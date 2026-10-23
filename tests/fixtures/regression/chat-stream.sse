@@ -1,0 +1,57 @@
+event: response.created
+data: {"type":"response.created","response":{"id":"resp_fixed","object":"response","created_at":0,"status":"in_progress","model":"gpt-5","output":[],"usage":{"input_tokens":0,"input_tokens_details":{"cached_tokens":0},"output_tokens":0,"total_tokens":0,"output_tokens_details":{"reasoning_tokens":0}}}}
+
+event: response.in_progress
+data: {"type":"response.in_progress","response":{"id":"resp_fixed","object":"response","created_at":0,"status":"in_progress","model":"gpt-5","output":[],"usage":{"input_tokens":0,"input_tokens_details":{"cached_tokens":0},"output_tokens":0,"total_tokens":0,"output_tokens_details":{"reasoning_tokens":0}}}}
+
+event: response.output_item.added
+data: {"type":"response.output_item.added","output_index":0,"item":{"id":"rs_resp_fixed","type":"reasoning","status":"in_progress","summary":[]}}
+
+event: response.reasoning_summary_part.added
+data: {"type":"response.reasoning_summary_part.added","item_id":"rs_resp_fixed","output_index":0,"summary_index":0,"part":{"type":"summary_text","text":""}}
+
+event: response.reasoning_summary_text.delta
+data: {"type":"response.reasoning_summary_text.delta","item_id":"rs_resp_fixed","output_index":0,"summary_index":0,"delta":"reason"}
+
+event: response.reasoning_summary_text.done
+data: {"type":"response.reasoning_summary_text.done","item_id":"rs_resp_fixed","output_index":0,"summary_index":0,"text":"reason"}
+
+event: response.reasoning_summary_part.done
+data: {"type":"response.reasoning_summary_part.done","item_id":"rs_resp_fixed","output_index":0,"summary_index":0,"part":{"type":"summary_text","text":"reason"}}
+
+event: response.output_item.done
+data: {"type":"response.output_item.done","output_index":0,"item":{"id":"rs_resp_fixed","type":"reasoning","summary":[{"type":"summary_text","text":"reason"}]}}
+
+event: response.output_item.added
+data: {"type":"response.output_item.added","output_index":1,"item":{"id":"resp_fixed_msg","type":"message","status":"in_progress","role":"assistant","content":[]}}
+
+event: response.content_part.added
+data: {"type":"response.content_part.added","item_id":"resp_fixed_msg","output_index":1,"content_index":0,"part":{"type":"output_text","text":"","annotations":[]}}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","item_id":"resp_fixed_msg","output_index":1,"content_index":0,"delta":"你好"}
+
+event: response.output_item.added
+data: {"type":"response.output_item.added","output_index":2,"item":{"id":"fc_call_1","type":"function_call","status":"in_progress","call_id":"call_1","name":"read","arguments":"","reasoning_content":"reason"}}
+
+event: response.function_call_arguments.delta
+data: {"type":"response.function_call_arguments.delta","item_id":"fc_call_1","output_index":2,"delta":"{}"}
+
+event: response.output_text.done
+data: {"type":"response.output_text.done","item_id":"resp_fixed_msg","output_index":1,"content_index":0,"text":"你好"}
+
+event: response.content_part.done
+data: {"type":"response.content_part.done","item_id":"resp_fixed_msg","output_index":1,"content_index":0,"part":{"type":"output_text","text":"你好","annotations":[]}}
+
+event: response.output_item.done
+data: {"type":"response.output_item.done","output_index":1,"item":{"id":"resp_fixed_msg","type":"message","status":"completed","role":"assistant","content":[{"type":"output_text","text":"你好","annotations":[]}]}}
+
+event: response.function_call_arguments.done
+data: {"type":"response.function_call_arguments.done","item_id":"fc_call_1","output_index":2,"arguments":"{}"}
+
+event: response.output_item.done
+data: {"type":"response.output_item.done","output_index":2,"item":{"id":"fc_call_1","type":"function_call","status":"completed","call_id":"call_1","name":"read","arguments":"{}","reasoning_content":"reason"}}
+
+event: response.completed
+data: {"type":"response.completed","response":{"id":"resp_fixed","object":"response","created_at":0,"status":"completed","model":"gpt-5","output":[{"id":"rs_resp_fixed","type":"reasoning","summary":[{"type":"summary_text","text":"reason"}]},{"id":"resp_fixed_msg","type":"message","status":"completed","role":"assistant","content":[{"type":"output_text","text":"你好","annotations":[]}]},{"id":"fc_call_1","type":"function_call","status":"completed","call_id":"call_1","name":"read","arguments":"{}","reasoning_content":"reason"}],"usage":{"input_tokens":0,"input_tokens_details":{"cached_tokens":0},"output_tokens":0,"total_tokens":0,"output_tokens_details":{"reasoning_tokens":0}}}}
+

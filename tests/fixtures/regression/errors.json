@@ -1,0 +1,26 @@
+[
+  {
+    "error": {
+      "message": "context exceeded",
+      "type": "upstream_error",
+      "code": "context_length_exceeded",
+      "param": null
+    }
+  },
+  {
+    "error": {
+      "message": "busy",
+      "type": "upstream_error",
+      "code": null,
+      "param": null
+    }
+  },
+  {
+    "error": {
+      "message": "null",
+      "type": "upstream_error",
+      "code": null,
+      "param": null
+    }
+  }
+]

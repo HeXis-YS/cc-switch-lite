@@ -1,0 +1,228 @@
+[
+  {
+    "Ok": {
+      "model": "gpt-5",
+      "messages": [
+        {
+          "role": "user",
+          "content": [
+            {
+              "type": "text",
+              "text": "hello"
+            }
+          ]
+        }
+      ],
+      "max_tokens": 8192,
+      "thinking": {
+        "type": "enabled",
+        "budget_tokens": 4096
+      },
+      "stream": true
+    }
+  },
+  {
+    "Ok": {
+      "model": "claude-opus-4-6",
+      "system": "be useful",
+      "messages": [
+        {
+          "role": "user",
+          "content": [
+            {
+              "type": "text",
+              "text": "你好"
+            },
+            {
+              "type": "image",
+              "source": {
+                "type": "base64",
+                "media_type": "image/png",
+                "data": "YQ=="
+              }
+            }
+          ]
+        }
+      ],
+      "max_tokens": 8192
+    }
+  },
+  {
+    "Ok": {
+      "model": "kimi-k2.5",
+      "messages": [
+        {
+          "role": "user",
+          "content": [
+            {
+              "type": "text",
+              "text": "(continuing the conversation)"
+            }
+          ]
+        },
+        {
+          "role": "assistant",
+          "content": [
+            {
+              "type": "tool_use",
+              "id": "call_1",
+              "name": "weather",
+              "input": {
+                "z": 2,
+                "a": 1
+              }
+            }
+          ]
+        },
+        {
+          "role": "user",
+          "content": [
+            {
+              "type": "tool_result",
+              "tool_use_id": "call_1",
+              "content": "sunny"
+            }
+          ]
+        }
+      ],
+      "max_tokens": 8192,
+      "tools": [
+        {
+          "name": "weather",
+          "input_schema": {
+            "type": "object",
+            "properties": {
+              "city": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      ]
+    }
+  },
+  {
+    "Ok": {
+      "model": "gemini-3-pro",
+      "messages": [
+        {
+          "role": "user",
+          "content": [
+            {
+              "type": "text",
+              "text": "(continuing the conversation)"
+            }
+          ]
+        },
+        {
+          "role": "assistant",
+          "content": [
+            {
+              "type": "text",
+              "text": "<think>reason</think>answer"
+            }
+          ]
+        },
+        {
+          "role": "user",
+          "content": [
+            {
+              "type": "text",
+              "text": "continue"
+            }
+          ]
+        }
+      ],
+      "thinking": {
+        "type": "disabled"
+      },
+      "max_tokens": 8192
+    }
+  },
+  {
+    "Ok": {
+      "model": "claude-mythos-5",
+      "messages": [
+        {
+          "role": "user",
+          "content": [
+            {
+              "type": "text",
+              "text": "think"
+            }
+          ]
+        }
+      ],
+      "thinking": {
+        "type": "adaptive"
+      },
+      "output_config": {
+        "effort": "high"
+      },
+      "max_tokens": 16000
+    }
+  },
+  {
+    "Err": "无效的请求: cannot convert Codex request: empty messages"
+  },
+  {
+    "Ok": {
+      "model": "gpt-5",
+      "messages": [
+        {
+          "role": "user",
+          "content": [
+            {
+              "type": "text",
+              "text": "hi"
+            }
+          ]
+        }
+      ],
+      "max_tokens": 8192,
+      "tools": [
+        {
+          "name": "functions__read",
+          "input_schema": {
+            "type": "object"
+          }
+        }
+      ]
+    }
+  },
+  {
+    "Ok": {
+      "model": "gpt-5",
+      "messages": [
+        {
+          "role": "user",
+          "content": [
+            {
+              "type": "text",
+              "text": "hi"
+            }
+          ]
+        }
+      ],
+      "max_tokens": 8192,
+      "tools": [
+        {
+          "name": "patch",
+          "input_schema": {
+            "type": "object",
+            "properties": {
+              "input": {
+                "type": "string",
+                "description": "Raw string input for the original custom tool. Preserve formatting exactly and follow the original tool definition embedded in the description."
+              }
+            },
+            "required": [
+              "input"
+            ]
+          },
+          "description": ""
+        }
+      ]
+    }
+  }
+]

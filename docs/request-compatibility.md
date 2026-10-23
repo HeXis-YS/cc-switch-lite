@@ -73,6 +73,6 @@ own enabled flag while honoring `cacheInjection`.
   substring check on its configured URL; it was not silently replaced by a
   different host-matching policy.
 
-Prepared request tests exercise production wiring, while independently extracted
-reference code compares the supported pipeline. Counts of copied unit tests are
-not a substitute for those execution-path checks.
+Prepared request and HTTP tests exercise production wiring. Fixed local regression
+fixtures preserve the accepted behavior of cc-switch-lite commit 58c8c87; ongoing
+refactors do not require a separate cc-switch implementation.
