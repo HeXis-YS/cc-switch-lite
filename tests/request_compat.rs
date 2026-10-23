@@ -46,6 +46,27 @@ async fn chat_cache_uses_real_prefixed_session_and_reasoning_platform() {
 }
 
 #[tokio::test]
+async fn anthropic_default_budget_preserves_explicit_client_limit() {
+    let p = provider(Protocol::Messages, "https://example.test/v1");
+    for (limit, expected) in [(None, 128000), (Some(1000), 1000)] {
+        let mut input = json!({"model":"claude-fable-5-1","input":"Hi"});
+        if let Some(limit) = limit {
+            input["max_output_tokens"] = json!(limit);
+        }
+        let out = prepare(
+            input,
+            &p,
+            &HeaderMap::new(),
+            &CompatConfig::default(),
+            &CodexChatHistoryStore::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.body["max_tokens"], expected);
+    }
+}
+
+#[tokio::test]
 async fn anthropic_configuration_is_applied_before_thinking_and_header_conversion() {
     let mut p = provider(
         Protocol::Messages,

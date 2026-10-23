@@ -110,8 +110,9 @@ pub async fn prepare_with_query(
             if let Some(max) = provider.compat.meta.max_output_tokens.filter(|v| *v > 0) {
                 input["max_output_tokens"] = json!(max);
             }
-            let mut body =
-                providers::transform_codex_anthropic::responses_request_to_anthropic(input, 8192)?;
+            let mut body = providers::transform_codex_anthropic::responses_request_to_anthropic(
+                input, 128000,
+            )?;
             if let Some(model) = body.get("model").and_then(Value::as_str) {
                 let stripped = strip_one_m_suffix_for_upstream(model);
                 if stripped != model {

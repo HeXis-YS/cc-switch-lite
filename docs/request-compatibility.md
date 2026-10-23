@@ -16,7 +16,7 @@ copyright; extraction helpers retain original function bodies unless listed belo
 | Chat reasoning config | Extracted `codex.rs` resolver and inference closure | Explicit metadata, normalization, platform precedence, model inference and Zen catalog effort lookup retained |
 | Gemini tool thought signature fallback | Production invocation after Chat conversion | Existing function re-enabled outside tests; only first call in current-turn assistant steps is filled |
 | Chat cache routing | Extracted original cache eligibility and injection | Explicit nonempty client key wins, then real client session; unknown gateways default to no injection |
-| Anthropic output ceiling | Metadata override before conversion | Positive `maxOutputTokens` beats client value; 8192 conversion fallback retained |
+| Anthropic output ceiling | Metadata override before conversion | Positive `maxOutputTokens` beats client value; absent both, conversion defaults to 128000 tokens (including thinking), intentionally differing from upstream's 8192 fallback |
 | Anthropic identity and cache | Original identity helper and complete cache injector | Impersonation opt-in; bridge cache enabled independent of optimizer master switch; `cacheInjection` respected |
 | Native Responses compaction | Complete copied module | Known summary replay and compaction trigger rewriting; unknown ciphertext preserved until reactive recovery |
 | Native xAI | Complete namespace and xAI modules | Restore map captured before flattening, then xAI field/schema/orphan-output rewrites; configured upstream model absent by scope |

@@ -11,7 +11,7 @@
 | `forwarder.rs` / `normalize_thinking_type` | 原始请求进入协议转换前 | 配置快照代替数据库；同样规范 thinking 类型 |
 | `codex.rs` reasoning resolver | Chat；显式 meta、URL 推断、modelCatalog effort 等级 | `compat.request`，保留原解析函数 |
 | `forwarder.rs` 1820–1870 | Chat：恢复历史 → 转换 → Gemini 签名补齐 → cache key | `compat.request`；进程内历史与客户端 session，不跨实例迁移 |
-| `forwarder.rs` 1880–1925 | Messages：Provider 输出上限 → 转换/8192 缺省 → `[1m]` → 身份提示 → 缓存注入 | `compat.request`；cache injection 由子开关决定，此路径不受 optimizer 总开关限制 |
+| `forwarder.rs` 1880–1925 | Messages：Provider 输出上限 → 转换/128000 缺省 → `[1m]` → 身份提示 → 缓存注入 | `compat.request`；缺省输出预算由上游的 8192 调整为 128000，包含思考消耗；cache injection 由子开关决定，此路径不受 optimizer 总开关限制 |
 | `codex_compaction.rs` | 第三方原生 Responses 压缩摘要/触发转换 | `compat.request`；官方 OAuth 状态清洗不适用 |
 | namespace / xAI sanitize | 原生 Responses 且原版 Provider 判定命中 | `compat.request`；须保留识别条件、schema 和工具名恢复 |
 | Moonshot schema | Chat 且 Moonshot/Kimi URL 命中 | `$ref` 同级关键词移入 `allOf`；其他上游不改 |
