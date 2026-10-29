@@ -2,20 +2,22 @@
 //! list navigation adapted from cc-switch-cli (MIT, Jason Young / saladday).
 //! Full upstream license accompanies the copied text editor in tui/text_edit.rs.
 mod text_edit;
+mod view;
 
 use crate::config::{Config, DefaultRoute, Protocol, Provider, Route, RouteRule, Server};
 use anyhow::Result;
 use crossterm::{
     cursor,
-    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
+    event::{
+        self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
+        KeyModifiers,
+    },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::{
     backend::CrosstermBackend,
-    layout::{Constraint, Layout},
-    style::{Color, Style},
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
+    widgets::{ListState, TableState},
     Terminal,
 };
 use std::{io, path::Path, sync::Arc};
@@ -27,7 +29,12 @@ struct TerminalGuard {
 }
 fn restore() {
     let _ = disable_raw_mode();
-    let _ = execute!(io::stdout(), cursor::Show, LeaveAlternateScreen);
+    let _ = execute!(
+        io::stdout(),
+        DisableBracketedPaste,
+        cursor::Show,
+        LeaveAlternateScreen
+    );
 }
 impl TerminalGuard {
     fn enter() -> Result<Self> {
@@ -39,7 +46,12 @@ impl TerminalGuard {
         }));
         let guard = Self { previous };
         enable_raw_mode()?;
-        execute!(io::stdout(), EnterAlternateScreen, cursor::Hide)?;
+        execute!(
+            io::stdout(),
+            EnterAlternateScreen,
+            EnableBracketedPaste,
+            cursor::Hide
+        )?;
         Ok(guard)
     }
 }
@@ -136,23 +148,22 @@ impl Editor {
 
 struct RouteEditor {
     index: Option<usize>,
-    fields: [TextInput; 3],
+    fields: [TextInput; 2],
+    provider: ListState,
     focus: usize,
 }
 impl RouteEditor {
-    fn new(route: Option<(usize, &RouteRule)>) -> Self {
+    fn new(route: Option<(usize, &RouteRule)>, config: &Config, selected: usize) -> Self {
+        let provider = route
+            .and_then(|(_, r)| config.providers.iter().position(|p| p.id == r.provider))
+            .unwrap_or(selected);
         Self {
             index: route.map(|(i, _)| i),
             fields: route.map_or_else(
                 || std::array::from_fn(|_| TextInput::new("")),
-                |(_, r)| {
-                    [
-                        TextInput::new(&r.name),
-                        TextInput::new(&r.model_pattern),
-                        TextInput::new(&r.provider),
-                    ]
-                },
+                |(_, r)| [TextInput::new(&r.name), TextInput::new(&r.model_pattern)],
             ),
+            provider: ListState::default().with_selected(Some(provider)),
             focus: 0,
         }
     }
@@ -161,7 +172,9 @@ impl RouteEditor {
         let rule = RouteRule {
             name: self.fields[0].value.clone(),
             model_pattern: self.fields[1].value.clone(),
-            provider: self.fields[2].value.clone(),
+            provider: config.providers[self.provider.selected().unwrap_or(0)]
+                .id
+                .clone(),
         };
         if let Some(i) = self.index {
             next.routes[i] = rule;
@@ -194,22 +207,295 @@ fn protocol_label(p: &Protocol) -> &'static str {
         Protocol::Messages => "messages",
     }
 }
-fn save(next: Config, config: &mut Config, path: &Path, status: &mut String) -> bool {
-    match next.validate().and_then(|_| next.save(path)) {
-        Ok(()) => {
-            *config = next;
-            *status = "Saved and valid. Restart the service to apply changes.".into();
-            true
+enum Mode {
+    Browse,
+    Provider(Editor),
+    Route(RouteEditor),
+    Delete,
+}
+
+struct App {
+    config: Config,
+    mode: Mode,
+    routes_view: bool,
+    providers: TableState,
+    routes: TableState,
+    status: String,
+    status_error: bool,
+    restart_required: bool,
+}
+
+impl App {
+    fn new(config: Config) -> Self {
+        let status = if config.providers.is_empty() {
+            "New configuration: press a to add the first provider."
+        } else {
+            "Configuration valid. Running services use their startup snapshot."
         }
-        Err(error) => {
-            *status = format!("Not saved: {error}");
-            false
+        .to_string();
+        let providers =
+            TableState::default().with_selected((!config.providers.is_empty()).then_some(0));
+        let routes = TableState::default().with_selected((!config.routes.is_empty()).then_some(0));
+        Self {
+            config,
+            mode: Mode::Browse,
+            routes_view: false,
+            providers,
+            routes,
+            status,
+            status_error: false,
+            restart_required: false,
         }
+    }
+
+    fn selected(&self) -> usize {
+        if self.routes_view {
+            &self.routes
+        } else {
+            &self.providers
+        }
+        .selected()
+        .unwrap_or(0)
+    }
+
+    fn select(&mut self, index: usize) {
+        let (state, len) = if self.routes_view {
+            (&mut self.routes, self.config.routes.len())
+        } else {
+            (&mut self.providers, self.config.providers.len())
+        };
+        state.select((len > 0).then_some(index.min(len.saturating_sub(1))));
+    }
+
+    fn save(&mut self, next: Config, path: &Path) -> bool {
+        match next.save(path) {
+            Ok(()) => {
+                self.config = next;
+                self.status = "Saved and valid.".into();
+                self.status_error = false;
+                self.restart_required = true;
+                true
+            }
+            Err(error) => {
+                self.status = format!("Not saved: {error}");
+                self.status_error = true;
+                false
+            }
+        }
+    }
+
+    fn paste(&mut self, text: &str) {
+        match &mut self.mode {
+            Mode::Provider(edit) if edit.focus < 4 => {
+                edit.fields[edit.focus].insert_paste(text);
+            }
+            Mode::Route(edit) if edit.focus < 2 => {
+                edit.fields[edit.focus].insert_paste(text);
+            }
+            _ => {}
+        }
+    }
+
+    // Return false only when the user exits; editor and confirmation keys never
+    // fall through to list actions.
+    fn key(&mut self, key: KeyEvent, path: &Path) -> bool {
+        if key.kind == KeyEventKind::Release {
+            return true;
+        }
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+            return false;
+        }
+        let save_key =
+            key.code == KeyCode::Char('s') && key.modifiers.contains(KeyModifiers::CONTROL);
+        match &mut self.mode {
+            Mode::Provider(edit) => {
+                if save_key {
+                    let next = edit.apply(&self.config);
+                    let selected = edit.index.unwrap_or(self.config.providers.len());
+                    if self.save(next, path) {
+                        self.providers.select(Some(selected));
+                        self.mode = Mode::Browse;
+                    }
+                } else {
+                    match key.code {
+                        KeyCode::Esc => self.mode = Mode::Browse,
+                        KeyCode::Tab => edit.focus = (edit.focus + 1) % 5,
+                        KeyCode::BackTab => edit.focus = (edit.focus + 4) % 5,
+                        KeyCode::Left if edit.focus == 4 => edit.protocol = (edit.protocol + 2) % 3,
+                        KeyCode::Right | KeyCode::Char(' ') if edit.focus == 4 => {
+                            edit.protocol = (edit.protocol + 1) % 3;
+                        }
+                        _ if edit.focus < 4 => {
+                            edit.fields[edit.focus].apply_key(key);
+                        }
+                        _ => {}
+                    }
+                }
+                return true;
+            }
+            Mode::Route(edit) => {
+                if save_key {
+                    let next = edit.apply(&self.config);
+                    let selected = edit.index.unwrap_or(self.config.routes.len());
+                    if self.save(next, path) {
+                        self.routes.select(Some(selected));
+                        self.mode = Mode::Browse;
+                    }
+                } else {
+                    match key.code {
+                        KeyCode::Esc => self.mode = Mode::Browse,
+                        KeyCode::Tab => edit.focus = (edit.focus + 1) % 3,
+                        KeyCode::BackTab => edit.focus = (edit.focus + 2) % 3,
+                        KeyCode::Up | KeyCode::Left if edit.focus == 2 => {
+                            let selected = edit.provider.selected().unwrap_or(0);
+                            edit.provider.select(Some(selected.saturating_sub(1)));
+                        }
+                        KeyCode::Down | KeyCode::Right if edit.focus == 2 => {
+                            let selected = edit.provider.selected().unwrap_or(0);
+                            edit.provider
+                                .select(Some((selected + 1).min(self.config.providers.len() - 1)));
+                        }
+                        _ if edit.focus < 2 => {
+                            edit.fields[edit.focus].apply_key(key);
+                        }
+                        _ => {}
+                    }
+                }
+                return true;
+            }
+            Mode::Delete => {
+                self.mode = Mode::Browse;
+                if key.code == KeyCode::Char('y') {
+                    let selected = self.selected();
+                    let mut next = self.config.clone();
+                    if self.routes_view {
+                        next.routes.remove(selected);
+                    } else {
+                        next.providers.remove(selected);
+                    }
+                    if self.save(next, path) {
+                        self.select(selected);
+                    }
+                } else {
+                    self.status = "Deletion cancelled.".into();
+                    self.status_error = false;
+                }
+                return true;
+            }
+            Mode::Browse => {}
+        }
+
+        let selected = self.selected();
+        match key.code {
+            KeyCode::Char('q') | KeyCode::Esc => return false,
+            KeyCode::Tab | KeyCode::BackTab => self.routes_view = !self.routes_view,
+            KeyCode::Up | KeyCode::Char('k') => self.select(selected.saturating_sub(1)),
+            KeyCode::Down | KeyCode::Char('j') => self.select(selected + 1),
+            KeyCode::Char('a' | 'e') if self.routes_view => {
+                if self.config.providers.is_empty() {
+                    self.status = "Add a provider before creating a route.".into();
+                    self.status_error = true;
+                } else if key.code == KeyCode::Char('a') {
+                    self.mode = Mode::Route(RouteEditor::new(
+                        None,
+                        &self.config,
+                        self.providers.selected().unwrap_or(0),
+                    ));
+                } else if let Some(route) = self.config.routes.get(selected) {
+                    self.mode =
+                        Mode::Route(RouteEditor::new(Some((selected, route)), &self.config, 0));
+                }
+            }
+            KeyCode::Char('a') => self.mode = Mode::Provider(Editor::new(None)),
+            KeyCode::Char('e') => {
+                if let Some(provider) = self.config.providers.get(selected) {
+                    self.mode = Mode::Provider(Editor::new(Some((selected, provider))));
+                }
+            }
+            KeyCode::Char('d') => {
+                if self.routes_view {
+                    if !self.config.routes.is_empty() {
+                        self.mode = Mode::Delete;
+                    }
+                } else if let Some(provider) = self.config.providers.get(selected) {
+                    if provider_is_referenced(&self.config, &provider.id) {
+                        let mut references: Vec<&str> = self
+                            .config
+                            .routes
+                            .iter()
+                            .filter(|r| r.provider == provider.id)
+                            .map(|r| r.name.as_str())
+                            .collect();
+                        if self
+                            .config
+                            .default_route
+                            .as_ref()
+                            .is_some_and(|r| r.provider == provider.id)
+                        {
+                            references.push("default route");
+                        }
+                        if self.config.route.provider == provider.id {
+                            references.push("legacy route");
+                        }
+                        self.status = format!(
+                            "Cannot delete '{}': change its references first: {}.",
+                            provider.name,
+                            references.join(", "),
+                        );
+                        self.status_error = true;
+                    } else {
+                        self.mode = Mode::Delete;
+                    }
+                }
+            }
+            KeyCode::Char('K' | 'J') if self.routes_view && !self.config.routes.is_empty() => {
+                let target = if key.code == KeyCode::Char('K') {
+                    selected.saturating_sub(1)
+                } else {
+                    (selected + 1).min(self.config.routes.len() - 1)
+                };
+                if target != selected {
+                    let mut next = self.config.clone();
+                    next.routes.swap(selected, target);
+                    if self.save(next, path) {
+                        self.select(target);
+                    }
+                }
+            }
+            KeyCode::Char('x') if self.routes_view => {
+                let mut next = self.config.clone();
+                next.default_route = None;
+                next.route = Route::default();
+                self.save(next, path);
+            }
+            KeyCode::Enter if !self.routes_view => {
+                if let Some(provider) = self.config.providers.get(selected) {
+                    let mut next = self.config.clone();
+                    next.default_route = Some(DefaultRoute {
+                        provider: provider.id.clone(),
+                    });
+                    next.route = Route::default();
+                    self.save(next, path);
+                }
+            }
+            KeyCode::Char('v') => {
+                self.status_error = false;
+                self.status = match self.config.validate() {
+                    Ok(()) => "Configuration valid.".into(),
+                    Err(error) => {
+                        self.status_error = true;
+                        format!("Invalid: {error}")
+                    }
+                };
+            }
+            _ => {}
+        }
+        true
     }
 }
 
 pub fn run(path: &Path) -> Result<()> {
-    let mut config = if path.try_exists()? {
+    let config = if path.try_exists()? {
         Config::load(path)?
     } else {
         Config {
@@ -218,296 +504,20 @@ pub fn run(path: &Path) -> Result<()> {
             server: Server {
                 listen: "0.0.0.0:15721".parse()?,
             },
-            route: Route {
-                provider: String::new(),
-            },
+            route: Route::default(),
             routes: vec![],
             default_route: None,
             providers: vec![],
         }
     };
-    let mut selected = 0;
-    let mut editor: Option<Editor> = None;
-    let mut route_editor: Option<RouteEditor> = None;
-    let mut routes_view = false;
-    let mut delete_confirmation = false;
-    let mut status = if config.providers.is_empty() {
-        "New configuration: press a to add the first provider."
-    } else {
-        "Configuration valid. Running services use their startup snapshot."
-    }
-    .to_string();
+    let mut app = App::new(config);
     let _guard = TerminalGuard::enter()?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     loop {
-        terminal.draw(|frame| {
-            let areas =
-                Layout::vertical([Constraint::Min(8), Constraint::Length(4)]).split(frame.area());
-            if let Some(edit) = &route_editor {
-                let rows: Vec<ListItem> = ["Name", "Model glob", "Provider ID"].iter().enumerate().map(|(i, label)| {
-                    let input = &edit.fields[i];
-                    let value = if i == edit.focus {
-                        format!("{}▏{}", &input.value[..input.cursor], &input.value[input.cursor..])
-                    } else { input.value.clone() };
-                    ListItem::new(format!("{label}: {value}"))
-                }).collect();
-                let mut state = ListState::default().with_selected(Some(edit.focus));
-                frame.render_stateful_widget(
-                    List::new(rows).block(Block::default().borders(Borders::ALL).title("Edit route: Tab fields · Ctrl-S save · Esc cancel"))
-                        .highlight_style(Style::default().fg(Color::Yellow)), areas[0], &mut state,
-                );
-            } else if let Some(edit) = &editor {
-                let labels = ["ID", "Name", "Base URL", "API key", "Protocol"];
-                let rows: Vec<ListItem> = labels
-                    .iter()
-                    .enumerate()
-                    .map(|(i, label)| {
-                        let value = if i == 4 {
-                            protocol_label(&edit.provider().protocol).to_string()
-                        } else if i == 3 {
-                            if edit.fields[3].value.is_empty() {
-                                "(missing)".into()
-                            } else {
-                                "******** (configured)".into()
-                            }
-                        } else {
-                            let input = &edit.fields[i];
-                            if i == edit.focus {
-                                format!(
-                                    "{}▏{}",
-                                    &input.value[..input.cursor],
-                                    &input.value[input.cursor..]
-                                )
-                            } else {
-                                input.value.clone()
-                            }
-                        };
-                        ListItem::new(format!("{label}: {value}"))
-                    })
-                    .collect();
-                let mut state = ListState::default().with_selected(Some(edit.focus));
-                frame.render_stateful_widget(
-                    List::new(rows)
-                        .block(Block::default().borders(Borders::ALL).title(
-                            "Edit provider: Tab fields · ←/→ protocol · Ctrl-S save · Esc cancel",
-                        ))
-                        .highlight_style(Style::default().fg(Color::Yellow)),
-                    areas[0],
-                    &mut state,
-                );
-            } else if routes_view {
-                let rows: Vec<ListItem> = config.routes.iter().enumerate().map(|(i, r)| {
-                    ListItem::new(format!("{}. {} | {} → {}", i + 1, r.name, r.model_pattern, r.provider))
-                }).collect();
-                let mut state = ListState::default().with_selected(if rows.is_empty() { None } else { Some(selected) });
-                frame.render_stateful_widget(
-                    List::new(rows).block(Block::default().borders(Borders::ALL).title(format!("Routes · first match · default: {}", default_provider(&config))))
-                        .highlight_style(Style::default().fg(Color::Yellow)).highlight_symbol("> "), areas[0], &mut state,
-                );
-            } else {
-                let items: Vec<ListItem> = config
-                    .providers
-                    .iter()
-                    .map(|p| {
-                        ListItem::new(format!(
-                            "{} {} ({}) | {} | {} | key: {}",
-                            if p.id == default_provider(&config) {
-                                "*"
-                            } else {
-                                " "
-                            },
-                            p.name,
-                            p.id,
-                            protocol_label(&p.protocol),
-                            p.base_url,
-                            if p.api_key.is_empty() {
-                                "missing"
-                            } else {
-                                "configured"
-                            }
-                        ))
-                    })
-                    .collect();
-                let mut state = ListState::default().with_selected(if items.is_empty() {
-                    None
-                } else {
-                    Some(selected)
-                });
-                frame.render_stateful_widget(
-                    List::new(items)
-                        .block(
-                            Block::default()
-                                .borders(Borders::ALL)
-                                .title("Providers · * default route"),
-                        )
-                        .highlight_style(Style::default().fg(Color::Yellow))
-                        .highlight_symbol("> "),
-                    areas[0],
-                    &mut state,
-                );
-            }
-            frame.render_widget(
-                Paragraph::new(format!(
-                    "{}\n{status}",
-                    if routes_view { "Tab providers · a add · e edit · d delete · K/J reorder · x clear default · v validate · q quit" }
-                    else { "Tab routes · a add · e edit · d delete · Enter default · v validate · q quit" }
-                ))
-                .block(Block::default().borders(Borders::ALL)),
-                areas[1],
-            );
-        })?;
-        let Event::Key(key) = event::read()? else {
-            continue;
-        };
-        if key.kind == KeyEventKind::Release {
-            continue;
-        }
-        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-            break;
-        }
-        if let Some(edit) = editor.as_mut() {
-            match key.code {
-                KeyCode::Esc => editor = None,
-                KeyCode::Tab => edit.focus = (edit.focus + 1) % 5,
-                KeyCode::BackTab => edit.focus = (edit.focus + 4) % 5,
-                KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    let next = edit.apply(&config);
-                    if save(next, &mut config, path, &mut status) {
-                        editor = None;
-                    }
-                }
-                KeyCode::Left if edit.focus == 4 => edit.protocol = (edit.protocol + 2) % 3,
-                KeyCode::Right | KeyCode::Char(' ') if edit.focus == 4 => {
-                    edit.protocol = (edit.protocol + 1) % 3
-                }
-                _ if edit.focus < 4 => {
-                    edit.fields[edit.focus].apply_key(key);
-                }
-                _ => {}
-            }
-            continue;
-        }
-        if let Some(edit) = route_editor.as_mut() {
-            match key.code {
-                KeyCode::Esc => route_editor = None,
-                KeyCode::Tab => edit.focus = (edit.focus + 1) % 3,
-                KeyCode::BackTab => edit.focus = (edit.focus + 2) % 3,
-                KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    if save(edit.apply(&config), &mut config, path, &mut status) {
-                        route_editor = None;
-                    }
-                }
-                _ => {
-                    edit.fields[edit.focus].apply_key(key);
-                }
-            }
-            continue;
-        }
-        if delete_confirmation {
-            delete_confirmation = false;
-            if key.code == KeyCode::Char('y') {
-                let mut next = config.clone();
-                if routes_view {
-                    next.routes.remove(selected);
-                } else {
-                    next.providers.remove(selected);
-                }
-                if save(next, &mut config, path, &mut status) {
-                    let len = if routes_view {
-                        config.routes.len()
-                    } else {
-                        config.providers.len()
-                    };
-                    selected = selected.min(len.saturating_sub(1));
-                }
-            } else {
-                status = "Deletion cancelled.".into();
-            }
-            continue;
-        }
-        match key.code {
-            KeyCode::Char('q') | KeyCode::Esc => break,
-            KeyCode::Tab => {
-                routes_view = !routes_view;
-                selected = 0;
-            }
-            KeyCode::Up | KeyCode::Char('k') => selected = selected.saturating_sub(1),
-            KeyCode::Down | KeyCode::Char('j') => {
-                let len = if routes_view {
-                    config.routes.len()
-                } else {
-                    config.providers.len()
-                };
-                selected = (selected + 1).min(len.saturating_sub(1));
-            }
-            KeyCode::Char('a') if routes_view => route_editor = Some(RouteEditor::new(None)),
-            KeyCode::Char('e') if routes_view => {
-                if let Some(r) = config.routes.get(selected) {
-                    route_editor = Some(RouteEditor::new(Some((selected, r))));
-                }
-            }
-            KeyCode::Char('d') if routes_view => {
-                if !config.routes.is_empty() {
-                    delete_confirmation = true;
-                    status = "Delete selected route? y confirms; any other key cancels.".into();
-                }
-            }
-            KeyCode::Char('K' | 'J') if routes_view && !config.routes.is_empty() => {
-                let target = if key.code == KeyCode::Char('K') {
-                    selected.saturating_sub(1)
-                } else {
-                    (selected + 1).min(config.routes.len() - 1)
-                };
-                if target != selected {
-                    let mut next = config.clone();
-                    next.routes.swap(selected, target);
-                    if save(next, &mut config, path, &mut status) {
-                        selected = target;
-                    }
-                }
-            }
-            KeyCode::Char('x') if routes_view => {
-                let mut next = config.clone();
-                next.default_route = None;
-                next.route = Route::default();
-                save(next, &mut config, path, &mut status);
-            }
-            KeyCode::Char('a') => editor = Some(Editor::new(None)),
-            KeyCode::Char('e') => {
-                if let Some(p) = config.providers.get(selected) {
-                    editor = Some(Editor::new(Some((selected, p))));
-                }
-            }
-            KeyCode::Enter if !routes_view => {
-                if let Some(p) = config.providers.get(selected) {
-                    let mut next = config.clone();
-                    next.default_route = Some(DefaultRoute {
-                        provider: p.id.clone(),
-                    });
-                    next.route = Route::default();
-                    save(next, &mut config, path, &mut status);
-                }
-            }
-            KeyCode::Char('d') => {
-                if let Some(p) = config.providers.get(selected) {
-                    if provider_is_referenced(&config, &p.id) {
-                        status =
-                            "Change routes referencing this provider before deleting it.".into();
-                    } else {
-                        delete_confirmation = true;
-                        status =
-                            "Delete selected provider? y confirms; any other key cancels.".into();
-                    }
-                }
-            }
-            KeyCode::Char('v') => {
-                status = match config.validate() {
-                    Ok(()) => {
-                        "Configuration valid. Restart the service after saved changes.".into()
-                    }
-                    Err(error) => format!("Invalid: {error}"),
-                }
-            }
+        terminal.draw(|frame| view::draw(frame, &mut app))?;
+        match event::read()? {
+            Event::Key(key) if !app.key(key, path) => break,
+            Event::Paste(text) => app.paste(&text),
             _ => {}
         }
     }
@@ -570,18 +580,49 @@ mod tests {
     }
 
     #[test]
-    fn route_editor_rejects_missing_provider_without_changing_config() {
+    fn route_editor_uses_selected_provider_and_restores_existing_reference() {
         let config: Config = toml::from_str(include_str!("../config.example.toml")).unwrap();
-        let mut editor = RouteEditor::new(None);
-        editor.fields = [
-            TextInput::new("new"),
-            TextInput::new("gpt-*"),
-            TextInput::new("missing"),
-        ];
-        assert!(editor.apply(&config).validate().is_err());
-        editor.fields[2] = TextInput::new(&config.providers[0].id);
+        let mut editor = RouteEditor::new(None, &config, 1);
+        editor.fields = [TextInput::new("new"), TextInput::new("gpt-*")];
         let next = editor.apply(&config);
         next.validate().unwrap();
         assert_eq!(next.routes.len(), config.routes.len() + 1);
+        assert_eq!(next.routes.last().unwrap().provider, config.providers[1].id);
+        let editor = RouteEditor::new(Some((0, &config.routes[0])), &config, 0);
+        assert_eq!(
+            editor.apply(&config).routes[0].provider,
+            config.routes[0].provider
+        );
+    }
+
+    #[test]
+    fn failed_save_preserves_draft_and_success_requires_restart_after_validation() {
+        let config: Config = toml::from_str(include_str!("../config.example.toml")).unwrap();
+        let mut app = App::new(config);
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        let key = |code, modifiers| KeyEvent::new(code, modifiers);
+        app.key(key(KeyCode::Char('a'), KeyModifiers::NONE), &path);
+        app.paste("duplicate");
+        app.key(key(KeyCode::Char('s'), KeyModifiers::CONTROL), &path);
+        assert!(matches!(app.mode, Mode::Provider(_)));
+        assert!(app.status_error);
+        assert!(!path.exists());
+        assert_eq!(app.config.providers.len(), 3);
+        if let Mode::Provider(edit) = &mut app.mode {
+            edit.fields[1] = TextInput::new("Added provider");
+            edit.fields[2] = TextInput::new("https://example.net/v1");
+            edit.fields[3] = TextInput::new("private-key");
+        }
+        app.key(key(KeyCode::Char('s'), KeyModifiers::CONTROL), &path);
+        assert!(matches!(app.mode, Mode::Browse));
+        assert_eq!(Config::load(&path).unwrap().providers.len(), 4);
+        app.key(key(KeyCode::Char('v'), KeyModifiers::NONE), &path);
+        assert!(app.restart_required);
+        assert!(!app.status_error);
+        // Pasting list shortcuts must not execute actions outside a text field.
+        app.paste("dyaq");
+        assert!(matches!(app.mode, Mode::Browse));
+        assert_eq!(app.config.providers.len(), 4);
     }
 }

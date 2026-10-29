@@ -237,6 +237,14 @@ impl TextInput {
         true
     }
 
+    /// A bracketed paste is data for one field, never navigation or commands.
+    pub fn insert_paste(&mut self, text: &str) {
+        self.clamp_cursor();
+        let text: String = text.chars().filter(|ch| !ch.is_control()).collect();
+        self.value.insert_str(self.cursor, &text);
+        self.cursor += text.len();
+    }
+
     pub fn backspace(&mut self) -> bool {
         if self.cursor == 0 || self.value.is_empty() {
             return false;
@@ -371,6 +379,15 @@ pub(crate) fn next_word_boundary(text: &str, cursor: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn paste_inserts_at_unicode_cursor_and_discards_control_characters() {
+        let mut input = TextInput::new("你好");
+        input.move_left();
+        input.insert_paste("a\t\r\n\u{13}🚀");
+        assert_eq!(input.value, "你a🚀好");
+        assert_eq!(input.cursor, "你a🚀".len());
+    }
 
     fn ctrl(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::CONTROL)

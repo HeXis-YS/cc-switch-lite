@@ -2,8 +2,8 @@
 """Real-PTY TUI smoke test; requires Python 3.11+, Unix, and a built binary.
 
 Usage: python3 scripts/tui-smoke.py [--binary target/debug/cc-switch-lite]
-Creates a temporary configuration, drives the provider editor, and checks masked
-credentials, private permissions and terminal restoration. Persistent run metadata
+Creates a temporary configuration and checks paste, provider selection, route
+editing, masked credentials, private permissions and terminal restoration at 80x24. Persistent run metadata
 and a credential-free result are written under .codex/runs/tui-<UTC>-<PID>/.
 """
 import argparse
@@ -40,17 +40,20 @@ def main():
         "python": platform.python_version(), "platform": platform.platform(),
         "binary": str(binary), "binary_sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
         "script_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
-        "terminal": "xterm-256color", "rows": 30, "columns": 140, "timeout_seconds": 15,
+        "terminal": "xterm-256color", "rows": 24, "columns": 80, "timeout_seconds": 30,
         "git_head": subprocess.run(["git", "rev-parse", "HEAD"], cwd=root, capture_output=True, text=True).stdout.strip(),
         "git_status": subprocess.run(["git", "status", "--short"], cwd=root, capture_output=True, text=True).stdout,
     }
     (run / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n")
     master, slave = pty.openpty()
     original = termios.tcgetattr(slave)
-    fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 140, 0, 0))
+    fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 80, 0, 0))
     captured = bytearray()
     process = None
-    deadline = time.monotonic() + 15
+    deadline = time.monotonic() + 30
+
+    def paste(value):
+        return b"\x1b[200~" + value + b"\x1b[201~"
 
     def drain_until(predicate):
         while not predicate():
@@ -78,45 +81,64 @@ def main():
             os.write(master, b"a")
             drain_until(lambda: b"Edit provider" in captured)
             secret = b"smoke-private-key-51927"
-            os.write(master, b"smoke\tSmoke Provider\thttps://example.com/v1\t" + secret + b"\x13")
+            url = b"https://example.com/" + b"long-path/" * 15 + b"v1"
+            os.write(master, b"smoke\tSmoke Provider\t" + paste(url) + b"\t"
+                     + paste(secret + b"\r\n\t\x13") + b"\x13")
             drain_until(lambda: config.exists())
             content = tomllib.loads(config.read_text())
             assert content["default_route"]["provider"] == "smoke", "Default route not selected"
             assert "route" not in content and "routes" not in content, "Empty legacy fields persisted"
             assert content["providers"][0] == {
                 "id": "smoke", "name": "Smoke Provider", "protocol": "responses",
-                "base_url": "https://example.com/v1", "api_key": secret.decode(),
+                "base_url": url.decode(), "api_key": secret.decode(),
                 "compat": {"meta": {}, "settings_config": {}},
             }, "Saved provider differs from input"
             assert config.stat().st_mode & 0o777 == 0o600, "Configuration permissions not private"
+            # A second provider makes the picker and independent list selection
+            # observable in saved configuration, without parsing ANSI redraws.
+            os.write(master, b"asecond\tSecond Provider\thttps://example.org/v1\t"
+                     + paste(secret) + b"\x13")
+            drain_until(lambda: len(tomllib.loads(config.read_text())["providers"]) == 2)
             os.write(master, b"\ta")
             # Ratatui draws only changed cells: a reused "Edit " prefix need not
             # appear again in the PTY byte stream. Verify the saved state below.
-            os.write(master, b"claude\tclaude-*\tsmoke\x13")
+            # New routes start on the selected provider. Left chooses the first.
+            os.write(master, b"claude\tclaude-*\t\x1b[D\x13")
             drain_until(lambda: len(tomllib.loads(config.read_text()).get("routes", [])) == 1)
             assert tomllib.loads(config.read_text())["routes"][0] == {
                 "name": "claude", "model_pattern": "claude-*", "provider": "smoke",
             }, "Route editor did not persist the rule"
             # Add a second rule, reorder it, then delete it through the confirmation.
-            os.write(master, b"aother\tgpt-*\tsmoke\x13")
+            os.write(master, b"aother\tgpt-*\t\x13")
             drain_until(lambda: len(tomllib.loads(config.read_text()).get("routes", [])) == 2)
-            os.write(master, b"J")
+            assert tomllib.loads(config.read_text())["routes"][1]["provider"] == "second", "Provider picker lost selected provider"
+            # Newly added routes are selected. Move the second rule up.
+            os.write(master, b"K")
             drain_until(lambda: tomllib.loads(config.read_text())["routes"][0]["name"] == "other")
-            os.write(master, b"kdy")
+            os.write(master, b"dy")
             drain_until(lambda: len(tomllib.loads(config.read_text())["routes"]) == 1)
             # Edit the remaining rule's name and clear the default.
             os.write(master, b"e\x15renamed\x13")
             drain_until(lambda: tomllib.loads(config.read_text())["routes"][0]["name"] == "renamed")
             os.write(master, b"x")
             drain_until(lambda: "default_route" not in tomllib.loads(config.read_text()))
+            # Returning to Providers must retain the second selection.
+            os.write(master, b"\t\r")
+            drain_until(lambda: tomllib.loads(config.read_text()).get("default_route", {}).get("provider") == "second")
+            # A pasted command sequence in a list must have no effect.
+            os.write(master, paste(b"dyaq"))
+            os.write(master, b"v")
             os.write(master, b"q")
             process.wait(timeout=max(0.1, deadline - time.monotonic()))
             while select.select([master], [], [], 0)[0]:
                 captured.extend(os.read(master, 65536))
             assert process.returncode == 0, "TUI exit failed"
             assert termios.tcgetattr(slave) == original, "Terminal settings were not restored"
+            assert b"\x1b[?2004h" in captured and b"\x1b[?2004l" in captured, "Bracketed paste mode was not restored"
             assert secret not in captured, "Credential appeared in terminal output"
-            result = "PASS: provider saved, routes created/edited/reordered/deleted, default cleared, key masked, mode 0600, terminal restored\n"
+            final = tomllib.loads(config.read_text())
+            assert len(final["providers"]) == 2 and len(final["routes"]) == 1, "Pasted list commands changed configuration"
+            result = "PASS: long URL/key pasted at 80x24, provider picker, routes created/edited/reordered/deleted, list selection retained, default changed, key masked, mode 0600, terminal/paste mode restored\n"
             (run / "output.log").write_text(result)
             print(result.strip())
             print(f"Run: {run.relative_to(root)}")

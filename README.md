@@ -42,13 +42,16 @@ JSON 错误脱敏后转换为 Responses 风格错误，保留上游错误类型�
 
 ## TUI
 
-`Tab` 切换 Provider 和路由列表。列表中 `↑/↓` 选择，`a` 新增、`e` 编辑、`d` 删除、`v` 校验、`q` 退出。
+`Tab` 切换 Provider 和路由列表，两个列表各自保留选中项及滚动位置。
+列表中 `↑/↓` 选择，`a` 新增、`e` 编辑、`d` 删除、`v` 校验、`q` 退出；底部提示随当前操作变化。
+Provider 按列显示名称、ID、协议与凭据状态，选中项下方显示地址；删除确认显示对象名称。
 Provider 列表中 `Enter` 设置默认路由；路由列表中 `K/J` 上移/下移规则，`x` 清除默认路由（必须保留至少一条规则）。
-路由编辑器填写名称、模型 glob 和已有 Provider ID；规则按显示顺序匹配。
+路由编辑器填写名称和模型 glob，切到 Provider 列表后用方向键选择已有 Provider；规则按显示顺序匹配。
 编辑时 `Tab/Shift-Tab` 切字段，协议字段用左右键选择，`Ctrl-S` 保存，`Esc` 取消。
-API Key 始终掩码显示。被规则或默认路由引用的 Provider 不能删除；修改 Provider ID 会同步更新引用。
+长文本字段随光标水平滚动。支持终端的括号粘贴（bracketed paste），内容只插入当前文本字段，过滤换行、Tab 等控制字符。
+API Key 始终掩码显示。被规则或默认路由引用的 Provider 不能删除，提示会列出相关规则；修改 Provider ID 会同步更新引用。
 不存在的配置可以通过 TUI 新增首个 Provider 创建。
-每次成功修改立即保存并提示重启；运行中的服务继续使用启动快照。
+每次成功修改立即保存；本次 TUI 会话中的重启提示会持续显示，运行中的服务继续使用启动快照。
 
 ## 会话边界
 
@@ -80,7 +83,8 @@ Messages 转换对 Opus 5.5 应用 [cc-switch #8048](https://github.com/farion12
 不需要真实 Provider 账户。Mock 通过不代表已验证真实 Codex CLI 与所有远程供应商组合。
 
 Unix / Python 3.11+ 可在构建后运行 `python3 scripts/tui-smoke.py`，通过真实 PTY
-检查新增 Provider、路由增删改与排序、清除默认路由、密钥掩码、0600 权限和终端恢复；日志位于 `.codex/runs/tui-<UTC>-<PID>/`。
+在 80×24 终端下检查长 URL/密钥粘贴、Provider 选择、路由增删改与排序、列表选中项保留、默认路由修改、
+密钥掩码、0600 权限，以及终端设置和粘贴模式恢复；日志位于 `.codex/runs/tui-<UTC>-<PID>/`。
 
 协议及 TUI 来源、版本和许可见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
 
@@ -90,3 +94,4 @@ Unix / Python 3.11+ 可在构建后运行 `python3 scripts/tui-smoke.py`，通�
 `src/server.rs` 保留请求解析、单 Provider 重试和最终脱敏；私有 transport 模块负责一次上游发送及响应提交前校验。
 `src/compat/response.rs` 负责成功响应转换，私有 error 模块集中客户端错误响应；现有模块导出路径保持不变。
 重试使用首次准备的具名响应选项和原始工具上下文，不能因修正请求体而重新计算这些状态。
+TUI 的状态和按键处理位于 `src/tui.rs`，界面绘制位于 `src/tui/view.rs`，文本编辑位于 `src/tui/text_edit.rs`。

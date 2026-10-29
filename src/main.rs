@@ -2,7 +2,7 @@ use cc_switch_lite::{config::Config, server, tui};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 #[derive(Parser)]
-#[command(version, about = "Single-provider Responses routing proxy")]
+#[command(version, about = "Responses proxy with model-based provider routing")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
