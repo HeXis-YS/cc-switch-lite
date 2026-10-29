@@ -8,7 +8,7 @@ use super::{
     codex_compaction,
     inline_think::InlineThinkSplitter,
     transform_codex_chat::{
-        chat_error_to_response_error, chat_usage_to_responses_usage,
+        chat_error_to_response_error, chat_incomplete_reason, chat_usage_to_responses_usage,
         custom_tool_input_from_chat_arguments, response_id_from_chat_id,
         response_status_from_finish_reason, response_tool_call_item_from_chat_name,
         response_tool_call_item_id_from_chat_name, CodexToolContext,
@@ -464,28 +464,40 @@ impl ChatToResponsesState {
             return Vec::new();
         }
 
+        if self.finish_reason.is_none() {
+            if self.has_substantive_output() {
+                self.finish_reason = Some("length".to_string());
+            } else {
+                return vec![self.failed_event(
+                    "Upstream Chat Completions stream ended before sending finish_reason"
+                        .to_string(),
+                    Some("stream_truncated".to_string()),
+                )];
+            }
+        }
+        let status = response_status_from_finish_reason(self.finish_reason.as_deref());
+
         let mut events = self.ensure_response_started();
         events.extend(self.flush_inline_think_at_boundary());
         events.extend(self.finalize_reasoning());
         events.extend(self.finalize_text());
-        events.extend(self.finalize_tools());
+        // Chat has no per-tool stop event. Only a successful finish_reason commits
+        // its calls; output_item.done would dispatch even an incomplete item in Codex.
+        if status == "completed" {
+            events.extend(self.finalize_tools());
+        }
 
         if self.tool_context.is_compaction_request() {
             return self.finish_compaction(events);
         }
-
-        let status = response_status_from_finish_reason(self.finish_reason.as_deref());
 
         // 丢弃过工具调用、且最终一个工具调用都没剩下时，Codex 会收到一个
         // "status=completed 但 output 里没有任何工具调用" 的回合，agent loop 必然
         // 静默收尾——这正是 #4341「答一句就停、零报错」的形态。此时如实报错，
         // 而不是谎报成功。只要还剩下任何一个合法工具调用，Codex 本来就会继续，
         // 判据不成立，行为保持不变。
-        //
-        // 🔴 只对本应 `completed` 的回合生效：`finish_reason=length`（含流提前断开后
-        // 合成的 length）有自己正当的终止解释，工具调用没拿到 name 是截断的后果而非
-        // 上游发了畸形数据——报成 tool_call_dropped 会给出错误的归因，而本修复的全部
-        // 意义就在于诊断信息的准确性。
+        // 截断或内容过滤回合不提交尚未完成的工具，由 response.incomplete
+        // 报告原因，不改报为上游缺失工具名。
         if status == "completed" && self.dropped_tool_calls > 0 && !self.has_emitted_tool_call() {
             let dropped = self.dropped_tool_calls;
             let message = format!(
@@ -497,11 +509,12 @@ impl ChatToResponsesState {
         }
 
         let mut response = self.base_response(status, self.completed_output_items());
-        if status == "incomplete" {
-            response["incomplete_details"] = json!({ "reason": "max_output_tokens" });
+        if let Some(reason) = chat_incomplete_reason(self.finish_reason.as_deref()) {
+            response["incomplete_details"] = json!({ "reason": reason });
+            events.push(sse::response_incomplete(&response));
+        } else {
+            events.push(sse::response_completed(&response));
         }
-
-        events.push(sse::response_completed(&response));
         self.completed = true;
         events
     }
@@ -797,6 +810,7 @@ pub(crate) fn create_responses_sse_stream_from_chat_with_context<
 
                         let data = data_parts.join("\n");
                         if data.trim() == "[DONE]" {
+                            state.finish_reason.get_or_insert_with(|| "stop".to_string());
                             for event in state.finalize() {
                                 yield Ok(event);
                             }
@@ -1183,7 +1197,8 @@ mod tests {
         ])
         .await;
 
-        assert!(output.contains("event: response.completed"));
+        assert!(output.contains("event: response.incomplete"));
+        assert!(!output.contains("event: response.completed"));
         assert!(output.contains("\"status\":\"incomplete\""));
         assert!(!output.contains("event: response.failed"));
     }
@@ -1471,7 +1486,8 @@ mod tests {
         ])
         .await;
 
-        assert!(output.contains("event: response.completed"));
+        assert!(output.contains("event: response.incomplete"));
+        assert!(!output.contains("event: response.completed"));
         assert!(output.contains("\"status\":\"incomplete\""));
         assert!(output.contains("\"incomplete_details\":{\"reason\":\"max_output_tokens\"}"));
         assert!(!output.contains("event: response.failed"));
@@ -1677,7 +1693,12 @@ mod tests {
                  data: [DONE]\n\n"
             );
             let expected = terminal_boundary_output(prefix.clone(), None).await;
-            assert_eq!(expected.matches("event: response.completed\n").count(), 1);
+            let terminal = if reason == "length" {
+                "response.incomplete"
+            } else {
+                "response.completed"
+            };
+            assert_eq!(expected.matches(&format!("event: {terminal}\n")).count(), 1);
             assert!(expected.contains("\"output_tokens\":11"));
             assert!(expected.contains("\"input_tokens\":7"));
             for tail in [
@@ -1702,6 +1723,38 @@ mod tests {
         let actual = terminal_boundary_output(prefix.to_owned(), Some("transport")).await;
         assert_eq!(actual.matches("event: response.failed\n").count(), 1);
         assert!(!actual.contains("event: response.completed\n"));
+    }
+
+    #[tokio::test]
+    async fn incomplete_turn_never_commits_an_unfinished_tool() {
+        // Even valid JSON is not a completion signal: Codex dispatches on
+        // output_item.done, before it sees the response's terminal event.
+        for arguments in [r#"{"path":"demo"}"#, r#"{"path":"#] {
+            for finish in [None, Some("length"), Some("content_filter")] {
+                let chunk = json!({"id":"fixed","choices":[{"delta":{"tool_calls":[{
+                    "index":0,"id":"call_open","type":"function","function":{
+                        "name":"delete_file","arguments":arguments
+                    }}]},"finish_reason":finish}]});
+                let output = collect(vec![&format!("data: {chunk}\n\n")]).await;
+                let events = parse_sse_events(&output);
+                assert_eq!(events.last().unwrap()["type"], "response.incomplete");
+                assert!(events
+                    .iter()
+                    .all(|event| event["type"] != "response.output_item.done"));
+                assert!(events
+                    .iter()
+                    .all(|event| event["type"] != "response.function_call_arguments.done"));
+                assert_eq!(events.last().unwrap()["response"]["output"], json!([]));
+                assert_eq!(
+                    events.last().unwrap()["response"]["incomplete_details"]["reason"],
+                    if finish == Some("content_filter") {
+                        "content_filter"
+                    } else {
+                        "max_output_tokens"
+                    }
+                );
+            }
+        }
     }
 
     #[tokio::test]

@@ -64,7 +64,6 @@ struct AnthropicToResponsesState {
     output_items: Vec<(u32, Value)>,
     anthropic_usage: Map<String, Value>,
     stop_reason: Option<String>,
-    stream_truncated: bool,
     tool_context: CodexToolContext,
 }
 
@@ -80,7 +79,6 @@ impl Default for AnthropicToResponsesState {
             output_items: Vec::new(),
             anthropic_usage: Map::new(),
             stop_reason: None,
-            stream_truncated: false,
             tool_context: CodexToolContext::default(),
         }
     }
@@ -334,10 +332,10 @@ impl AnthropicToResponsesState {
         let Some(index) = data.get("index").and_then(|v| v.as_u64()) else {
             return Vec::new();
         };
-        self.close_block(index)
+        self.close_block(index, true)
     }
 
-    fn close_block(&mut self, index: u64) -> Vec<Bytes> {
+    fn close_block(&mut self, index: u64, complete: bool) -> Vec<Bytes> {
         let Some(block) = self.blocks.get_mut(&index) else {
             return Vec::new();
         };
@@ -361,6 +359,11 @@ impl AnthropicToResponsesState {
                 events
             }
             BlockKind::Tool => {
+                // Codex dispatches output_item.done regardless of item.status.
+                // Only content_block_stop commits a tool; EOF cannot close it.
+                if !complete {
+                    return Vec::new();
+                }
                 // Prefer streamed input_json_delta; fall back to the input carried on
                 // content_block_start when the gateway emitted no deltas (mirrors the
                 // non-streaming aggregator's precedence in transform_codex_anthropic).
@@ -379,11 +382,7 @@ impl AnthropicToResponsesState {
                 let is_custom_tool = self.tool_context.is_custom_tool_chat_name(&name);
                 let item = response_tool_call_item_from_chat_name(
                     &item_id,
-                    if self.stream_truncated {
-                        "incomplete"
-                    } else {
-                        "completed"
-                    },
+                    "completed",
                     &call_id,
                     &name,
                     &arguments,
@@ -391,21 +390,19 @@ impl AnthropicToResponsesState {
                     &self.tool_context,
                 );
                 let mut events = Vec::new();
-                if !self.stream_truncated {
-                    if is_custom_tool {
-                        let input = item.get("input").and_then(Value::as_str).unwrap_or("");
-                        events.push(sse::custom_tool_call_input_done(
-                            output_index,
-                            &item_id,
-                            input,
-                        ));
-                    } else {
-                        events.push(sse::function_call_arguments_done(
-                            output_index,
-                            &item_id,
-                            &arguments,
-                        ));
-                    }
+                if is_custom_tool {
+                    let input = item.get("input").and_then(Value::as_str).unwrap_or("");
+                    events.push(sse::custom_tool_call_input_done(
+                        output_index,
+                        &item_id,
+                        input,
+                    ));
+                } else {
+                    events.push(sse::function_call_arguments_done(
+                        output_index,
+                        &item_id,
+                        &arguments,
+                    ));
                 }
                 events.push(sse::output_item_done(output_index, &item));
                 self.output_items.push((output_index, item));
@@ -462,7 +459,8 @@ impl AnthropicToResponsesState {
         }
         let mut events = self.ensure_response_started();
 
-        // Close out any blocks that are still open
+        // Flush remaining text/thinking, but do not synthesize completion of an
+        // open tool block. Only content_block_stop makes a tool executable.
         let open: Vec<u64> = self
             .blocks
             .iter()
@@ -470,7 +468,7 @@ impl AnthropicToResponsesState {
             .map(|(index, _)| *index)
             .collect();
         for index in open {
-            events.extend(self.close_block(index));
+            events.extend(self.close_block(index, false));
         }
 
         if self.tool_context.is_compaction_request() {
@@ -487,9 +485,10 @@ impl AnthropicToResponsesState {
         let mut response = self.base_response(status, output);
         if let Some(reason) = incomplete_reason {
             response["incomplete_details"] = json!({ "reason": reason });
+            events.push(sse::response_incomplete(&response));
+        } else {
+            events.push(sse::response_completed(&response));
         }
-
-        events.push(sse::response_completed(&response));
         self.completed = true;
         events
     }
@@ -700,10 +699,17 @@ pub(crate) fn responses_sse_events_from_anthropic_message(
                 _ => {}
             }
 
-            events.extend(state.handle_content_block_stop(&json!({
-                "type": "content_block_stop",
-                "index": index
-            })));
+            // A buffered incomplete message provides no evidence that a tool
+            // block finished. Keep it open rather than synthesizing a dispatch.
+            let (status, _) = map_anthropic_stop_reason_to_status(
+                body.get("stop_reason").and_then(Value::as_str),
+            );
+            if block_type != "tool_use" || status == "completed" {
+                events.extend(state.handle_content_block_stop(&json!({
+                    "type": "content_block_stop",
+                    "index": index
+                })));
+            }
         }
     }
 
@@ -809,11 +815,9 @@ pub(crate) fn create_responses_sse_stream_from_anthropic_with_context<
                     yield Ok(event);
                 }
             } else if state.has_substantive_output() {
-                // Upstream truncated mid-stream (e.g. a proxy closed the connection without
-                // an I/O error) after emitting partial output. Report it as incomplete so
-                // Codex does not accept the truncated output as a normal completion.
+                // Codex uses the terminal event type, not response.status, to
+                // distinguish truncated output from a successful completion.
                 state.stop_reason = Some("max_tokens".to_string());
-                state.stream_truncated = true;
                 for event in state.finalize() {
                     yield Ok(event);
                 }
@@ -975,7 +979,8 @@ mod tests {
         );
         let merged = run(input).await;
         assert!(merged.contains("\"delta\":\"partial\""));
-        assert!(merged.contains("event: response.completed"));
+        assert!(merged.contains("event: response.incomplete"));
+        assert!(!merged.contains("event: response.completed"));
         // The top-level response is incomplete (message output items keep their own
         // "completed" status, but the response status must not be "completed").
         assert!(merged.contains("\"status\":\"incomplete\""));
@@ -996,6 +1001,8 @@ mod tests {
         let merged = run(input).await;
         assert!(merged.contains("\"status\":\"incomplete\""));
         assert!(!merged.contains("event: response.function_call_arguments.done"));
+        assert!(!merged.contains("event: response.output_item.done"));
+        assert!(merged.contains("event: response.incomplete"));
         assert!(merged.contains("\"reason\":\"max_output_tokens\""));
     }
 
@@ -1152,6 +1159,52 @@ mod tests {
         let merged = run(input).await;
         assert!(merged.contains("\"status\":\"incomplete\""));
         assert!(merged.contains("\"reason\":\"max_output_tokens\""));
+        assert!(merged.contains("event: response.incomplete"));
+        assert!(!merged.contains("event: response.completed"));
+    }
+
+    #[tokio::test]
+    async fn open_tool_with_valid_json_is_not_dispatched_on_eof() {
+        let input = [
+            json!({"type":"message_start","message":{"id":"fixed"}}),
+            json!({"type":"content_block_start","index":0,"content_block":{
+                "type":"tool_use","id":"call_open","name":"delete_file","input":{}}}),
+            json!({"type":"content_block_delta","index":0,"delta":{
+                "type":"input_json_delta","partial_json":"{\"path\":\"demo\"}"}}),
+        ]
+        .iter()
+        .map(|event| format!("data: {event}\n\n"))
+        .collect::<String>();
+        for tail in [
+            "".to_string(),
+            format!(
+                "data: {}\n\n",
+                json!({"type":"message_delta","delta":{"stop_reason":"max_tokens"}})
+            ),
+        ] {
+            let merged = run(&format!("{input}{tail}")).await;
+            assert!(merged.contains("event: response.incomplete"));
+            assert!(!merged.contains("event: response.output_item.done"));
+            assert!(!merged.contains("event: response.function_call_arguments.done"));
+        }
+        // A tool explicitly closed before EOF remains a completed call.
+        let closed = format!(
+            "{input}data: {}\n\n",
+            json!({"type":"content_block_stop","index":0})
+        );
+        let merged = run(&closed).await;
+        assert!(merged.contains("event: response.output_item.done"));
+        assert!(merged.contains("event: response.incomplete"));
+    }
+
+    #[test]
+    fn json_refusal_is_an_incomplete_event_with_content_filter_reason() {
+        let merged = render_message_events(&json!({
+            "type":"message","id":"refused","content":[],"stop_reason":"refusal"
+        }));
+        assert!(merged.contains("event: response.incomplete"));
+        assert!(merged.contains("\"reason\":\"content_filter\""));
+        assert!(!merged.contains("event: response.completed"));
     }
 
     #[tokio::test]

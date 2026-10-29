@@ -1363,6 +1363,8 @@ pub(crate) fn anthropic_response_to_responses_with_context(
         format!("resp_{id}")
     };
     let model = body.get("model").and_then(|m| m.as_str()).unwrap_or("");
+    let (status, incomplete_reason) =
+        map_anthropic_stop_reason_to_status(body.get("stop_reason").and_then(Value::as_str));
 
     let mut output: Vec<Value> = Vec::new();
     let mut text_parts: Vec<Value> = Vec::new();
@@ -1393,6 +1395,11 @@ pub(crate) fn anthropic_response_to_responses_with_context(
                     }
                 }
                 "tool_use" => {
+                    // JSON carries no content_block_stop boundaries. An incomplete
+                    // message cannot establish that its tool input finished.
+                    if status != "completed" {
+                        continue;
+                    }
                     flush_text(&mut output, &mut text_parts);
                     let call_id = block.get("id").and_then(|v| v.as_str()).unwrap_or("");
                     let name = block.get("name").and_then(|v| v.as_str()).unwrap_or("");
@@ -1426,8 +1433,6 @@ pub(crate) fn anthropic_response_to_responses_with_context(
     }
     flush_text(&mut output, &mut text_parts);
 
-    let (status, incomplete_reason) =
-        map_anthropic_stop_reason_to_status(body.get("stop_reason").and_then(|s| s.as_str()));
     let usage = build_responses_usage_from_anthropic(body.get("usage"));
 
     let mut result = json!({

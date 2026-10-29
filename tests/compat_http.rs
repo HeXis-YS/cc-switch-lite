@@ -166,6 +166,53 @@ fn agent_task() -> Value {
 }
 
 #[tokio::test]
+async fn incomplete_json_response_does_not_commit_tool_calls() {
+    for (protocol, streaming) in [
+        (Protocol::ChatCompletions, false),
+        (Protocol::Messages, false),
+        (Protocol::Messages, true),
+    ] {
+        for filtered in [false, true] {
+            let body = if protocol == Protocol::ChatCompletions {
+                json!({"id":"fixed","choices":[{"message":{"tool_calls":[{
+                    "id":"call_cut","type":"function","function":{"name":"delete_file","arguments":"{}"}
+                }]},"finish_reason":if filtered {"content_filter"} else {"length"}}]})
+            } else {
+                json!({"id":"fixed","type":"message","content":[{
+                    "type":"tool_use","id":"call_cut","name":"delete_file","input":{}
+                }],"stop_reason":if filtered {"refusal"} else {"max_tokens"}})
+            };
+            let fixture =
+                Fixture::new(protocol, vec![Reply::json(StatusCode::OK, body)], |_| {}).await;
+            let response = fixture.send(input(streaming)).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let text = response.text().await.unwrap();
+            let response = if streaming {
+                assert!(!text.contains("event: response.output_item.done"));
+                text.split("\n\n")
+                    .filter_map(|block| block.lines().find_map(|line| line.strip_prefix("data: ")))
+                    .filter_map(|data| serde_json::from_str::<Value>(data).ok())
+                    .find(|event| event["type"] == "response.incomplete")
+                    .unwrap()["response"]
+                    .clone()
+            } else {
+                serde_json::from_str::<Value>(&text).unwrap()
+            };
+            assert_eq!(response["status"], "incomplete");
+            assert_eq!(response["output"], json!([]));
+            assert_eq!(
+                response["incomplete_details"]["reason"],
+                if filtered {
+                    "content_filter"
+                } else {
+                    "max_output_tokens"
+                }
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn namespace_custom_tools_round_trip_through_chat_and_messages() {
     for protocol in [Protocol::ChatCompletions, Protocol::Messages] {
         for streaming in [false, true] {

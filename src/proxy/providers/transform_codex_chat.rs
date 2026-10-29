@@ -2095,9 +2095,7 @@ pub(crate) fn chat_completion_to_response_with_context(
     // 收尾（#4341）。此时如实报错，而不是谎报成功。只要还剩下任何一个合法工具
     // 调用，Codex 本来就会继续，判据不成立，行为保持不变。
     //
-    // 🔴 与流式分支一致，只对本应 `completed` 的回合生效：`finish_reason=length`
-    // 是截断，工具调用缺 name 是截断的后果而非上游发了畸形数据，报成
-    // tool_call_dropped 会给出错误的归因。
+    // 截断和内容过滤由 incomplete_details 解释，不改报为工具名缺失。
     if response_status_from_finish_reason(finish_reason) == "completed"
         && tool_calls.dropped > 0
         && tool_calls.items.is_empty()
@@ -2108,7 +2106,10 @@ pub(crate) fn chat_completion_to_response_with_context(
             tool_calls.dropped
         )));
     }
-    output.extend(tool_calls.items);
+    // Buffered responses have no per-tool completion boundary either.
+    if response_status_from_finish_reason(finish_reason) == "completed" {
+        output.extend(tool_calls.items);
+    }
 
     let mut response = json!({
         "id": response_id,
@@ -2120,8 +2121,8 @@ pub(crate) fn chat_completion_to_response_with_context(
         "usage": chat_usage_to_responses_usage(body.get("usage"))
     });
 
-    if finish_reason == Some("length") {
-        response["incomplete_details"] = json!({ "reason": "max_output_tokens" });
+    if let Some(reason) = chat_incomplete_reason(finish_reason) {
+        response["incomplete_details"] = json!({ "reason": reason });
     }
 
     Ok(response)
@@ -2571,9 +2572,18 @@ pub(crate) fn response_id_from_chat_id(id: Option<&str>) -> String {
 }
 
 pub(crate) fn response_status_from_finish_reason(finish_reason: Option<&str>) -> &'static str {
+    if chat_incomplete_reason(finish_reason).is_some() {
+        "incomplete"
+    } else {
+        "completed"
+    }
+}
+
+pub(crate) fn chat_incomplete_reason(finish_reason: Option<&str>) -> Option<&'static str> {
     match finish_reason {
-        Some("length") => "incomplete",
-        _ => "completed",
+        Some("length") => Some("max_output_tokens"),
+        Some("content_filter") => Some("content_filter"),
+        _ => None,
     }
 }
 
