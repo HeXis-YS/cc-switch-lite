@@ -1,6 +1,6 @@
 # cc-switch-lite
 
-独立 Rust 单端口代理与 TUI 控制面板，为 Codex CLI 提供 `POST /v1/responses`，按模型选择 Provider。
+独立 Rust 单端口代理，为 Codex CLI 提供 `POST /v1/responses`，按模型选择 Provider。
 支持 Responses 透传、Chat Completions 和 Anthropic Messages 转换（JSON/SSE、工具调用及思考内容）。
 
 ## 使用
@@ -14,22 +14,16 @@ install -m 600 config.example.yaml config.yaml
 # 编辑地址和凭据后：
 ./target/release/cc-switch-lite validate --config config.yaml
 ./target/release/cc-switch-lite serve --config config.yaml
-# 另一终端：
-./target/release/cc-switch-lite tui --config config.yaml
 ```
 
-配置文件仅支持 YAML，结构见 [config.example.yaml](config.example.yaml)。可选兼容字段和固定参考版本的差异清单见
-[请求兼容清单](docs/request-compatibility.md) 与 [行为清单](docs/compatibility.md)。`base_url` 是 API 前缀；
-程序按所选协议构造 `/responses`、`/chat/completions` 或 `/v1/messages`，并处理已带版本号的前缀。
-`routes` 列表按顺序匹配完整的请求 `model`，首个匹配生效。`model_pattern` 支持 glob：
-`claude-*`、`gpt-[45]*`、`deepseek/*`；`*` 不跨 `/`，跨路径匹配使用 `**`。
-未命中时使用 `default_route`；未配置默认路由则返回请求错误。请求必须包含非空字符串 `model`。
-路由只选择 Provider，不改写模型名：`claude-*` 不匹配 `ccs-openlux-claude/claude-opus-5-5`，
-需由客户端发送上游接受的模型名，或配置匹配完整名称的规则。协议兼容分支仍可能按原版语义处理模型标记。
-YAML 中的旧 `route.provider` 字段仍可读取，作为未设置 `default_route` 时的后备；TUI 设置默认路由后改用 `default_route`。
-配置版本必须为 1；Provider ID、规则名称唯一；路由引用必须存在；未知字段和无效凭据拒绝启动。
-YAML 错误不会打印可能包含密钥的源码行。程序保存配置时在同目录创建临时文件、同步后原子替换，Unix 权限为 `0600`。
-模型 glob、API Key 等字符串建议加引号。TUI 保存配置会重新序列化，手写注释不会保留。
+配置文件仅支持 YAML。直接编辑 [config.example.yaml](config.example.yaml) 的副本，字段、协议地址、
+路由匹配及兼容选项见 [配置指南](docs/configuration.md)。单 Provider 可以只配置 `default_route`；
+多个 Provider 可通过有序的 `routes` 列表按模型选择，首个匹配生效，路由不改写模型名。
+
+每次修改后先运行 `validate`，成功时输出 `Configuration valid`，再重启服务。
+服务使用启动时的配置快照；`serve` 和 `validate` 只读取文件，不会自动保存或重载配置。
+配置包含明文凭据，Unix 下请保持 `chmod 600 config.yaml`。YAML 解析错误不会打印可能包含密钥的源码行。
+`validate` 检查配置结构与约束，不会连接上游验证密钥、模型或服务可用性。
 
 代理不提供入口鉴权，仅部署于可信内网或由外部网络层限制访问。默认示例监听 `0.0.0.0:15721`。
 客户端自行配置 Responses endpoint 指向代理的 `/v1`，本程序不写入客户端配置。
@@ -40,19 +34,6 @@ JSON 错误脱敏后转换为 Responses 风格错误，保留上游错误类型�
 请求体上限为 200 MiB；缓冲响应正文上限为 128 MiB，SSE 按流处理。故障转移关闭时沿用原版行为，不启用
 额外连接或响应空闲超时；流式请求保留 600 秒响应头等待上限和 24 小时总时限，
 加密任务流识别仍有独立的有限预读窗口。
-
-## TUI
-
-`Tab` 切换 Provider 和路由列表，两个列表各自保留选中项及滚动位置。
-列表中 `↑/↓` 选择，`a` 新增、`e` 编辑、`d` 删除、`v` 校验、`q` 退出；底部提示随当前操作变化。
-Provider 按列显示名称、ID、协议与凭据状态，选中项下方显示地址；删除确认显示对象名称。
-Provider 列表中 `Enter` 设置默认路由；路由列表中 `K/J` 上移/下移规则，`x` 清除默认路由（必须保留至少一条规则）。
-路由编辑器填写名称和模型 glob，切到 Provider 列表后用方向键选择已有 Provider；规则按显示顺序匹配。
-编辑时 `Tab/Shift-Tab` 切字段，协议字段用左右键选择，`Ctrl-S` 保存，`Esc` 取消。
-长文本字段随光标水平滚动。支持终端的括号粘贴（bracketed paste），内容只插入当前文本字段，过滤换行、Tab 等控制字符。
-API Key 始终掩码显示。被规则或默认路由引用的 Provider 不能删除，提示会列出相关规则；修改 Provider ID 会同步更新引用。
-不存在的配置可以通过 TUI 新增首个 Provider 创建。
-每次成功修改立即保存；本次 TUI 会话中的重启提示会持续显示，运行中的服务继续使用启动快照。
 
 ## 会话边界
 
@@ -83,12 +64,8 @@ Messages 转换对 Opus 5.5 应用 [cc-switch #8048](https://github.com/farion12
 迁移已验收，后续重构不依赖 cc-switch 副本。
 不需要真实 Provider 账户。Mock 通过不代表已验证真实 Codex CLI 与所有远程供应商组合。
 
-Unix / Python 3.11+ 环境安装 PyYAML（`python3 -m pip install PyYAML`）后，
-可在构建后运行 `python3 scripts/tui-smoke.py`，通过真实 PTY
-在 80×24 终端下检查长 URL/密钥粘贴、Provider 选择、路由增删改与排序、列表选中项保留、默认路由修改、
-密钥掩码、0600 权限，以及终端设置和粘贴模式恢复；日志位于 `.codex/runs/tui-<UTC>-<PID>/`。
-
-协议及 TUI 来源、版本和许可见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
+协议兼容范围见 [请求兼容清单](docs/request-compatibility.md) 与 [行为清单](docs/compatibility.md)；
+来源、版本和许可见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
 
 ## 维护入口
 
@@ -96,4 +73,3 @@ Unix / Python 3.11+ 环境安装 PyYAML（`python3 -m pip install PyYAML`）后�
 `src/server.rs` 保留请求解析、单 Provider 重试和最终脱敏；私有 transport 模块负责一次上游发送及响应提交前校验。
 `src/compat/response.rs` 负责成功响应转换，私有 error 模块集中客户端错误响应；现有模块导出路径保持不变。
 重试使用首次准备的具名响应选项和原始工具上下文，不能因修正请求体而重新计算这些状态。
-TUI 的状态和按键处理位于 `src/tui.rs`，界面绘制位于 `src/tui/view.rs`，文本编辑位于 `src/tui/text_edit.rs`。

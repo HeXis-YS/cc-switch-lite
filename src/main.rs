@@ -1,4 +1,4 @@
-use cc_switch_lite::{config::Config, server, tui};
+use cc_switch_lite::{config::Config, server};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 #[derive(Parser)]
@@ -13,10 +13,6 @@ enum Command {
         #[arg(long)]
         config: PathBuf,
     },
-    Tui {
-        #[arg(long)]
-        config: PathBuf,
-    },
     Validate {
         #[arg(long)]
         config: PathBuf,
@@ -26,7 +22,6 @@ enum Command {
 async fn main() -> anyhow::Result<()> {
     match Cli::parse().command {
         Command::Serve { config } => server::serve(Config::load(&config)?).await,
-        Command::Tui { config } => tui::run(&config),
         Command::Validate { config } => {
             Config::load(&config)?;
             println!("Configuration valid");

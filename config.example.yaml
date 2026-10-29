@@ -1,13 +1,20 @@
+# Copy to config.yaml, replace URLs and keys, then validate before serving.
+# Field reference and advanced options: docs/configuration.md
 version: 1
 
 server:
+  # Use 127.0.0.1:15721 for local access only. No gateway authentication.
   listen: "0.0.0.0:15721"
 
 default_route:
+  # Used when no rule matches; must reference a providers[].id below.
   provider: provider-a
 
 # Rules match the complete request model in order; the first match wins.
 # Matching selects a provider and does not strip or rewrite model prefixes.
+# "*" does not cross "/"; use "**" to match across path separators.
+# Omit routes for a single-provider configuration. Without a default route,
+# unmatched models fail. Restart the service after changing this file.
 routes:
   - name: claude
     model_pattern: "claude-*"
@@ -20,15 +27,18 @@ providers:
   - id: provider-a
     name: Provider A
     protocol: responses
+    # API prefix: sends requests to /v1/responses on this host.
     base_url: "https://example.com/v1"
     api_key: "replace-with-your-key"
   - id: provider-b
     name: Provider B
     protocol: chat_completions
+    # Converts Responses requests and sends them to /v1/chat/completions.
     base_url: "https://example.org/v1"
     api_key: "replace-with-your-key"
   - id: provider-c
     name: Provider C
     protocol: messages
+    # Converts Responses requests and sends them to /v1/messages.
     base_url: "https://api.anthropic.com/v1"
     api_key: "replace-with-your-key"

@@ -206,9 +206,17 @@ fn new_config_roundtrips_without_empty_legacy_fields_and_accepts_appended_rules(
 }
 
 #[test]
-fn documented_example_is_valid() {
-    let config: Config = serde_saphyr::from_str(include_str!("../config.example.yaml")).unwrap();
-    config.validate().unwrap();
+fn documented_examples_are_valid() {
+    let examples = std::iter::once(include_str!("../config.example.yaml")).chain(
+        include_str!("../docs/configuration.md")
+            .split("```yaml\n")
+            .skip(1)
+            .map(|block| block.split("```").next().unwrap()),
+    );
+    for example in examples {
+        let config: Config = serde_saphyr::from_str(example).unwrap();
+        config.validate().unwrap();
+    }
 }
 
 #[test]

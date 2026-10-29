@@ -12,9 +12,9 @@ printf 'CARGO_BUILD_JOBS=%s RUST_TEST_THREADS=%s\n' "$CARGO_BUILD_JOBS" "$RUST_T
 rustc --version
 cargo --version
 git rev-parse --verify HEAD 2>/dev/null || printf 'Uncommitted initial repository\n'
-git diff --binary > "$run/workspace.patch"
+git diff HEAD --binary > "$run/workspace.patch"
 git status --short
-find src tests -type f -print0 | sort -z | xargs -0 sha256sum > "$run/source-sha256.txt"
+find src tests config.example.yaml docs/configuration.md -type f -print0 | sort -z | xargs -0 sha256sum > "$run/source-sha256.txt"
 uname -a
 sha256sum Cargo.toml Cargo.lock scripts/verify.sh
 cargo fmt --check
