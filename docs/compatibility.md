@@ -40,7 +40,7 @@
 | --- | --- | --- |
 | content_encoding | 压缩成功体、错误体 | gzip/deflate/br/zstd、未知编码、解压后限额；透明响应避免二次编码 |
 | handler buffered conversion | Chat/Messages 非流式 | JSON 失败后 SSE 嗅探；工具/思考/usage/错误均保留 |
-| streaming converters | Chat/Messages 流 | UTF-8 跨分片、混合换行、尾部无空行、工具参数、签名、流错误 |
+| streaming converters | Chat/Messages 流 | UTF-8 跨分片、混合换行、EOF 解析完整尾块；截断/内容过滤发送 `response.incomplete`；未完成工具不发送 `output_item.done`；保留工具参数、签名、usage 和流错误 |
 | Messages success validator | HTTP 2xx 的非流式或显式 JSON 响应 | 错误信封在响应提交前识别 |
 | error mapper / context window | 失败响应和符合原版条件的上下文超限 | 状态码、JSON 与 `response.failed` SSE，错误诊断脱敏 |
 | native compaction / namespace / late arguments | 原生 Responses | 转换开关/顺序、普通无关输出不变 |
@@ -52,9 +52,21 @@
 
 故障转移、熔断计量、stack 模型映射、官方账号/OAuth、Copilot、Bedrock 专用分支及其他客户端入口明确范围外。原版日志中的上游原始内容不能照搬到生产日志：凭据脱敏是已约定差异。
 
+## Codex 协议契约修复
+
+对照本地 Codex `797bab474649e6df315f4dc3fec4d1486029fdde` 的请求类型、SSE 消费端和工具调度代码，修正以下迁移基线行为：
+
+- Chat 的 `length`、Messages 的 `max_tokens` 及有部分输出的无终态 EOF，发送 `response.incomplete`，reason 为 `max_output_tokens`。Chat `content_filter`、Messages `refusal` 的 reason 为 `content_filter`。Codex 按事件类型处理终态，不能用 `response.completed` 搭配 `status: incomplete` 代替。
+- Chat 在成功 `finish_reason` 后才提交工具；兼容未带 finish_reason 但显式发送 `[DONE]` 的上游。Messages 以 `content_block_stop` 提交对应工具。仍在接收参数的调用不会因 EOF、截断或最终清理而发送 `output_item.done`；已关闭的 Messages 工具保留。JSON 响应没有逐块完成信号，Chat/Messages 的 incomplete JSON 不包含可执行工具，Messages 转 SSE 时也不为这些工具补造完成事件。有效 JSON 本身不构成结束信号。
+- namespace 内的 `custom` 与 `function` 工具均参与转换。Chat/Messages 将 custom 包装成接收 `input` 字符串的函数，回放和指定工具选择使用同一展开名称，响应还原为带 namespace 的 `custom_tool_call`。xAI 原生 Responses 路径使用同一字符串包装，将对应历史调用结果改为 `function_call_output`，并还原响应调用类型和输入；其他原生 Responses 路径仍透传。
+- 普通生成请求的 `text.format: json_schema` 映射到 Chat 的 `response_format.json_schema` 或 Messages 的 `output_config.format`；Messages 保留同级的 thinking effort，不发送 OpenAI 专用的 name/strict 字段。`json_object` 仅映射到 Chat；Messages 对缺少 schema 的格式请求返回错误。未知格式和缺少对象 schema 的 `json_schema` 在转换前返回请求错误。压缩回合继续不带结构化输出约束。
+- Chat 和 Messages 在 EOF 时均解析完整的尾部事件，即使上游没有发送末尾空行；Chat 尾部正文、usage、错误和 `[DONE]` 使用与普通块相同的处理逻辑。
+
+这些修复由转换和 mock HTTP 测试验证；远程 Provider 对 custom 包装、JSON schema 和模型能力的支持仍由上游决定。Messages 结构化输出字段依据 [Anthropic 文档](https://platform.claude.com/docs/en/build-with-claude/structured-outputs)，不通过提示词或重试模拟约束。
+
 ## 本地回归验证
 
-迁移已在本项目提交 `58c8c87` 验收。来源是包含用户本地提交的 cc-switch 仓库，不等同于公共上游版本。后续重构以本项目重构前行为为基线，不持续与 cc-switch 比较。
+迁移已在本项目提交 `58c8c87` 验收。来源是包含用户本地提交的 cc-switch 仓库，不等同于公共上游版本。后续重构以本项目重构前行为为基线，不持续与 cc-switch 比较。上节所列 Codex 契约修复属于明确的行为变更，相关单元断言同步修订；固定迁移 fixture 保持不变。
 
 `tests/regression.rs` 保留迁移验收使用的输入，期望值固定于 `tests/fixtures/regression`。JSON 比较完整结构；固定 ID 的 SSE 在 1、7、4096 字节分片下按字节比较；URL 与完整 header map 保持断言。仅原场景中自动生成的 session UUID 规范化为固定 UUID，其他字段和事件顺序不忽略。加密任务拒绝与提交测试保留直接断言。
 

@@ -14,6 +14,8 @@ copyright; extraction helpers retain original function bodies unless listed belo
 | `[1m]` stripping before conversion | Non-Anthropic paths strip using original helper | Anthropic defers stripping until its converted request so beta detection still works |
 | Chat history enrichment | `CodexChatHistoryStore::enrich_request` | Runs before reasoning resolution and conversion |
 | Chat reasoning config | Extracted `codex.rs` resolver and inference closure | Explicit metadata, normalization, platform precedence, model inference and Zen catalog effort lookup retained |
+| Codex `text.format` | Chat `response_format` / Messages `output_config.format` | JSON schema constraints mapped for ordinary generation; Messages preserves effort, rejects schema-free `json_object`; native Responses passes through |
+| Namespace custom tools | Shared Chat/Messages context and native xAI namespace adapter | String-input function wrapper, namespace-aware replay/choice and custom call restoration; native xAI converts the same wrapper to Responses function schema |
 | Gemini tool thought signature fallback | Production invocation after Chat conversion | Existing function re-enabled outside tests; only first call in current-turn assistant steps is filled |
 | Chat cache routing | Extracted original cache eligibility and injection | Explicit nonempty client key wins, then real client session; unknown gateways default to no injection |
 | Anthropic output ceiling | Metadata override before conversion | Positive `maxOutputTokens` beats client value; absent both, conversion defaults to 128000 tokens (including thinking), intentionally differing from upstream's 8192 fallback |

@@ -34,6 +34,11 @@ Local adaptation: converter warning logs omit request/upstream strings
 Request/response orchestration and necessary adaptations are documented in
 `docs/compatibility.md` and `docs/request-compatibility.md`.
 
+Local correctness fixes checked against Codex `797bab47` cover incomplete SSE
+terminal types, unfinished tool commitment, EOF tail events, namespace custom
+tools, and Responses `text.format` mapping. Affected unit expectations are
+updated to the client contract; fixed migration fixtures remain unchanged.
+
 Migration was accepted at cc-switch-lite commit `58c8c87`. The source repository
 includes the user's local commits, not only public upstream changes. Local tests
 and fixed regression fixtures now protect that accepted behavior; the temporary

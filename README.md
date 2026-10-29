@@ -57,6 +57,10 @@ Responses 的 `previous_response_id` 原样交上游。Chat 路径复用 `CodexC
 Messages 保持参考转换行为，不额外套用 Chat 缓存。
 不提供跨 Provider/实例会话迁移、自定义模型映射、负载均衡、OAuth、管理 API 或热加载。
 
+Chat/Messages 的截断和内容过滤通过 `response.incomplete` 报告；未完成的工具调用不提交执行。
+两条路径支持 namespace 内的 custom 工具，并将 Codex `text.format` 的 JSON schema 映射到对应上游字段。
+Messages 不支持无 schema 的 `json_object` 请求，转换时返回错误；实际 schema 和模型支持由上游校验。
+
 Messages 转换对 Opus 5.5 应用 [cc-switch #8048](https://github.com/farion1231/cc-switch/pull/8048)，
 并按本项目指定范围对 Sonnet 5.5、Fable 5.1、Haiku 5.5 启用相同行为：保留 adaptive thinking，允许完整的无签名工具历史。
 强制工具选择转为 `auto` 并追加调用指令；指定工具时仅保留该工具。这是尽力满足调用意图，不能保证强制调用。
