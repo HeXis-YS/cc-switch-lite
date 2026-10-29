@@ -14,13 +14,14 @@
 //! that native path, mirroring the proven design of sub2api
 //! (`pkg/apicompat/responses_namespace.go`):
 //!
-//! - **Request**: lift every `namespace` child into a top-level `function` tool
+//! - **Request**: lift `function` and `custom` namespace children into top-level
+//!   `function` tools (custom tools use the Chat string-input wrapper)
 //!   whose name is the deterministic flat name `<namespace>__<child>` (with the
 //!   same sha256 truncation used by the Chat path, so both layers agree), then
-//!   rewrite namespace-qualified `function_call` items in the replayed `input`
+//!   rewrite namespace-qualified function/custom calls in the replayed `input`
 //!   history to the flat name and drop a `namespace`-typed `tool_choice`.
-//! - **Response**: restore the flat `function_call` names back to
-//!   `{name, namespace}` so the Codex client can match the call against its own
+//! - **Response**: restore the call type, custom input and `{name, namespace}`
+//!   so the Codex client can match the call against its own
 //!   namespaced tool registry (streaming and non-streaming).
 //!
 //! Flatten and restore both derive their name map from the *same* request tools
@@ -32,7 +33,10 @@ use std::collections::HashMap;
 
 use serde_json::{json, Value};
 
-use super::transform_codex_chat::flatten_namespace_tool_name;
+use super::transform_codex_chat::{
+    build_codex_tool_context_from_request, custom_tool_input_from_chat_arguments,
+    flatten_namespace_tool_name,
+};
 use crate::proxy::error::ProxyError;
 
 /// Reverse map entry: a flattened tool name resolves back to its original
@@ -41,6 +45,7 @@ use crate::proxy::error::ProxyError;
 pub(crate) struct NamespacedName {
     pub namespace: String,
     pub name: String,
+    pub custom: bool,
 }
 
 /// Build the flat-name → `{namespace, name}` restore map from a Codex Responses
@@ -63,7 +68,10 @@ pub(crate) fn namespace_restore_map(request_body: &Value) -> HashMap<String, Nam
             continue;
         }
         for child in namespace_children(tool) {
-            if child.get("type").and_then(Value::as_str) != Some("function") {
+            if !matches!(
+                child.get("type").and_then(Value::as_str),
+                Some("function" | "custom")
+            ) {
                 continue;
             }
             let Some(name) = child.get("name").and_then(Value::as_str) else {
@@ -77,6 +85,7 @@ pub(crate) fn namespace_restore_map(request_body: &Value) -> HashMap<String, Nam
             map.entry(flat).or_insert_with(|| NamespacedName {
                 namespace: namespace.to_string(),
                 name: name.to_string(),
+                custom: child.get("type").and_then(Value::as_str) == Some("custom"),
             });
         }
     }
@@ -130,7 +139,10 @@ pub(crate) fn flatten_request_namespaces(body: &mut Value) -> Result<bool, Proxy
             continue;
         }
         for child in namespace_children(tool) {
-            if child.get("type").and_then(Value::as_str) != Some("function") {
+            if !matches!(
+                child.get("type").and_then(Value::as_str),
+                Some("function" | "custom")
+            ) {
                 continue;
             }
             let Some(name) = child.get("name").and_then(Value::as_str).map(str::trim) else {
@@ -149,6 +161,7 @@ pub(crate) fn flatten_request_namespaces(body: &mut Value) -> Result<bool, Proxy
             let entry = NamespacedName {
                 namespace: namespace.to_string(),
                 name: name.to_string(),
+                custom: child.get("type").and_then(Value::as_str) == Some("custom"),
             };
             if let Some(prev) = owners.get(&flat) {
                 if *prev != entry {
@@ -172,6 +185,7 @@ pub(crate) fn flatten_request_namespaces(body: &mut Value) -> Result<bool, Proxy
         .unwrap_or_default();
     let mut flattened: Vec<Value> = Vec::with_capacity(tools.len());
     let mut seen_flat = std::collections::HashSet::new();
+    let tool_context = build_codex_tool_context_from_request(body);
     for tool in tools {
         if tool.get("type").and_then(Value::as_str) != Some("namespace") {
             flattened.push(tool);
@@ -181,7 +195,10 @@ pub(crate) fn flatten_request_namespaces(body: &mut Value) -> Result<bool, Proxy
             continue;
         };
         for child in namespace_children(&tool) {
-            if child.get("type").and_then(Value::as_str) != Some("function") {
+            if !matches!(
+                child.get("type").and_then(Value::as_str),
+                Some("function" | "custom")
+            ) {
                 continue;
             }
             let Some(name) = child.get("name").and_then(Value::as_str).map(str::trim) else {
@@ -194,7 +211,28 @@ pub(crate) fn flatten_request_namespaces(body: &mut Value) -> Result<bool, Proxy
             if !seen_flat.insert(flat.clone()) {
                 continue;
             }
-            let mut lifted = child.clone();
+            // xAI accepts function tools, so reuse the Chat string-input wrapper
+            // for custom tools and restore custom_tool_call on the response.
+            let mut lifted = if child.get("type").and_then(Value::as_str) == Some("custom") {
+                let function = tool_context
+                    .chat_tools()
+                    .iter()
+                    .find(|tool| {
+                        tool.pointer("/function/name").and_then(Value::as_str)
+                            == Some(flat.as_str())
+                    })
+                    .and_then(|tool| tool.get("function"))
+                    .ok_or_else(|| {
+                        ProxyError::TransformError(
+                            "Missing converted namespace custom tool".to_string(),
+                        )
+                    })?;
+                let mut function = function.clone();
+                function["type"] = json!("function");
+                function
+            } else {
+                child.clone()
+            };
             if let Some(obj) = lifted.as_object_mut() {
                 obj.insert("name".to_string(), json!(flat));
             }
@@ -203,9 +241,19 @@ pub(crate) fn flatten_request_namespaces(body: &mut Value) -> Result<bool, Proxy
     }
     body["tools"] = json!(flattened);
 
-    // Rewrite namespace-qualified function_call items in the replayed history.
+    // Rewrite namespace-qualified function/custom calls in the replayed history.
     if let Some(input) = body.get_mut("input") {
         rewrite_namespace_qualified_calls(input, &owners);
+        if let Some(items) = input.as_array_mut() {
+            // xAI executes the wrapper as a function, so its receipts must use
+            // function_call_output too. A previous_response_id continuation may
+            // contain only the receipt, without replaying the original call.
+            for item in items {
+                if item["type"] == "custom_tool_call_output" {
+                    item["type"] = json!("function_call_output");
+                }
+            }
+        }
     }
 
     // A namespace-typed tool_choice cannot survive flattening: degrade to auto.
@@ -220,9 +268,8 @@ pub(crate) fn flatten_request_namespaces(body: &mut Value) -> Result<bool, Proxy
     Ok(true)
 }
 
-/// Restore flattened `function_call` names in a full (non-streaming) Responses
-/// payload back to their `{name, namespace}` identity. Returns whether anything
-/// changed.
+/// Restore flattened calls in a buffered response, including custom call type
+/// and input. Returns whether anything changed.
 pub(crate) fn restore_response_namespaces(
     value: &mut Value,
     map: &HashMap<String, NamespacedName>,
@@ -234,7 +281,7 @@ pub(crate) fn restore_response_namespaces(
 }
 
 /// Restore a single parsed SSE event (e.g. `response.output_item.added` /
-/// `.done` carrying a `function_call`). Returns whether anything changed.
+/// `.done` carrying a flattened call). Returns whether anything changed.
 pub(crate) fn restore_sse_event_namespaces(
     event: &mut Value,
     map: &HashMap<String, NamespacedName>,
@@ -261,7 +308,10 @@ fn rewrite_namespace_qualified_calls(value: &mut Value, owners: &HashMap<String,
             }
         }
         Value::Object(obj) => {
-            if obj.get("type").and_then(Value::as_str) == Some("function_call") {
+            if matches!(
+                obj.get("type").and_then(Value::as_str),
+                Some("function_call" | "custom_tool_call")
+            ) {
                 rewrite_namespace_qualified_call(value, owners);
                 return;
             }
@@ -298,6 +348,22 @@ fn rewrite_namespace_qualified_call(
     let flat = flatten_namespace_tool_name(&namespace, &name);
     match owners.get(&flat) {
         Some(entry) if entry.namespace == namespace && entry.name == name => {
+            if entry.custom {
+                match obj.get("type").and_then(Value::as_str) {
+                    Some("custom_tool_call") => {
+                        let input = obj.remove("input").unwrap_or_else(|| json!(""));
+                        obj.insert(
+                            "arguments".to_string(),
+                            json!(json!({"input": input}).to_string()),
+                        );
+                        obj.insert("type".to_string(), json!("function_call"));
+                    }
+                    Some("custom") => {
+                        obj.insert("type".to_string(), json!("function"));
+                    }
+                    _ => {}
+                }
+            }
             obj.insert("name".to_string(), json!(flat));
             obj.remove("namespace");
             true
@@ -318,6 +384,14 @@ fn restore_value(value: &mut Value, map: &HashMap<String, NamespacedName>) -> bo
             if obj.get("type").and_then(Value::as_str) == Some("function_call") {
                 if let Some(flat) = obj.get("name").and_then(Value::as_str) {
                     if let Some(entry) = map.get(flat) {
+                        if entry.custom {
+                            let arguments = obj.remove("arguments").unwrap_or(Value::Null);
+                            let input = custom_tool_input_from_chat_arguments(
+                                arguments.as_str().unwrap_or(""),
+                            );
+                            obj.insert("type".to_string(), json!("custom_tool_call"));
+                            obj.insert("input".to_string(), json!(input));
+                        }
                         obj.insert("name".to_string(), json!(entry.name));
                         obj.insert("namespace".to_string(), json!(entry.namespace));
                         changed = true;
@@ -337,6 +411,52 @@ fn restore_value(value: &mut Value, map: &HashMap<String, NamespacedName>) -> bo
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn custom_namespace_tool_is_wrapped_replayed_and_restored() {
+        let mut request = json!({"tools":[{"type":"namespace","name":"functions","tools":[{
+            "type":"custom","name":"apply_patch","format":{"type":"text"}}
+        ]}],"tool_choice":{"type":"custom","namespace":"functions","name":"apply_patch"},
+            "input":[{"type":"custom_tool_call","namespace":"functions","name":"apply_patch",
+                "call_id":"old","input":"old patch"},
+                {"type":"custom_tool_call_output","call_id":"old","output":"applied"},
+                {"type":"custom_tool_call_output","call_id":"previous","output":"applied earlier"}]});
+        let map = namespace_restore_map(&request);
+        flatten_request_namespaces(&mut request).unwrap();
+        super::super::transform_codex_responses_xai_sanitize::sanitize_xai_responses_request(
+            &mut request,
+        );
+        assert_eq!(request["tools"][0]["type"], "function");
+        assert_eq!(request["tools"][0]["name"], "functions__apply_patch");
+        assert_eq!(
+            request["tools"][0]["parameters"]["properties"]["input"]["type"],
+            "string"
+        );
+        assert_eq!(request["input"][0]["type"], "function_call");
+        assert_eq!(request["input"][0]["name"], "functions__apply_patch");
+        assert_eq!(request["input"][1]["type"], "function_call_output");
+        assert_eq!(request["input"][1]["output"], "applied");
+        assert_eq!(request["input"][2]["type"], "function_call_output");
+        assert_eq!(
+            serde_json::from_str::<Value>(request["input"][0]["arguments"].as_str().unwrap())
+                .unwrap(),
+            json!({"input":"old patch"})
+        );
+        assert_eq!(
+            request["tool_choice"],
+            json!({"type":"function","name":"functions__apply_patch"})
+        );
+        let call = json!({"type":"function_call","name":"functions__apply_patch","call_id":"patch",
+            "arguments":"{\"input\":\"new patch\"}"});
+        let expected = json!({"type":"custom_tool_call","name":"apply_patch","namespace":"functions",
+            "call_id":"patch","input":"new patch"});
+        let mut response = json!({"output":[call]});
+        assert!(restore_response_namespaces(&mut response, &map));
+        assert_eq!(response["output"][0], expected);
+        let mut event = json!({"type":"response.output_item.done","item":call});
+        assert!(restore_sse_event_namespaces(&mut event, &map));
+        assert_eq!(event["item"], expected);
+    }
 
     fn namespace_request() -> Value {
         json!({

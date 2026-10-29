@@ -166,6 +166,96 @@ fn agent_task() -> Value {
 }
 
 #[tokio::test]
+async fn namespace_custom_tools_round_trip_through_chat_and_messages() {
+    for protocol in [Protocol::ChatCompletions, Protocol::Messages] {
+        for streaming in [false, true] {
+            let call = json!({"id":"call_patch","type":"function","function":{
+                "name":"functions__apply_patch","arguments":"{\"input\":\"patch text\"}"}});
+            let tool = json!({"type":"tool_use","id":"call_patch","name":"functions__apply_patch",
+                "input":{"input":"patch text"}});
+            let reply = match (protocol,streaming) {
+                (Protocol::ChatCompletions,false) => Reply::json(StatusCode::OK,json!({"id":"fixed",
+                    "choices":[{"message":{"tool_calls":[call]},"finish_reason":"tool_calls"}]})),
+                (Protocol::ChatCompletions,true) => Reply::new(StatusCode::OK,Some("text/event-stream"),
+                    format!("data: {}\n\ndata: [DONE]\n\n",json!({"id":"fixed","choices":[{
+                        "delta":{"tool_calls":[{"index":0,"id":"call_patch","type":"function","function":call["function"]}]},
+                        "finish_reason":"tool_calls"}]})).into_bytes()),
+                (Protocol::Messages,false) => Reply::json(StatusCode::OK,json!({"id":"fixed","type":"message",
+                    "content":[tool],"stop_reason":"tool_use"})),
+                (Protocol::Messages,true) => Reply::new(StatusCode::OK,Some("text/event-stream"),[
+                    json!({"type":"message_start","message":{"id":"fixed"}}),
+                    json!({"type":"content_block_start","index":0,"content_block":tool}),
+                    json!({"type":"content_block_stop","index":0}),
+                    json!({"type":"message_delta","delta":{"stop_reason":"tool_use"}}),
+                    json!({"type":"message_stop"})
+                ].iter().map(|value|format!("data: {value}\n\n")).collect::<String>().into_bytes()),
+                _ => unreachable!(),
+            };
+            let fixture = Fixture::new(protocol, vec![reply], |_| {}).await;
+            let mut request = input(streaming);
+            request["tools"] = json!([{"type":"namespace","name":"functions","tools":[{
+                "type":"custom","name":"apply_patch","description":"Apply a patch","format":{"type":"text"}}
+            ]}]);
+            request["tool_choice"] =
+                json!({"type":"custom","name":"apply_patch","namespace":"functions"});
+            request["input"] = json!([
+                {"role":"user","content":"Patch it"},
+                {"type":"custom_tool_call","namespace":"functions","name":"apply_patch","call_id":"old_patch","input":"old patch"},
+                {"type":"custom_tool_call_output","call_id":"old_patch","output":"ok"}
+            ]);
+            let response = fixture.send(request).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let text = response.text().await.unwrap();
+            let item = if streaming {
+                text.split("\n\n")
+                    .filter_map(|block| block.lines().find_map(|line| line.strip_prefix("data: ")))
+                    .filter_map(|data| serde_json::from_str::<Value>(data).ok())
+                    .find(|event| event["type"] == "response.output_item.done")
+                    .unwrap()["item"]
+                    .clone()
+            } else {
+                serde_json::from_str::<Value>(&text).unwrap()["output"][0].clone()
+            };
+            assert_eq!(item["type"], "custom_tool_call");
+            assert_eq!(item["namespace"], "functions");
+            assert_eq!(item["name"], "apply_patch");
+            assert_eq!(item["input"], "patch text");
+            let calls = fixture.mock.calls.lock().await;
+            let sent = &calls[0];
+            if protocol == Protocol::ChatCompletions {
+                assert_eq!(
+                    sent["tools"][0]["function"]["name"],
+                    "functions__apply_patch"
+                );
+                assert_eq!(
+                    sent["tool_choice"]["function"]["name"],
+                    "functions__apply_patch"
+                );
+                assert!(sent["messages"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|message| message.pointer("/tool_calls/0/function/name")
+                        == Some(&json!("functions__apply_patch"))));
+            } else {
+                assert_eq!(sent["tools"][0]["name"], "functions__apply_patch");
+                assert_eq!(sent["tool_choice"]["name"], "functions__apply_patch");
+                assert!(sent["messages"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|message| message["content"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|block| block["type"] == "tool_use"
+                            && block["name"] == "functions__apply_patch")));
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn wrapped_chat_response_preserves_text_usage_and_tool_history() {
     let wrapped = json!({"success":true,"data":{
         "id":"wrapped","model":"compat-test-model","created":42,

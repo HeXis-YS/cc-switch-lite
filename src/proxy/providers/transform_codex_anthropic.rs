@@ -523,16 +523,12 @@ fn map_tool_choice_to_anthropic(tool_choice: &Value, tool_context: &CodexToolCon
             _ => json!({ "type": "auto" }),
         },
         Value::Object(obj) => match obj.get("type").and_then(|t| t.as_str()) {
-            Some("function") => {
+            Some("function" | "custom") => {
                 let name = obj.get("name").and_then(|n| n.as_str()).unwrap_or("");
                 let namespace = obj.get("namespace").and_then(|value| value.as_str());
                 let upstream_name = tool_context.chat_name_for_response_function(name, namespace);
                 json!({ "type": "tool", "name": upstream_name })
             }
-            Some("custom") => json!({
-                "type": "tool",
-                "name": obj.get("name").and_then(|value| value.as_str()).unwrap_or("")
-            }),
             Some("tool_search") => {
                 json!({ "type": "tool", "name": TOOL_SEARCH_PROXY_NAME })
             }
@@ -616,6 +612,8 @@ fn convert_input_to_messages(
                     .get("name")
                     .and_then(|value| value.as_str())
                     .unwrap_or("");
+                let namespace = item.get("namespace").and_then(Value::as_str);
+                let upstream_name = tool_context.chat_name_for_response_function(name, namespace);
                 let input = item.get("input").cloned().unwrap_or_else(|| json!(""));
                 push_block(
                     &mut messages,
@@ -623,7 +621,7 @@ fn convert_input_to_messages(
                     json!({
                         "type": "tool_use",
                         "id": call_id,
-                        "name": name,
+                        "name": upstream_name,
                         "input": { "input": input }
                     }),
                 );

@@ -151,15 +151,18 @@ impl CodexToolContext {
         self.add_chat_tool(chat_name, spec, chat_tool);
     }
 
-    fn add_custom_tool(&mut self, tool: &Value) {
+    fn add_custom_tool(&mut self, tool: &Value, namespace: Option<&str>) {
         let Some(name) = responses_tool_name(tool) else {
             return;
         };
+        let chat_name = namespace
+            .map(|namespace| flatten_namespace_tool_name(namespace, &name))
+            .unwrap_or_else(|| name.clone());
         let description = json!(responses_custom_tool_description(tool));
         let chat_tool = json!({
             "type": "function",
             "function": {
-                "name": name,
+                "name": chat_name,
                 "description": description,
                 "parameters": {
                     "type": "object",
@@ -176,9 +179,9 @@ impl CodexToolContext {
         let spec = CodexToolSpec {
             kind: CodexToolKind::Custom,
             name: name.clone(),
-            namespace: None,
+            namespace: namespace.map(ToString::to_string),
         };
-        self.add_chat_tool(name, spec, chat_tool);
+        self.add_chat_tool(chat_name, spec, chat_tool);
     }
 
     fn add_tool_search_tool(&mut self) {
@@ -224,8 +227,10 @@ impl CodexToolContext {
         };
 
         for child in children {
-            if child.get("type").and_then(|v| v.as_str()) == Some("function") {
-                self.add_function_tool(child, Some(namespace));
+            match child.get("type").and_then(Value::as_str) {
+                Some("function") => self.add_function_tool(child, Some(namespace)),
+                Some("custom") => self.add_custom_tool(child, Some(namespace)),
+                _ => {}
             }
         }
     }
@@ -233,14 +238,17 @@ impl CodexToolContext {
     fn add_response_tool(&mut self, tool: &Value) {
         match tool {
             Value::String(name) => {
-                self.add_custom_tool(&json!({
-                    "type": "custom",
-                    "name": name
-                }));
+                self.add_custom_tool(
+                    &json!({
+                        "type": "custom",
+                        "name": name
+                    }),
+                    None,
+                );
             }
             Value::Object(_) => match tool.get("type").and_then(|v| v.as_str()) {
                 Some("function") => self.add_function_tool(tool, None),
-                Some("custom") => self.add_custom_tool(tool),
+                Some("custom") => self.add_custom_tool(tool, None),
                 Some("tool_search") => self.add_tool_search_tool(),
                 Some("namespace") => self.add_namespace_tool(tool),
                 _ => {}
@@ -840,7 +848,7 @@ fn append_responses_item_as_chat_message(
         }
         Some("custom_tool_call") => {
             append_unique_pending_reasoning(pending_reasoning, responses_item_reasoning_text(item));
-            let mut tool_call = responses_custom_tool_call_to_chat_tool_call(item);
+            let mut tool_call = responses_custom_tool_call_to_chat_tool_call(item, tool_context);
             copy_tool_call_extra_content(&mut tool_call, item);
             register_known_tool_call_id(known_tool_call_ids, &tool_call);
             pending_tool_calls.push(tool_call);
@@ -1926,20 +1934,25 @@ fn responses_function_call_to_chat_tool_call(
     })
 }
 
-fn responses_custom_tool_call_to_chat_tool_call(item: &Value) -> Value {
+fn responses_custom_tool_call_to_chat_tool_call(
+    item: &Value,
+    tool_context: &CodexToolContext,
+) -> Value {
     let call_id = item
         .get("call_id")
         .or_else(|| item.get("id"))
         .and_then(|v| v.as_str())
         .unwrap_or("");
     let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
+    let namespace = item.get("namespace").and_then(Value::as_str);
+    let chat_name = tool_context.chat_name_for_response_function(name, namespace);
     let input = item.get("input").cloned().unwrap_or_else(|| json!(""));
 
     json!({
         "id": call_id,
         "type": "function",
         "function": {
-            "name": name,
+            "name": chat_name,
             "arguments": canonical_json_string(&json!({ CUSTOM_TOOL_INPUT_FIELD: input }))
         }
     })
@@ -1989,10 +2002,12 @@ fn responses_tool_choice_to_chat(tool_choice: &Value, tool_context: &CodexToolCo
         }
         Value::Object(obj) if obj.get("type").and_then(|v| v.as_str()) == Some("custom") => {
             let name = obj.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            let namespace = obj.get("namespace").and_then(Value::as_str);
+            let chat_name = tool_context.chat_name_for_response_function(name, namespace);
             json!({
                 "type": "function",
                 "function": {
-                    "name": name
+                    "name": chat_name
                 }
             })
         }
@@ -2339,9 +2354,9 @@ pub(crate) fn response_tool_call_item_from_chat_name(
         Some(spec) if spec.kind == CodexToolKind::ToolSearch => {
             response_tool_search_call_item(call_id, status, arguments, reasoning)
         }
-        Some(spec) if spec.kind == CodexToolKind::Custom => response_custom_tool_call_item(
-            item_id, status, call_id, &spec.name, arguments, reasoning,
-        ),
+        Some(spec) if spec.kind == CodexToolKind::Custom => {
+            response_custom_tool_call_item(item_id, status, call_id, spec, arguments, reasoning)
+        }
         Some(spec) => response_function_call_item_with_namespace(
             item_id,
             status,
@@ -2379,7 +2394,7 @@ fn response_custom_tool_call_item(
     item_id: &str,
     status: &str,
     call_id: &str,
-    name: &str,
+    spec: &CodexToolSpec,
     arguments: &str,
     reasoning: Option<&str>,
 ) -> Value {
@@ -2389,9 +2404,12 @@ fn response_custom_tool_call_item(
         "type": "custom_tool_call",
         "status": status,
         "call_id": call_id,
-        "name": name,
+        "name": spec.name,
         "input": input
     });
+    if let Some(namespace) = &spec.namespace {
+        item["namespace"] = json!(namespace);
+    }
     super::codex_chat_common::attach_optional_reasoning_content_field(&mut item, reasoning);
     item
 }
