@@ -23,26 +23,28 @@ fn provider(protocol: Protocol, url: &str) -> Provider {
 async fn chat_cache_uses_real_prefixed_session_and_reasoning_platform() {
     let mut p = provider(Protocol::ChatCompletions, "https://openrouter.ai/api/v1");
     p.compat.meta.prompt_cache_routing = Some("enabled".into());
-    let mut headers = HeaderMap::new();
-    headers.insert(
-        "session_id",
-        HeaderValue::from_static("12345678-1234-1234-1234-123456789012"),
-    );
-    let out = prepare(
-        json!({"model":"deepseek-v4","reasoning":{"effort":"xhigh"},"input":"Hi"}),
-        &p,
-        &headers,
-        &CompatConfig::default(),
-        &CodexChatHistoryStore::default(),
-    )
-    .await
-    .unwrap();
-    assert_eq!(
-        out.body["prompt_cache_key"],
-        "codex_12345678-1234-1234-1234-123456789012"
-    );
-    assert_eq!(out.body["reasoning"]["effort"], "xhigh");
-    assert!(out.body.get("thinking").is_none());
+    for name in ["session_id", "x-session-id", "session-id", "thread-id"] {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            name,
+            HeaderValue::from_static("12345678-1234-1234-1234-123456789012"),
+        );
+        let out = prepare(
+            json!({"model":"deepseek-v4","reasoning":{"effort":"xhigh"},"input":"Hi"}),
+            &p,
+            &headers,
+            &CompatConfig::default(),
+            &CodexChatHistoryStore::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            out.body["prompt_cache_key"], "codex_12345678-1234-1234-1234-123456789012",
+            "{name}"
+        );
+        assert_eq!(out.body["reasoning"]["effort"], "xhigh");
+        assert!(out.body.get("thinking").is_none());
+    }
 }
 
 #[tokio::test]

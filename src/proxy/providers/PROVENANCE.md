@@ -1,9 +1,20 @@
 # Protocol conversion provenance
 
-The current forwarding logic is derived from `cc-switch v4.0.18`.
+The forwarding baseline is derived from `cc-switch v4.0.18`.
 Migration source: commit `214e75ba7f625c679dd4e61df166ec4463245fe7`, `src-tauri/src/proxy/`,
 including the user's local commits noted below.
 Copyright (c) 2025 Jason Young, MIT; see `LICENSE-cc-switch`.
+
+Selected fixes from public `cc-switch v4.0.21` (`c4db63c60d2a1ddcb4bd9f81152b9c6126413659`):
+
+- `80640b52`: unwrap non-streaming Chat completion `data` envelopes. The owned
+  converter helper is retained; usage-accounting-only helpers are not needed.
+- `7f9cd9e9`: use the attached-media marker for orphan tool results.
+- `96f01af0`: rectify explicit foreign Azure resource rejections, including item IDs.
+- `2e1e2979`: recognize `session-id` and `thread-id` with upstream precedence.
+
+The corresponding upstream regression tests are retained where applicable.
+This is a selective port, not a replacement of the baseline or the user's local changes.
 
 The conversion, SSE, chat history, tool history, compaction, inline thinking,
 canonical JSON, SSE parsing and tool media modules retain their upstream tests.

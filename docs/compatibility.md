@@ -1,9 +1,22 @@
 # 固定基线与兼容行为清单
 
-当前转发逻辑来自 **cc-switch v4.0.18**。
+转发逻辑以 **cc-switch v4.0.18** 为迁移基线，已选择性移植下列 v4.0.21 修复。
 迁移来源提交：`214e75ba7f625c679dd4e61df166ec4463245fe7`，包含用户的本地提交。
-范围为 Codex `POST /v1/responses`、API Key、单 Provider、关闭故障转移。
+初次迁移范围为 Codex `POST /v1/responses`、API Key、单 Provider、关闭故障转移；当前模型路由配置见 README。
 下表是迁移审查契约；具体实现及测试必须保持所列触发条件，不能把未触发的其他应用路径当作缺陷补入。
+
+## v4.0.21 选择性移植
+
+来源为公共仓库 `farion1231/cc-switch`，版本提交 `c4db63c60d2a1ddcb4bd9f81152b9c6126413659`。
+
+| 来源提交 | 适用行为 |
+| --- | --- |
+| `80640b52` | 非流式 Chat 响应顶层没有 `choices` 数组且 `data.choices` 是数组时解包；顶层非 null 字段优先，顶层 `choices` 占位不覆盖内层数组。标准响应不变。 |
+| `7f9cd9e9` | 孤立工具结果转为 user 消息时，用“媒体已附加”的占位文本对应同一消息内的媒体位置；配对工具结果仍使用原来的移动提示。 |
+| `96f01af0` | 原生 Responses 上游明确拒绝其他 Azure 资源签发的条目时，使用现有单次修正重试；清理条目 `id`，保留 `call_id`、参数、结果及 `item_reference`。仍受整流器开关控制。 |
+| `2e1e2979` | Codex 会话 header 依次识别 `session_id`、`x-session-id`、`session-id`、`thread-id`，再回退到 metadata；沿用原有有效性检查。 |
+
+本次保留原版相关回归测试并补充实际 HTTP 接线验证；不改写已有固定回归期望值。Claude 客户端反向转换、OAuth 和 Codex 客户端 TOML 地址选择不属于本次移植路径。
 
 ## 请求链
 

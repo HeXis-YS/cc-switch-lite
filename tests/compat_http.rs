@@ -166,6 +166,110 @@ fn agent_task() -> Value {
 }
 
 #[tokio::test]
+async fn wrapped_chat_response_preserves_text_usage_and_tool_history() {
+    let wrapped = json!({"success":true,"data":{
+        "id":"wrapped","model":"compat-test-model","created":42,
+        "choices":[{"message":{"role":"assistant","content":"checking",
+            "tool_calls":[{"id":"call_wrapped","type":"function","function":{"name":"read","arguments":"{}"}}]},
+            "finish_reason":"tool_calls"}],
+        "usage":{"prompt_tokens":12,"completion_tokens":3}
+    }});
+    let fixture = Fixture::new(
+        Protocol::ChatCompletions,
+        vec![
+            Reply::json(StatusCode::OK, wrapped),
+            Reply::json(StatusCode::OK, chat_success()),
+        ],
+        |_| {},
+    )
+    .await;
+    let response = fixture.send(input(false)).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let value: Value = response.json().await.unwrap();
+    assert_eq!(value["model"], "compat-test-model");
+    assert_eq!(value["created_at"], 42);
+    assert!(value["output"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|item| item["content"][0]["text"] == "checking"));
+    assert_eq!(value["usage"]["input_tokens"], 12);
+    assert_eq!(value["usage"]["output_tokens"], 3);
+    let response = fixture
+        .send(json!({"model":"compat-test-model","stream":false,
+            "previous_response_id":value["id"],
+            "input":[{"type":"function_call_output","call_id":"call_wrapped","output":"ok"}]
+        }))
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let calls = fixture.mock.calls.lock().await;
+    assert_eq!(calls.len(), 2);
+    let messages = calls[1]["messages"].as_array().unwrap();
+    assert!(messages
+        .iter()
+        .any(|m| m["tool_calls"][0]["id"] == "call_wrapped"));
+    assert!(messages
+        .iter()
+        .any(|m| m["role"] == "tool" && m["tool_call_id"] == "call_wrapped"));
+}
+
+#[tokio::test]
+async fn azure_resource_rejection_rectifies_once_and_respects_disabled_and_exhausted_boundaries() {
+    for (enabled, recovery_success, expected_calls) in
+        [(true, true, 2), (false, true, 1), (true, false, 2)]
+    {
+        let failure = Reply::json(
+            StatusCode::BAD_REQUEST,
+            json!({"error":{
+                "type":"invalid_request_error","param":"input","code":null,
+                "message":"The requested item was created under a different Azure OpenAI resource. Use the same resource that created the item to access it."
+            }}),
+        );
+        let second = if recovery_success {
+            native_success()
+        } else {
+            failure.clone()
+        };
+        let fixture = Fixture::new(Protocol::Responses, vec![failure, second], |config| {
+            config.compat.rectifier.enabled = enabled;
+        })
+        .await;
+        let request = json!({"model":"compat-test-model","input":[
+            {"type":"message","role":"user","id":"msg_foreign","content":"hi"},
+            {"type":"reasoning","id":"rs_foreign","summary":[],"encrypted_content":"foreign"},
+            {"type":"function_call","id":"fc_foreign","call_id":"call_1","name":"read","arguments":"{\"id\":1}"},
+            {"type":"function_call_output","call_id":"call_1","output":"ok"},
+            {"type":"item_reference","id":"msg_reference"},
+            {"type":"message","role":"user","content":"next"}
+        ]});
+        let response = fixture.send(request).await;
+        assert_eq!(
+            response.status(),
+            if enabled && recovery_success {
+                StatusCode::OK
+            } else {
+                StatusCode::BAD_REQUEST
+            }
+        );
+        let calls = fixture.mock.calls.lock().await;
+        assert_eq!(calls.len(), expected_calls);
+        assert_eq!(calls[0]["input"][0]["id"], "msg_foreign");
+        if enabled {
+            assert_eq!(
+                calls[1]["input"],
+                json!([
+                    {"type":"message","role":"user","content":"hi"},
+                    {"type":"function_call","call_id":"call_1","name":"read","arguments":"{\"id\":1}"},
+                    {"type":"function_call_output","call_id":"call_1","output":"ok"},
+                    {"type":"item_reference","id":"msg_reference"},
+                    {"type":"message","role":"user","content":"next"}
+                ])
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn unmarked_sse_bodies_are_aggregated_in_both_transformed_protocols() {
     let chat="data: {\"id\":\"c1\",\"model\":\"compat-test-model\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hello\"},\"finish_reason\":\"stop\"}]}\n\n";
     let messages="event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg1\",\"model\":\"compat-test-model\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\nevent: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"hello\"}}\n\nevent: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
