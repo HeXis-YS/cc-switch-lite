@@ -20,6 +20,92 @@ fn provider(protocol: Protocol, url: &str) -> Provider {
 }
 
 #[tokio::test]
+async fn codex_output_schema_survives_protocol_preparation() {
+    let schema = json!({"type":"object","properties":{"answer":{"type":"integer"}},
+        "required":["answer"],"additionalProperties":false});
+    let format =
+        json!({"type":"json_schema","name":"codex_output_schema","strict":true,"schema":schema});
+    for protocol in [
+        Protocol::ChatCompletions,
+        Protocol::Messages,
+        Protocol::Responses,
+    ] {
+        let input = json!({"model":"claude-opus-4-6","input":"Return the answer",
+            "reasoning":{"effort":"high"},"text":{"format":format}});
+        let out = prepare(
+            input,
+            &provider(protocol, "https://example.test/v1"),
+            &HeaderMap::new(),
+            &CompatConfig::default(),
+            &CodexChatHistoryStore::default(),
+        )
+        .await
+        .unwrap();
+        match protocol {
+            Protocol::ChatCompletions => assert_eq!(
+                out.body["response_format"],
+                json!({"type":"json_schema","json_schema":{"name":"codex_output_schema","strict":true,"schema":schema}})
+            ),
+            Protocol::Messages => {
+                assert_eq!(
+                    out.body["output_config"]["format"],
+                    json!({"type":"json_schema","schema":schema})
+                );
+                assert_eq!(out.body["output_config"]["effort"], "high");
+            }
+            Protocol::Responses => assert_eq!(out.body["text"]["format"], format),
+        }
+    }
+    // Without reasoning there is no output_config yet; creating format must still work.
+    let out = prepare(
+        json!({"model":"plain-model","input":"Answer","text":{"format":format}}),
+        &provider(Protocol::Messages, "https://example.test/v1"),
+        &HeaderMap::new(),
+        &CompatConfig::default(),
+        &CodexChatHistoryStore::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(out.body["output_config"]["format"]["schema"], schema);
+}
+
+#[tokio::test]
+async fn output_formats_are_mapped_or_rejected_before_forwarding() {
+    for protocol in [Protocol::ChatCompletions, Protocol::Messages] {
+        for format in [
+            json!({"type":"unknown"}),
+            json!({"type":"json_schema","schema":null}),
+        ] {
+            assert!(prepare(
+                json!({"model":"test","input":"Answer","text":{"format":format}}),
+                &provider(protocol, "https://example.test/v1"),
+                &HeaderMap::new(),
+                &CompatConfig::default(),
+                &CodexChatHistoryStore::default()
+            )
+            .await
+            .is_err());
+        }
+        let result = prepare(
+            json!({"model":"test","input":"Answer","text":{"format":{"type":"json_object"}}}),
+            &provider(protocol, "https://example.test/v1"),
+            &HeaderMap::new(),
+            &CompatConfig::default(),
+            &CodexChatHistoryStore::default(),
+        )
+        .await;
+        if protocol == Protocol::ChatCompletions {
+            assert_eq!(
+                result.unwrap().body["response_format"],
+                json!({"type":"json_object"})
+            );
+        } else {
+            assert!(result.is_err());
+        }
+    }
+}
+
+#[tokio::test]
 async fn chat_cache_uses_real_prefixed_session_and_reasoning_platform() {
     let mut p = provider(Protocol::ChatCompletions, "https://openrouter.ai/api/v1");
     p.compat.meta.prompt_cache_routing = Some("enabled".into());

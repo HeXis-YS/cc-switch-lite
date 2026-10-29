@@ -15,7 +15,7 @@
 use super::codex_compaction;
 use super::transform_codex_chat::{
     build_codex_tool_context_from_request, response_tool_call_item_from_chat_name,
-    response_tool_call_item_id_from_chat_name, CodexToolContext,
+    response_tool_call_item_id_from_chat_name, responses_text_format, CodexToolContext,
 };
 use super::transform_responses::{sanitize_anthropic_tool_use_input, TOOL_RESULT_ERROR_MARKER};
 use crate::proxy::error::ProxyError;
@@ -480,6 +480,22 @@ pub fn responses_request_to_anthropic(
             {
                 tool_choice.insert("disable_parallel_tool_use".to_string(), json!(true));
             }
+        }
+    }
+
+    if !tool_context.is_compaction_request() {
+        if let Some(format) = responses_text_format(&body)? {
+            if format.get("type").and_then(Value::as_str) != Some("json_schema") {
+                return Err(ProxyError::InvalidRequest(
+                    "Anthropic Messages requires a JSON schema for text.format".to_string(),
+                ));
+            }
+            // Anthropic constrains JSON output with output_config.format. Keep
+            // adaptive thinking's effort alongside it; name/strict are OpenAI fields.
+            result["output_config"]["format"] = json!({
+                "type": "json_schema",
+                "schema": format["schema"]
+            });
         }
     }
 

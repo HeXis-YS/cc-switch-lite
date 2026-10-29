@@ -366,6 +366,18 @@ pub fn responses_to_chat_completions_with_reasoning(
             result[*key] = value.clone();
         }
     }
+    if !compaction {
+        if let Some(format) = responses_text_format(&body)? {
+            result["response_format"] =
+                if format.get("type").and_then(Value::as_str) == Some("json_schema") {
+                    let mut schema = format.clone();
+                    schema.as_object_mut().unwrap().remove("type");
+                    json!({"type": "json_schema", "json_schema": schema})
+                } else {
+                    format.clone()
+                };
+        }
+    }
 
     // Strict OpenAI-compatible upstreams (vLLM, enterprise gateways) reject
     // requests that carry tool_choice or parallel_tool_calls without a non-empty
@@ -388,6 +400,27 @@ pub fn responses_to_chat_completions_with_reasoning(
     super::transform::inject_openai_stream_include_usage(&mut result);
 
     Ok(result)
+}
+
+/// Responses places output constraints under text.format; Chat and Messages
+/// use different envelopes. Reject an unknown format instead of losing it.
+pub(crate) fn responses_text_format(body: &Value) -> Result<Option<&Value>, ProxyError> {
+    let Some(format) = body
+        .pointer("/text/format")
+        .filter(|value| !value.is_null())
+    else {
+        return Ok(None);
+    };
+    match format.get("type").and_then(Value::as_str) {
+        Some("text") => Ok(None),
+        Some("json_object") => Ok(Some(format)),
+        Some("json_schema") if format.get("schema").is_some_and(Value::is_object) => {
+            Ok(Some(format))
+        }
+        _ => Err(ProxyError::InvalidRequest(
+            "Unsupported or invalid text.format".to_string(),
+        )),
+    }
 }
 
 fn apply_reasoning_options(
