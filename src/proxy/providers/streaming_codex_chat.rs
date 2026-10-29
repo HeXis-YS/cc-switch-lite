@@ -753,6 +753,37 @@ impl ChatToResponsesState {
 
         sse::response_failed(&response)
     }
+
+    fn process_sse_block(&mut self, block: &str) -> Vec<Bytes> {
+        let mut event_name = None;
+        let mut data_parts = Vec::new();
+        for line in block.lines() {
+            if let Some(event) = strip_sse_field(line, "event") {
+                event_name = Some(event.trim());
+            }
+            if let Some(data) = strip_sse_field(line, "data") {
+                data_parts.push(data);
+            }
+        }
+        if data_parts.is_empty() {
+            return Vec::new();
+        }
+        let data = data_parts.join("\n");
+        if data.trim() == "[DONE]" {
+            // Some compatible gateways omit finish_reason but send [DONE].
+            // Preserve that explicit terminal signal; EOF alone is insufficient.
+            self.finish_reason.get_or_insert_with(|| "stop".to_string());
+            return self.finalize();
+        }
+        let Ok(chunk) = serde_json::from_str::<Value>(&data) else {
+            return Vec::new();
+        };
+        if event_name == Some("error") || chunk.get("error").is_some() {
+            let normalized = chat_error_to_response_error(Some(&chunk));
+            return vec![self.failed_event_with_error(normalized["error"].clone())];
+        }
+        self.handle_chat_chunk(&chunk)
+    }
 }
 
 fn chat_delta_reasoning_text(delta: &Value) -> Option<String> {
@@ -779,7 +810,6 @@ pub(crate) fn create_responses_sse_stream_from_chat_with_context<
         let mut buffer = String::new();
         let mut utf8_remainder: Vec<u8> = Vec::new();
         let mut state = ChatToResponsesState::with_tool_context(tool_context);
-        let mut stream_failed = false;
 
         tokio::pin!(stream);
 
@@ -789,54 +819,12 @@ pub(crate) fn create_responses_sse_stream_from_chat_with_context<
                     crate::proxy::sse::append_utf8_safe(&mut buffer, &mut utf8_remainder, &bytes);
 
                     while let Some(block) = take_sse_block(&mut buffer) {
-                        if block.trim().is_empty() {
-                            continue;
-                        }
-
-                        let mut event_name: Option<String> = None;
-                        let mut data_parts: Vec<String> = Vec::new();
-                        for line in block.lines() {
-                            if let Some(event) = strip_sse_field(line, "event") {
-                                event_name = Some(event.trim().to_string());
-                            }
-                            if let Some(data) = strip_sse_field(line, "data") {
-                                data_parts.push(data.to_string());
-                            }
-                        }
-
-                        if data_parts.is_empty() {
-                            continue;
-                        }
-
-                        let data = data_parts.join("\n");
-                        if data.trim() == "[DONE]" {
-                            state.finish_reason.get_or_insert_with(|| "stop".to_string());
-                            for event in state.finalize() {
-                                yield Ok(event);
-                            }
-                            // [DONE] is terminal, including failed/incomplete finalization.
-                            return;
-                        }
-
-                        let chunk: Value = match serde_json::from_str(&data) {
-                            Ok(value) => value,
-                            Err(_) => continue,
-                        };
-
-                        if event_name.as_deref() == Some("error") || chunk.get("error").is_some() {
-                            let normalized = chat_error_to_response_error(Some(&chunk));
-                            yield Ok(state.failed_event_with_error(normalized["error"].clone()));
-                            stream_failed = true;
-                            break;
-                        }
-
-                        for event in state.handle_chat_chunk(&chunk) {
+                        for event in state.process_sse_block(&block) {
                             yield Ok(event);
                         }
-                    }
-
-                    if stream_failed {
-                        break;
+                        if state.completed {
+                            return;
+                        }
                     }
                 }
                 Err(e) => {
@@ -844,28 +832,18 @@ pub(crate) fn create_responses_sse_stream_from_chat_with_context<
                         format!("Stream error: {e}"),
                         Some("stream_error".to_string()),
                     ));
-                    stream_failed = true;
-                    break;
+                    return;
                 }
             }
         }
 
-        if !stream_failed {
-            if state.completed || state.finish_reason.is_some() {
-                for event in state.finalize() {
-                    yield Ok(event);
-                }
-            } else if state.has_substantive_output() {
-                state.finish_reason = Some("length".to_string());
-                for event in state.finalize() {
-                    yield Ok(event);
-                }
-            } else {
-                yield Ok(state.failed_event(
-                    "Upstream Chat Completions stream ended before sending finish_reason".to_string(),
-                    Some("stream_truncated".to_string()),
-                ));
-            }
+        // A buffering gateway may omit the final blank line. Consume its last
+        // data/error/[DONE] block before deciding whether the stream was truncated.
+        for event in state.process_sse_block(&buffer) {
+            yield Ok(event);
+        }
+        for event in state.finalize() {
+            yield Ok(event);
         }
     }
 }
@@ -1755,6 +1733,52 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn final_chat_block_without_blank_line_preserves_text_usage_and_errors() {
+        let prefix =
+            "data: {\"id\":\"fixed\",\"choices\":[{\"delta\":{\"content\":\"Hello \"}}]}\n\n";
+        let tail = "data: {\"id\":\"fixed\",\"choices\":[{\"delta\":{\"content\":\"world\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":4,\"completion_tokens\":2}}";
+        // Include single-byte fragmentation to exercise the EOF buffer and UTF-8 parser.
+        for size in [1, 4096] {
+            let raw = format!("{prefix}{tail}");
+            let chunks = raw
+                .as_bytes()
+                .chunks(size)
+                .map(|bytes| Ok::<_, std::io::Error>(Bytes::copy_from_slice(bytes)))
+                .collect::<Vec<_>>();
+            let bytes = create_responses_sse_stream_from_chat(stream::iter(chunks))
+                .map(|b| b.unwrap())
+                .collect::<Vec<_>>()
+                .await;
+            let output = String::from_utf8(bytes.concat()).unwrap();
+            let events = parse_sse_events(&output);
+            let last = events.last().unwrap();
+            assert_eq!(last["type"], "response.completed");
+            assert_eq!(
+                last["response"]["output"][0]["content"][0]["text"],
+                "Hello world"
+            );
+            assert_eq!(last["response"]["usage"]["input_tokens"], 4);
+            assert_eq!(last["response"]["usage"]["output_tokens"], 2);
+        }
+        let output = collect(vec![
+            prefix,
+            "event: error\ndata: {\"error\":{\"message\":\"tail failure\"}}",
+        ])
+        .await;
+        let events = parse_sse_events(&output);
+        assert_eq!(events.last().unwrap()["type"], "response.failed");
+        assert_eq!(
+            events.last().unwrap()["response"]["error"]["message"],
+            "tail failure"
+        );
+        let output = collect(vec![prefix, "data: [DONE]"]).await;
+        assert_eq!(
+            parse_sse_events(&output).last().unwrap()["type"],
+            "response.completed"
+        );
     }
 
     #[tokio::test]
