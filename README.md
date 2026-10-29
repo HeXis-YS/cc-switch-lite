@@ -10,25 +10,26 @@
 ```sh
 cargo build --release --locked
 # 创建配置（不要把真实凭据提交到 Git）
-install -m 600 config.example.toml config.toml
+install -m 600 config.example.yaml config.yaml
 # 编辑地址和凭据后：
-./target/release/cc-switch-lite validate --config config.toml
-./target/release/cc-switch-lite serve --config config.toml
+./target/release/cc-switch-lite validate --config config.yaml
+./target/release/cc-switch-lite serve --config config.yaml
 # 另一终端：
-./target/release/cc-switch-lite tui --config config.toml
+./target/release/cc-switch-lite tui --config config.yaml
 ```
 
-配置结构见 [config.example.toml](config.example.toml)，可选兼容字段和固定参考版本的差异清单见
+配置文件仅支持 YAML，结构见 [config.example.yaml](config.example.yaml)。可选兼容字段和固定参考版本的差异清单见
 [请求兼容清单](docs/request-compatibility.md) 与 [行为清单](docs/compatibility.md)。`base_url` 是 API 前缀；
 程序按所选协议构造 `/responses`、`/chat/completions` 或 `/v1/messages`，并处理已带版本号的前缀。
-`[[routes]]` 按顺序匹配完整的请求 `model`，首个匹配生效。`model_pattern` 支持 glob：
+`routes` 列表按顺序匹配完整的请求 `model`，首个匹配生效。`model_pattern` 支持 glob：
 `claude-*`、`gpt-[45]*`、`deepseek/*`；`*` 不跨 `/`，跨路径匹配使用 `**`。
-未命中时使用 `[default_route]`；未配置默认路由则返回请求错误。请求必须包含非空字符串 `model`。
+未命中时使用 `default_route`；未配置默认路由则返回请求错误。请求必须包含非空字符串 `model`。
 路由只选择 Provider，不改写模型名：`claude-*` 不匹配 `ccs-openlux-claude/claude-opus-5-5`，
 需由客户端发送上游接受的模型名，或配置匹配完整名称的规则。协议兼容分支仍可能按原版语义处理模型标记。
-旧 `[route] provider = "..."` 仍可读取，作为未设置 `default_route` 时的后备；TUI 设置默认路由后改用新格式。
+YAML 中的旧 `route.provider` 字段仍可读取，作为未设置 `default_route` 时的后备；TUI 设置默认路由后改用 `default_route`。
 配置版本必须为 1；Provider ID、规则名称唯一；路由引用必须存在；未知字段和无效凭据拒绝启动。
-TOML 错误不会打印可能包含密钥的源码行。程序保存配置时在同目录创建临时文件、同步后原子替换，Unix 权限为 `0600`。
+YAML 错误不会打印可能包含密钥的源码行。程序保存配置时在同目录创建临时文件、同步后原子替换，Unix 权限为 `0600`。
+模型 glob、API Key 等字符串建议加引号。TUI 保存配置会重新序列化，手写注释不会保留。
 
 代理不提供入口鉴权，仅部署于可信内网或由外部网络层限制访问。默认示例监听 `0.0.0.0:15721`。
 客户端自行配置 Responses endpoint 指向代理的 `/v1`，本程序不写入客户端配置。
@@ -82,7 +83,8 @@ Messages 转换对 Opus 5.5 应用 [cc-switch #8048](https://github.com/farion12
 迁移已验收，后续重构不依赖 cc-switch 副本。
 不需要真实 Provider 账户。Mock 通过不代表已验证真实 Codex CLI 与所有远程供应商组合。
 
-Unix / Python 3.11+ 可在构建后运行 `python3 scripts/tui-smoke.py`，通过真实 PTY
+Unix / Python 3.11+ 环境安装 PyYAML（`python3 -m pip install PyYAML`）后，
+可在构建后运行 `python3 scripts/tui-smoke.py`，通过真实 PTY
 在 80×24 终端下检查长 URL/密钥粘贴、Provider 选择、路由增删改与排序、列表选中项保留、默认路由修改、
 密钥掩码、0600 权限，以及终端设置和粘贴模式恢复；日志位于 `.codex/runs/tui-<UTC>-<PID>/`。
 

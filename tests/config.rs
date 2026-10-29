@@ -27,7 +27,7 @@ fn valid_config() -> Config {
 #[test]
 fn roundtrip_three_protocols_and_current_selection() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("config.toml");
+    let path = dir.path().join("config.yaml");
     let mut config = valid_config();
     for (id, protocol) in [("b", Protocol::ChatCompletions), ("c", Protocol::Messages)] {
         let mut provider = config.providers[0].clone();
@@ -36,6 +36,8 @@ fn roundtrip_three_protocols_and_current_selection() {
         config.providers.push(provider);
     }
     config.route.provider = "b".into();
+    config.providers[1].api_key = "true".into();
+    config.providers[2].api_key = "00123".into();
     config.save(&path).unwrap();
     let loaded = Config::load(&path).unwrap();
     assert_eq!(loaded.route_for_model("example").unwrap().id, "b");
@@ -45,25 +47,27 @@ fn roundtrip_three_protocols_and_current_selection() {
     );
     assert_eq!(loaded.providers[2].protocol, Protocol::Messages);
     assert_eq!(loaded.providers[0].api_key, "test-private-key");
+    assert_eq!(loaded.providers[1].api_key, "true");
+    assert_eq!(loaded.providers[2].api_key, "00123");
 }
 
 #[test]
-fn unknown_fields_and_invalid_toml_have_no_secret_diagnostics() {
+fn unknown_fields_and_invalid_yaml_have_no_secret_diagnostics() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("config.toml");
+    let path = dir.path().join("config.yaml");
     for input in [
         format!(
-            "unexpected = \"test-private-key\"\n{}",
-            toml::to_string(&valid_config()).unwrap()
+            "unexpected: \"test-private-key\"\n{}",
+            serde_saphyr::to_string(&valid_config()).unwrap()
         ),
-        "api_key = \"test-private-key\" extra malformed input".into(),
+        "api_key: [\"test-private-key\"".into(),
     ] {
         fs::write(&path, input).unwrap();
         let error = Config::load(&path)
             .err()
             .expect("must reject malformed config");
         assert!(!format!("{error:#}").contains("test-private-key"));
-        assert_eq!(error.to_string(), "Invalid TOML configuration");
+        assert_eq!(error.to_string(), "Invalid YAML configuration");
     }
 }
 
@@ -101,7 +105,7 @@ fn unsafe_urls_and_header_injection_are_rejected_without_echoing_secrets() {
 #[test]
 fn failed_save_preserves_original_bytes_and_cleans_temporary_files() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("config.toml");
+    let path = dir.path().join("config.yaml");
     let mut config = valid_config();
     config.save(&path).unwrap();
     let original = fs::read(&path).unwrap();
@@ -126,7 +130,7 @@ fn replacement_is_atomic_and_permissions_are_private() {
     use std::io::Read;
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("config.toml");
+    let path = dir.path().join("config.yaml");
     let mut config = valid_config();
     config.save(&path).unwrap();
     fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
@@ -147,10 +151,10 @@ fn replacement_is_atomic_and_permissions_are_private() {
 #[test]
 fn invalid_route_prevents_server_startup() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("config.toml");
+    let path = dir.path().join("config.yaml");
     let mut config = valid_config();
     config.route.provider = "missing".into();
-    fs::write(&path, toml::to_string(&config).unwrap()).unwrap();
+    fs::write(&path, serde_saphyr::to_string(&config).unwrap()).unwrap();
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_cc-switch-lite"))
         .args(["serve", "--config"])
         .arg(&path)
@@ -172,15 +176,16 @@ fn new_config_roundtrips_without_empty_legacy_fields_and_accepts_appended_rules(
         provider: "a".into(),
     });
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("config.toml");
+    let path = dir.path().join("config.yaml");
     config.save(&path).unwrap();
     let text = fs::read_to_string(&path).unwrap();
-    assert!(!text.contains("routes = []"));
-    assert!(!text.contains("[route]"));
+    let saved: serde_json::Value = serde_saphyr::from_str(&text).unwrap();
+    assert!(saved.get("routes").is_none());
+    assert!(saved.get("route").is_none());
     fs::write(
         &path,
         format!(
-            "{text}\n[[routes]]\nname = 'claude'\nmodel_pattern = 'claude-*'\nprovider = 'a'\n"
+            "{text}\nroutes:\n  - name: claude\n    model_pattern: 'claude-*'\n    provider: a\n"
         ),
     )
     .unwrap();
@@ -202,14 +207,14 @@ fn new_config_roundtrips_without_empty_legacy_fields_and_accepts_appended_rules(
 
 #[test]
 fn documented_example_is_valid() {
-    let config: Config = toml::from_str(include_str!("../config.example.toml")).unwrap();
+    let config: Config = serde_saphyr::from_str(include_str!("../config.example.yaml")).unwrap();
     config.validate().unwrap();
 }
 
 #[test]
 fn compatibility_roundtrip_defaults_and_restricted_fields() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("compat.toml");
+    let path = dir.path().join("compat.yaml");
     let mut config = valid_config();
     config.providers[0].compat.meta.max_output_tokens = Some(16384);
     config.providers[0].compat.meta.prompt_cache_routing = Some("enabled".into());
@@ -239,13 +244,10 @@ fn compatibility_roundtrip_defaults_and_restricted_fields() {
 #[test]
 fn compatibility_fields_reject_unknown_and_authentication_override() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("compat.toml");
-    let baseline = toml::to_string(&valid_config()).unwrap();
-    std::fs::write(
-        &path,
-        format!("{baseline}\n[providers.compat.meta.unknown]\nvalue=true\n"),
-    )
-    .unwrap();
+    let path = dir.path().join("compat.yaml");
+    let mut value = serde_json::to_value(valid_config()).unwrap();
+    value["providers"][0]["compat"]["meta"]["unknown"] = serde_json::json!({"value": true});
+    std::fs::write(&path, serde_saphyr::to_string(&value).unwrap()).unwrap();
     assert!(Config::load(&path).is_err());
     let mut config = valid_config();
     config.providers[0]

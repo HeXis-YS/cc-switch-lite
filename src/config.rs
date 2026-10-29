@@ -15,6 +15,7 @@ pub struct Config {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub routes: Vec<RouteRule>,
     pub providers: Vec<Provider>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_route: Option<DefaultRoute>,
 }
 
@@ -82,8 +83,8 @@ impl Config {
     pub fn load(path: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(path).context("Cannot read configuration")?;
         // Parser diagnostics can contain the source line, including credentials.
-        let config: Self =
-            toml::from_str(&text).map_err(|_| anyhow::anyhow!("Invalid TOML configuration"))?;
+        let config: Self = serde_saphyr::from_str(&text)
+            .map_err(|_| anyhow::anyhow!("Invalid YAML configuration"))?;
         config.validate()?;
         Ok(config)
     }
@@ -193,7 +194,7 @@ impl Config {
             temp.as_file()
                 .set_permissions(std::fs::Permissions::from_mode(0o600))?;
         }
-        temp.write_all(toml::to_string_pretty(self)?.as_bytes())?;
+        temp.write_all(serde_saphyr::to_string(self)?.as_bytes())?;
         temp.as_file().sync_all()?;
         temp.persist(path)
             .map_err(|_| anyhow::anyhow!("Cannot replace configuration; original retained"))?;

@@ -581,7 +581,8 @@ mod tests {
 
     #[test]
     fn route_editor_uses_selected_provider_and_restores_existing_reference() {
-        let config: Config = toml::from_str(include_str!("../config.example.toml")).unwrap();
+        let config: Config =
+            serde_saphyr::from_str(include_str!("../config.example.yaml")).unwrap();
         let mut editor = RouteEditor::new(None, &config, 1);
         editor.fields = [TextInput::new("new"), TextInput::new("gpt-*")];
         let next = editor.apply(&config);
@@ -597,10 +598,11 @@ mod tests {
 
     #[test]
     fn failed_save_preserves_draft_and_success_requires_restart_after_validation() {
-        let config: Config = toml::from_str(include_str!("../config.example.toml")).unwrap();
+        let config: Config =
+            serde_saphyr::from_str(include_str!("../config.example.yaml")).unwrap();
         let mut app = App::new(config);
         let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("config.toml");
+        let path = directory.path().join("config.yaml");
         let key = |code, modifiers| KeyEvent::new(code, modifiers);
         app.key(key(KeyCode::Char('a'), KeyModifiers::NONE), &path);
         app.paste("duplicate");

@@ -289,7 +289,7 @@ mod tests {
     use ratatui::{backend::TestBackend, Terminal};
 
     fn config() -> crate::config::Config {
-        toml::from_str(include_str!("../../config.example.toml")).unwrap()
+        serde_saphyr::from_str(include_str!("../../config.example.yaml")).unwrap()
     }
 
     fn screen(terminal: &Terminal<TestBackend>) -> String {

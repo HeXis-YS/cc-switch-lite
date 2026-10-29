@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Real-PTY TUI smoke test; requires Python 3.11+, Unix, and a built binary.
+"""Real-PTY TUI smoke test; requires Python 3.11+, PyYAML, Unix, and a built binary.
 
 Usage: python3 scripts/tui-smoke.py [--binary target/debug/cc-switch-lite]
 Creates a temporary configuration and checks paste, provider selection, route
@@ -21,7 +21,7 @@ import subprocess
 import tempfile
 import termios
 import time
-import tomllib
+import yaml
 
 
 def main():
@@ -38,6 +38,7 @@ def main():
     run.mkdir(parents=True)
     metadata = {
         "python": platform.python_version(), "platform": platform.platform(),
+        "pyyaml": yaml.__version__,
         "binary": str(binary), "binary_sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
         "script_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
         "terminal": "xterm-256color", "rows": 24, "columns": 80, "timeout_seconds": 30,
@@ -71,7 +72,7 @@ def main():
 
     try:
         with tempfile.TemporaryDirectory(prefix="tui-config-", dir=run) as directory:
-            config = Path(directory) / "config.toml"
+            config = Path(directory) / "config.yaml"
             process = subprocess.Popen(
                 [str(binary), "tui", "--config", str(config)], cwd=root,
                 stdin=slave, stdout=slave, stderr=slave,
@@ -85,7 +86,7 @@ def main():
             os.write(master, b"smoke\tSmoke Provider\t" + paste(url) + b"\t"
                      + paste(secret + b"\r\n\t\x13") + b"\x13")
             drain_until(lambda: config.exists())
-            content = tomllib.loads(config.read_text())
+            content = yaml.safe_load(config.read_text())
             assert content["default_route"]["provider"] == "smoke", "Default route not selected"
             assert "route" not in content and "routes" not in content, "Empty legacy fields persisted"
             assert content["providers"][0] == {
@@ -98,33 +99,33 @@ def main():
             # observable in saved configuration, without parsing ANSI redraws.
             os.write(master, b"asecond\tSecond Provider\thttps://example.org/v1\t"
                      + paste(secret) + b"\x13")
-            drain_until(lambda: len(tomllib.loads(config.read_text())["providers"]) == 2)
+            drain_until(lambda: len(yaml.safe_load(config.read_text())["providers"]) == 2)
             os.write(master, b"\ta")
             # Ratatui draws only changed cells: a reused "Edit " prefix need not
             # appear again in the PTY byte stream. Verify the saved state below.
             # New routes start on the selected provider. Left chooses the first.
             os.write(master, b"claude\tclaude-*\t\x1b[D\x13")
-            drain_until(lambda: len(tomllib.loads(config.read_text()).get("routes", [])) == 1)
-            assert tomllib.loads(config.read_text())["routes"][0] == {
+            drain_until(lambda: len(yaml.safe_load(config.read_text()).get("routes", [])) == 1)
+            assert yaml.safe_load(config.read_text())["routes"][0] == {
                 "name": "claude", "model_pattern": "claude-*", "provider": "smoke",
             }, "Route editor did not persist the rule"
             # Add a second rule, reorder it, then delete it through the confirmation.
             os.write(master, b"aother\tgpt-*\t\x13")
-            drain_until(lambda: len(tomllib.loads(config.read_text()).get("routes", [])) == 2)
-            assert tomllib.loads(config.read_text())["routes"][1]["provider"] == "second", "Provider picker lost selected provider"
+            drain_until(lambda: len(yaml.safe_load(config.read_text()).get("routes", [])) == 2)
+            assert yaml.safe_load(config.read_text())["routes"][1]["provider"] == "second", "Provider picker lost selected provider"
             # Newly added routes are selected. Move the second rule up.
             os.write(master, b"K")
-            drain_until(lambda: tomllib.loads(config.read_text())["routes"][0]["name"] == "other")
+            drain_until(lambda: yaml.safe_load(config.read_text())["routes"][0]["name"] == "other")
             os.write(master, b"dy")
-            drain_until(lambda: len(tomllib.loads(config.read_text())["routes"]) == 1)
+            drain_until(lambda: len(yaml.safe_load(config.read_text())["routes"]) == 1)
             # Edit the remaining rule's name and clear the default.
             os.write(master, b"e\x15renamed\x13")
-            drain_until(lambda: tomllib.loads(config.read_text())["routes"][0]["name"] == "renamed")
+            drain_until(lambda: yaml.safe_load(config.read_text())["routes"][0]["name"] == "renamed")
             os.write(master, b"x")
-            drain_until(lambda: "default_route" not in tomllib.loads(config.read_text()))
+            drain_until(lambda: "default_route" not in yaml.safe_load(config.read_text()))
             # Returning to Providers must retain the second selection.
             os.write(master, b"\t\r")
-            drain_until(lambda: tomllib.loads(config.read_text()).get("default_route", {}).get("provider") == "second")
+            drain_until(lambda: yaml.safe_load(config.read_text()).get("default_route", {}).get("provider") == "second")
             # A pasted command sequence in a list must have no effect.
             os.write(master, paste(b"dyaq"))
             os.write(master, b"v")
@@ -136,7 +137,7 @@ def main():
             assert termios.tcgetattr(slave) == original, "Terminal settings were not restored"
             assert b"\x1b[?2004h" in captured and b"\x1b[?2004l" in captured, "Bracketed paste mode was not restored"
             assert secret not in captured, "Credential appeared in terminal output"
-            final = tomllib.loads(config.read_text())
+            final = yaml.safe_load(config.read_text())
             assert len(final["providers"]) == 2 and len(final["routes"]) == 1, "Pasted list commands changed configuration"
             result = "PASS: long URL/key pasted at 80x24, provider picker, routes created/edited/reordered/deleted, list selection retained, default changed, key masked, mode 0600, terminal/paste mode restored\n"
             (run / "output.log").write_text(result)

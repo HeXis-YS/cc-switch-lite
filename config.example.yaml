@@ -1,0 +1,34 @@
+version: 1
+
+server:
+  listen: "0.0.0.0:15721"
+
+default_route:
+  provider: provider-a
+
+# Rules match the complete request model in order; the first match wins.
+# Matching selects a provider and does not strip or rewrite model prefixes.
+routes:
+  - name: claude
+    model_pattern: "claude-*"
+    provider: provider-c
+  - name: chat
+    model_pattern: "gpt-[45]*"
+    provider: provider-b
+
+providers:
+  - id: provider-a
+    name: Provider A
+    protocol: responses
+    base_url: "https://example.com/v1"
+    api_key: "replace-with-your-key"
+  - id: provider-b
+    name: Provider B
+    protocol: chat_completions
+    base_url: "https://example.org/v1"
+    api_key: "replace-with-your-key"
+  - id: provider-c
+    name: Provider C
+    protocol: messages
+    base_url: "https://api.anthropic.com/v1"
+    api_key: "replace-with-your-key"

@@ -310,7 +310,7 @@ async fn running_router_uses_snapshot_until_recreated() {
     )
     .await;
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("config.toml");
+    let path = dir.path().join("config.yaml");
     let original = config(&url, Protocol::Responses);
     original.save(&path).unwrap();
     let (old, p) = start(server::router(Config::load(&path).unwrap()).unwrap()).await;

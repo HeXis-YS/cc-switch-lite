@@ -1,3 +1,4 @@
 /target/
 /.codex/
-/config.toml
+/config.yaml
+/config.yml
