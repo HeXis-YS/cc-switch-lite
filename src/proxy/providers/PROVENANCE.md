@@ -1,6 +1,8 @@
 # Protocol conversion provenance
 
-Copied from `cc-switch` commit `214e75ba7f625c679dd4e61df166ec4463245fe7`, `src-tauri/src/proxy/`.
+The current forwarding logic is derived from `cc-switch v4.0.18`.
+Migration source: commit `214e75ba7f625c679dd4e61df166ec4463245fe7`, `src-tauri/src/proxy/`,
+including the user's local commits noted below.
 Copyright (c) 2025 Jason Young, MIT; see `LICENSE-cc-switch`.
 
 The conversion, SSE, chat history, tool history, compaction, inline thinking,
