@@ -125,3 +125,18 @@ async fn gzip_body_is_decoded_and_entity_headers_removed() {
     assert!(!headers.contains_key("content-encoding"));
     assert!(!headers.contains_key("content-length"));
 }
+
+#[tokio::test]
+async fn malformed_gzip_body_returns_forward_failed() {
+    let response = axum::http::Response::builder()
+        .header("content-encoding", "gzip")
+        .body(Bytes::from_static(b"not a gzip stream"))
+        .unwrap()
+        .into();
+
+    let error = decode_response(response).await.unwrap_err();
+    assert!(matches!(
+        error,
+        ProxyError::ForwardFailed(message) if message.contains("decompress")
+    ));
+}

@@ -76,7 +76,11 @@ pub async fn decode_response(
             Err(DecompressError::TooLarge { .. }) => {
                 return Err(ProxyError::ResponseBodyTooLarge(MAX_RESPONSE_BODY_BYTES))
             }
-            Err(DecompressError::Io(_)) => {}
+            Err(DecompressError::Io(error)) => {
+                return Err(ProxyError::ForwardFailed(format!(
+                    "Failed to decompress upstream response body: {error}"
+                )))
+            }
         }
     }
     Ok((headers, status, body))
