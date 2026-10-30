@@ -1,5 +1,6 @@
 // Derived from cc-switch@214e75ba7f625c679dd4e61df166ec4463245fe7.
 // Copyright (c) 2025 Jason Young. MIT; see proxy/providers/LICENSE-cc-switch.
+use crate::config::Protocol;
 use crate::provider::LocalProxyRequestOverrides;
 use crate::proxy::{
     body_filter::filter_private_params_with_whitelist, json_canonical::canonicalize_value,
@@ -44,6 +45,56 @@ pub(super) fn base_url_is_full_endpoint(base_url: &str, endpoint_suffix: &str) -
     path.trim_end_matches('/')
         .to_ascii_lowercase()
         .ends_with(endpoint_suffix)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum EndpointShape {
+    FullUrl,
+    Appended,
+}
+
+pub(super) fn endpoint_shape(
+    protocol: Protocol,
+    base_url: &str,
+    is_full_url: bool,
+) -> EndpointShape {
+    let automatically_full = match protocol {
+        Protocol::Responses => false,
+        Protocol::ChatCompletions => base_url_is_full_endpoint(base_url, "/chat/completions"),
+        Protocol::Messages => base_url_is_full_endpoint(base_url, "/v1/messages"),
+    };
+
+    if is_full_url || automatically_full {
+        EndpointShape::FullUrl
+    } else {
+        EndpointShape::Appended
+    }
+}
+
+pub(super) fn effective_endpoint(protocol: Protocol, query: Option<&str>) -> String {
+    let endpoint = match protocol {
+        Protocol::Responses => "/responses",
+        Protocol::ChatCompletions => "/chat/completions",
+        Protocol::Messages => "/v1/messages",
+    };
+    match query {
+        Some(query) if !query.is_empty() => format!("{endpoint}?{query}"),
+        _ => endpoint.to_string(),
+    }
+}
+
+pub(super) fn resolve_upstream_url(
+    protocol: Protocol,
+    base_url: &str,
+    is_full_url: bool,
+    query: Option<&str>,
+) -> String {
+    let endpoint = effective_endpoint(protocol, query);
+
+    match endpoint_shape(protocol, base_url, is_full_url) {
+        EndpointShape::FullUrl => append_query_to_full_url(base_url, query),
+        EndpointShape::Appended => build_url(base_url, &endpoint),
+    }
 }
 
 pub(super) fn is_codex_client_fingerprint_header(key_str: &str) -> bool {
@@ -410,6 +461,91 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::collections::HashMap;
+
+    #[test]
+    fn resolves_appended_upstream_urls_without_changing_base_path_rules() {
+        let cases = [
+            (
+                Protocol::Responses,
+                "https://api.example.test",
+                "https://api.example.test/v1/responses",
+            ),
+            (
+                Protocol::ChatCompletions,
+                "https://api.example.test/v1",
+                "https://api.example.test/v1/chat/completions",
+            ),
+            (
+                Protocol::Responses,
+                "https://gateway.example.test/openai",
+                "https://gateway.example.test/openai/responses",
+            ),
+            (
+                Protocol::Messages,
+                "https://api.example.test/v1",
+                "https://api.example.test/v1/messages",
+            ),
+        ];
+
+        for (protocol, base_url, expected) in cases {
+            assert_eq!(
+                resolve_upstream_url(protocol, base_url, false, None),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn recognizes_protocol_full_endpoints_and_appends_request_query() {
+        assert_eq!(
+            endpoint_shape(
+                Protocol::ChatCompletions,
+                "https://gateway.example.test/custom/chat/completions/",
+                false,
+            ),
+            EndpointShape::FullUrl
+        );
+        assert_eq!(
+            resolve_upstream_url(
+                Protocol::ChatCompletions,
+                "https://gateway.example.test/custom/chat/completions?existing=one",
+                false,
+                Some("trace=two"),
+            ),
+            "https://gateway.example.test/custom/chat/completions?existing=one&trace=two"
+        );
+        assert_eq!(
+            resolve_upstream_url(
+                Protocol::Messages,
+                "https://gateway.example.test/v1/messages",
+                false,
+                Some("beta=true"),
+            ),
+            "https://gateway.example.test/v1/messages?beta=true"
+        );
+    }
+
+    #[test]
+    fn explicit_full_url_appends_query_and_no_query_preserves_it() {
+        assert_eq!(
+            resolve_upstream_url(
+                Protocol::Responses,
+                "https://gateway.example.test/response?version=one",
+                true,
+                Some("trace=two"),
+            ),
+            "https://gateway.example.test/response?version=one&trace=two"
+        );
+        assert_eq!(
+            resolve_upstream_url(
+                Protocol::Responses,
+                "https://gateway.example.test/response?version=one",
+                true,
+                None,
+            ),
+            "https://gateway.example.test/response?version=one"
+        );
+    }
 
     #[test]
     fn prepare_upstream_request_body_filters_private_fields_and_canonicalizes_order() {

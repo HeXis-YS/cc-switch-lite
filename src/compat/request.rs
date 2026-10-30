@@ -160,25 +160,13 @@ pub async fn prepare_with_query(
             body = prepare_upstream_request_body(body);
         }
     }
-    let endpoint = match provider.protocol {
-        Protocol::Responses => "/responses",
-        Protocol::ChatCompletions => "/chat/completions",
-        Protocol::Messages => "/v1/messages",
-    };
-    let full = provider.compat.meta.is_full_url == Some(true)
-        || (provider.protocol == Protocol::ChatCompletions
-            && base_url_is_full_endpoint(&provider.base_url, "/chat/completions"))
-        || (provider.protocol == Protocol::Messages
-            && base_url_is_full_endpoint(&provider.base_url, "/v1/messages"));
-    let effective_endpoint = match query {
-        Some(query) if !query.is_empty() => format!("{endpoint}?{query}"),
-        _ => endpoint.to_string(),
-    };
-    let url = if full {
-        append_query_to_full_url(&provider.base_url, query)
-    } else {
-        build_url(&provider.base_url, &effective_endpoint)
-    };
+    let effective_endpoint = effective_endpoint(provider.protocol, query);
+    let url = resolve_upstream_url(
+        provider.protocol,
+        &provider.base_url,
+        provider.compat.meta.is_full_url == Some(true),
+        query,
+    );
     let outbound_headers = prepare_headers(
         provider,
         headers,
