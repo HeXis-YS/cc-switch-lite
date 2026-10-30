@@ -1,4 +1,4 @@
-use cc_switch_lite::config::{Config, Protocol, Provider, Route, Server};
+use cc_switch_lite::config::{Config, DefaultRoute, Protocol, Provider, Server};
 use std::fs;
 
 fn valid_config() -> Config {
@@ -8,11 +8,10 @@ fn valid_config() -> Config {
         server: Server {
             listen: "127.0.0.1:15721".parse().unwrap(),
         },
-        route: Route {
-            provider: "a".into(),
-        },
         routes: vec![],
-        default_route: None,
+        default_route: Some(DefaultRoute {
+            provider: "a".into(),
+        }),
         providers: vec![Provider {
             id: "a".into(),
             name: "Provider A".into(),
@@ -35,7 +34,7 @@ fn roundtrip_three_protocols_and_current_selection() {
         provider.protocol = protocol;
         config.providers.push(provider);
     }
-    config.route.provider = "b".into();
+    config.default_route.as_mut().unwrap().provider = "b".into();
     config.providers[1].api_key = "true".into();
     config.providers[2].api_key = "00123".into();
     config.save(&path).unwrap();
@@ -72,14 +71,16 @@ fn unknown_fields_and_invalid_yaml_have_no_secret_diagnostics() {
 }
 
 #[test]
-fn missing_route_and_duplicate_provider_are_rejected() {
+fn missing_routing_and_duplicate_provider_are_rejected() {
     let mut config = valid_config();
-    config.route.provider = "absent".into();
+    config.default_route = None;
     assert_eq!(
         config.validate().unwrap_err().to_string(),
-        "Legacy route provider does not exist"
+        "Configuration must have routes or default_route"
     );
-    config.route.provider = "a".into();
+    config.default_route = Some(DefaultRoute {
+        provider: "a".into(),
+    });
     config.providers.push(config.providers[0].clone());
     assert!(config.validate().is_err());
 }
@@ -109,7 +110,7 @@ fn failed_save_preserves_original_bytes_and_cleans_temporary_files() {
     let mut config = valid_config();
     config.save(&path).unwrap();
     let original = fs::read(&path).unwrap();
-    config.route.provider = "missing".into();
+    config.default_route.as_mut().unwrap().provider = "missing".into();
     assert!(config.save(&path).is_err());
     assert_eq!(fs::read(&path).unwrap(), original);
     assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
@@ -149,11 +150,11 @@ fn replacement_is_atomic_and_permissions_are_private() {
 }
 
 #[test]
-fn invalid_route_prevents_server_startup() {
+fn invalid_default_route_prevents_server_startup() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("config.yaml");
     let mut config = valid_config();
-    config.route.provider = "missing".into();
+    config.default_route.as_mut().unwrap().provider = "missing".into();
     fs::write(&path, serde_saphyr::to_string(&config).unwrap()).unwrap();
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_cc-switch-lite"))
         .args(["serve", "--config"])
@@ -161,17 +162,35 @@ fn invalid_route_prevents_server_startup() {
         .output()
         .unwrap();
     assert!(!output.status.success());
-    assert!(
-        String::from_utf8_lossy(&output.stderr).contains("Legacy route provider does not exist")
-    );
+    assert!(String::from_utf8_lossy(&output.stderr)
+        .contains("Default route references nonexistent provider 'missing'"));
     assert!(!String::from_utf8_lossy(&output.stderr).contains("test-private-key"));
 }
 
 #[test]
+fn legacy_route_field_is_rejected_by_validate() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.yaml");
+    let input = format!(
+        "route:\n  provider: a\n{}",
+        serde_saphyr::to_string(&valid_config()).unwrap()
+    );
+    fs::write(&path, input).unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_cc-switch-lite"))
+        .args(["validate", "--config"])
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("Invalid YAML configuration"));
+    assert!(!stderr.contains("test-private-key"));
+}
+
+#[test]
 fn new_config_roundtrips_without_empty_legacy_fields_and_accepts_appended_rules() {
-    use cc_switch_lite::config::{DefaultRoute, RouteRule};
+    use cc_switch_lite::config::RouteRule;
     let mut config = valid_config();
-    config.route = Route::default();
     config.default_route = Some(DefaultRoute {
         provider: "a".into(),
     });

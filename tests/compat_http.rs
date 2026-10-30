@@ -8,7 +8,7 @@ use axum::{
     Json, Router,
 };
 use cc_switch_lite::{
-    config::{Config, Protocol, Provider, Route, Server},
+    config::{Config, DefaultRoute, Protocol, Provider, Server},
     server,
 };
 use serde_json::{json, Value};
@@ -103,11 +103,10 @@ impl Fixture {
             server: Server {
                 listen: "127.0.0.1:0".parse().unwrap(),
             },
-            route: Route {
+            default_route: Some(DefaultRoute {
                 provider: "one".into(),
-            },
+            }),
             routes: vec![],
-            default_route: None,
             providers: vec![Provider {
                 id: "one".into(),
                 name: "Mock".into(),

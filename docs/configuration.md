@@ -48,10 +48,9 @@ providers:
 | `default_route.provider` | 可省略 | 未命中任何规则时使用的 Provider ID |
 | `routes` | 默认 `[]` | 按顺序匹配完整请求模型名的规则列表 |
 | `compat` | 可省略 | 全局兼容选项，通常沿用默认值即可 |
-| `route.provider` | 可省略 | 旧的默认 Provider 字段；仅在没有 `default_route` 时生效，新配置使用 `default_route` |
 
 必须至少配置一条 `routes` 规则或一个默认 Provider。所有路由引用必须指向已有 Provider；
-即使旧 `route.provider` 被 `default_route` 覆盖，它也必须引用存在的 Provider。
+旧配置中的顶层 `route.provider` 已移除，请改为 `default_route.provider`；`validate` 会将旧 `route` 字段报告为 `Invalid YAML configuration`。
 示例中的 `0.0.0.0:15721` 是显式配置值，省略 `server.listen` 会校验失败。
 
 ## Provider 字段与协议
@@ -96,7 +95,7 @@ Provider 失败直接返回错误，不会改用其他 Provider；符合条件�
 
 规则按列表顺序检查，首个匹配生效，没有单独的优先级字段。
 精确规则应放在宽泛规则前，例如 `gpt-4.1` 放在 `gpt-*` 前；`"**"` 放在末尾可以接住所有模型。
-未命中规则时，依次检查 `default_route`、旧 `route.provider`；都没有就返回请求错误。
+未命中规则时使用 `default_route`；未配置默认 Provider 时，该模型的请求会失败。
 如果只配置 `routes`，没有默认 Provider，未匹配的模型将失败。
 
 | glob 示例 | 匹配示例 | 不匹配示例 |
@@ -185,7 +184,7 @@ Messages 未指定 Provider 上限且请求也未给上限时，转换默认使�
 ## 校验边界与排查
 
 `validate` 检查版本、必填字段、ID 与规则名称唯一性、Provider 引用、地址、凭据和受限兼容选项。
-顶层配置、`providers[]`、`routes[]`、`default_route`、旧 `route`、顶层及 Provider 的 `compat`、
+顶层配置、`providers[]`、`routes[]`、`default_route`、顶层及 Provider 的 `compat`、
 `compat.transport`、Provider 的 `compat.meta` 和 `localProxyRequestOverrides` 对象会拒绝未知字段。
 `server`、`optimizer`、`rectifier` 和 `codexChatReasoning` 的未知字段沿用当前反序列化行为，可能被忽略；
 不能依赖 `validate` 发现这些子结构中的所有拼写错误。

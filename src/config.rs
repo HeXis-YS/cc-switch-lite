@@ -10,8 +10,6 @@ pub struct Config {
     #[serde(default)]
     pub compat: crate::compat::CompatConfig,
     pub server: Server,
-    #[serde(default, skip_serializing_if = "Route::is_empty")]
-    pub route: Route,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub routes: Vec<RouteRule>,
     pub providers: Vec<Provider>,
@@ -29,19 +27,6 @@ impl Default for Server {
         Self {
             listen: "127.0.0.1:15721".parse().unwrap(),
         }
-    }
-}
-
-#[derive(Clone, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Route {
-    #[serde(default)]
-    pub provider: String,
-}
-
-impl Route {
-    fn is_empty(&self) -> bool {
-        self.provider.is_empty()
     }
 }
 
@@ -146,13 +131,8 @@ impl Config {
             }
         }
 
-        // 验证遗留单路由（向后兼容）
-        if !self.route.provider.is_empty() {
-            if !ids.contains(&self.route.provider) {
-                bail!("Legacy route provider does not exist");
-            }
-        } else if self.routes.is_empty() && self.default_route.is_none() {
-            bail!("Configuration must have routes, default_route, or legacy route.provider");
+        if self.routes.is_empty() && self.default_route.is_none() {
+            bail!("Configuration must have routes or default_route");
         }
 
         Ok(())
@@ -170,11 +150,6 @@ impl Config {
         // 2. 使用默认路由
         if let Some(default) = &self.default_route {
             return self.providers.iter().find(|p| p.id == default.provider);
-        }
-
-        // 3. 回退到遗留单路由（向后兼容）
-        if !self.route.provider.is_empty() {
-            return self.providers.iter().find(|p| p.id == self.route.provider);
         }
 
         None
@@ -212,7 +187,6 @@ mod tests {
             version: 1,
             compat: Default::default(),
             server: Server::default(),
-            route: Route::default(),
             routes: vec![
                 RouteRule {
                     name: "claude".into(),
@@ -288,7 +262,6 @@ mod tests {
             version: 1,
             compat: Default::default(),
             server: Server::default(),
-            route: Route::default(),
             routes: vec![
                 RouteRule {
                     name: "specific".into(),
@@ -328,7 +301,6 @@ fn test_route_ccs_model() {
         version: 1,
         compat: Default::default(),
         server: Server::default(),
-        route: Route::default(),
         routes: vec![RouteRule {
             name: "claude-models".into(),
             model_pattern: "claude-*".into(),

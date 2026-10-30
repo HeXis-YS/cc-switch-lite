@@ -19,6 +19,7 @@ install -m 600 config.example.yaml config.yaml
 配置文件仅支持 YAML。直接编辑 [config.example.yaml](config.example.yaml) 的副本，字段、协议地址、
 路由匹配及兼容选项见 [配置指南](docs/configuration.md)。单 Provider 可以只配置 `default_route`；
 多个 Provider 可通过有序的 `routes` 列表按模型选择，首个匹配生效，路由不改写模型名。
+旧配置中的顶层 `route.provider` 需迁移为 `default_route.provider`；旧 `route` 字段会被 `validate` 拒绝。
 
 每次修改后先运行 `validate`，成功时输出 `Configuration valid`，再重启服务。
 服务使用启动时的配置快照；`serve` 和 `validate` 只读取文件，不会自动保存或重载配置。

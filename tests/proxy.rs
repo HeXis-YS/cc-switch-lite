@@ -7,7 +7,7 @@ use axum::{
     Json, Router,
 };
 use cc_switch_lite::{
-    config::{Config, Protocol, Provider, Route, Server},
+    config::{Config, DefaultRoute, Protocol, Provider, Server},
     server,
 };
 use serde_json::{json, Value};
@@ -61,11 +61,10 @@ fn config(url: &str, protocol: Protocol) -> Config {
         server: Server {
             listen: "127.0.0.1:0".parse().unwrap(),
         },
-        route: Route {
+        default_route: Some(DefaultRoute {
             provider: "one".into(),
-        },
+        }),
         routes: vec![],
-        default_route: None,
         providers: vec![Provider {
             id: "one".into(),
             name: "One".into(),
@@ -175,7 +174,7 @@ async fn model_routes_select_upstream_credentials_and_reject_unmatched_requests(
     provider.base_url = format!("{messages_url}/v1");
     provider.api_key = "messages-only-key".into();
     config.providers.push(provider);
-    config.route = Route::default();
+    config.default_route = None;
     config.routes.push(RouteRule {
         name: "claude".into(),
         model_pattern: "claude-*".into(),
