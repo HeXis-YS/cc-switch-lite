@@ -41,7 +41,7 @@ pub fn codex_context_window_sse_response(
 
 #[path = "../response_error_mapper.rs"]
 mod error_mapper;
-use error_mapper::{get_error_message, map_proxy_error_to_status};
+use error_mapper::get_error_message;
 fn codex_proxy_error_json(
     provider_name: &str,
     request_model: &str,
@@ -160,25 +160,14 @@ fn codex_proxy_error_json(
 fn codex_proxy_error_code(error: &ProxyError) -> &'static str {
     match error {
         ProxyError::ForwardFailed(_) => "cc_switch_forward_failed",
-        ProxyError::Timeout(_) | ProxyError::StreamIdleTimeout(_) => "cc_switch_timeout",
-        ProxyError::NoAvailableProvider => "cc_switch_no_available_provider",
-        ProxyError::AllProvidersCircuitOpen => "cc_switch_all_providers_circuit_open",
-        ProxyError::NoProvidersConfigured => "cc_switch_no_providers_configured",
-        ProxyError::MaxRetriesExceeded => "cc_switch_max_retries_exceeded",
-        ProxyError::ProviderUnhealthy(_) => "cc_switch_provider_unhealthy",
+        ProxyError::Timeout(_) => "cc_switch_timeout",
         ProxyError::ConfigError(_) => "cc_switch_config_error",
         ProxyError::TransformError(_) => "cc_switch_transform_error",
         ProxyError::InvalidRequest(_) => "cc_switch_invalid_request",
         ProxyError::AuthError(_) => "cc_switch_auth_error",
         ProxyError::UpstreamError { .. } => "cc_switch_upstream_error",
-        ProxyError::DatabaseError(_) => "cc_switch_database_error",
         ProxyError::Internal(_) => "cc_switch_internal_error",
-        ProxyError::AlreadyRunning
-        | ProxyError::NotRunning
-        | ProxyError::BindFailed(_)
-        | ProxyError::StopTimeout
-        | ProxyError::StopFailed(_)
-        | ProxyError::ResponseBodyTooLarge(_) => "cc_switch_proxy_error",
+        ProxyError::ResponseBodyTooLarge(_) => "cc_switch_proxy_error",
     }
 }
 
@@ -203,8 +192,7 @@ pub fn proxy_error_response(
     streaming: bool,
     error: &ProxyError,
 ) -> Response {
-    let status = StatusCode::from_u16(map_proxy_error_to_status(error))
-        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    let status = error.status();
     let body = codex_proxy_error_json(provider_name, model, "/v1/responses", error);
     if let Some(response) = codex_context_window_sse_response(model, &body, status, streaming) {
         return response;

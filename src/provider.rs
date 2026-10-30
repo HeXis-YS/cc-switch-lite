@@ -35,14 +35,6 @@ pub struct Provider {
     pub name: String,
     pub settings_config: serde_json::Value,
     pub meta: Option<ProviderMeta>,
-    pub website_url: Option<String>,
-    pub category: Option<String>,
-    pub created_at: Option<i64>,
-    pub sort_index: Option<usize>,
-    pub notes: Option<String>,
-    pub icon: Option<String>,
-    pub icon_color: Option<String>,
-    pub in_failover_queue: bool,
 }
 pub type ProviderMeta = crate::compat::request::CompatMeta;
 

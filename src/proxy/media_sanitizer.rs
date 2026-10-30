@@ -445,15 +445,7 @@ mod tests {
             id: "test".to_string(),
             name: "Test".to_string(),
             settings_config,
-            website_url: None,
-            category: None,
-            created_at: None,
-            sort_index: None,
-            notes: None,
             meta: None,
-            icon: None,
-            icon_color: None,
-            in_failover_queue: false,
         }
     }
 

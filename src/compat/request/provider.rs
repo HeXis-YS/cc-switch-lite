@@ -62,6 +62,5 @@ pub fn upstream_provider(provider: &Provider) -> crate::provider::Provider {
         name: provider.name.clone(),
         settings_config: settings,
         meta: Some(provider.compat.meta.clone()),
-        ..Default::default()
     }
 }

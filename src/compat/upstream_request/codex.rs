@@ -461,15 +461,7 @@ mod tests {
             id: "test".to_string(),
             name: "Test Codex".to_string(),
             settings_config: config,
-            website_url: None,
-            category: Some("codex".to_string()),
-            created_at: None,
-            sort_index: None,
-            notes: None,
             meta: None,
-            icon: None,
-            icon_color: None,
-            in_failover_queue: false,
         }
     }
     #[test]
