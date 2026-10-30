@@ -21,11 +21,9 @@ pub enum ProxyError {
     #[error("配置错误: {0}")]
     ConfigError(String),
 
-    #[allow(dead_code)]
     #[error("格式转换错误: {0}")]
     TransformError(String),
 
-    #[allow(dead_code)]
     #[error("无效的请求: {0}")]
     InvalidRequest(String),
 
@@ -35,10 +33,6 @@ pub enum ProxyError {
     /// 认证错误
     #[error("认证失败: {0}")]
     AuthError(String),
-
-    #[allow(dead_code)]
-    #[error("内部错误: {0}")]
-    Internal(String),
 }
 
 impl ProxyError {
@@ -52,7 +46,6 @@ impl ProxyError {
             Self::TransformError(_) => StatusCode::UNPROCESSABLE_ENTITY,
             Self::Timeout(_) => StatusCode::GATEWAY_TIMEOUT,
             Self::AuthError(_) => StatusCode::UNAUTHORIZED,
-            Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
 }
@@ -102,17 +95,6 @@ impl IntoResponse for ProxyError {
     }
 }
 
-/// 错误分类
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ErrorCategory {
-    /// 可重试错误（网络问题、5xx）
-    Retryable, // 网络超时、5xx 错误
-    /// 不可重试错误（4xx、认证失败）
-    NonRetryable, // 认证失败、参数错误、4xx 错误
-    #[allow(dead_code)]
-    ClientAbort, // 客户端主动中断
-}
-
 /// 把错误连同 `source()` 原因链拼成一行。
 ///
 /// reqwest / hyper 的外层文本只有「error sending request」「error decoding response body」
@@ -135,26 +117,6 @@ pub fn describe_error_chain(error: &(dyn std::error::Error + 'static)) -> String
 /// reqwest 错误的文本带完整 URL（查询参数里可能有 Key），先去掉 URL 再展开原因链。
 pub fn describe_reqwest_error(error: reqwest::Error) -> String {
     describe_error_chain(&error.without_url())
-}
-
-/// 判断错误是否可重试
-#[allow(dead_code)]
-pub fn categorize_error(error: &reqwest::Error) -> ErrorCategory {
-    if error.is_timeout() || error.is_connect() {
-        return ErrorCategory::Retryable;
-    }
-
-    if let Some(status) = error.status() {
-        if status.is_server_error() {
-            ErrorCategory::Retryable
-        } else if status.is_client_error() {
-            ErrorCategory::NonRetryable
-        } else {
-            ErrorCategory::Retryable
-        }
-    } else {
-        ErrorCategory::Retryable
-    }
 }
 
 #[cfg(test)]
@@ -199,10 +161,6 @@ mod tests {
             (
                 ProxyError::AuthError("bad credential".into()),
                 StatusCode::UNAUTHORIZED,
-            ),
-            (
-                ProxyError::Internal("unexpected".into()),
-                StatusCode::INTERNAL_SERVER_ERROR,
             ),
         ];
 
