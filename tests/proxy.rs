@@ -310,12 +310,24 @@ async fn running_router_uses_snapshot_until_recreated() {
     .await;
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("config.yaml");
-    let original = config(&url, Protocol::Responses);
-    original.save(&path).unwrap();
+    let original = format!(
+        r#"version: 1
+server:
+  listen: "127.0.0.1:0"
+default_route:
+  provider: one
+providers:
+  - id: one
+    name: One
+    protocol: responses
+    base_url: "{url}/v1"
+    api_key: secret-credential-123
+"#
+    );
+    std::fs::write(&path, &original).unwrap();
     let (old, p) = start(server::router(Config::load(&path).unwrap()).unwrap()).await;
-    let mut changed = original.clone();
-    changed.providers[0].api_key = "new-credential".into();
-    changed.save(&path).unwrap();
+    let changed = original.replace("secret-credential-123", "new-credential");
+    std::fs::write(&path, changed).unwrap();
     send(&old, json!({"model":"same","input":"hi"})).await;
     let (new, n) = start(server::router(Config::load(&path).unwrap()).unwrap()).await;
     send(&new, json!({"model":"same","input":"hi"})).await;

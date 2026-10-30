@@ -1,7 +1,7 @@
 use anyhow::{bail, Context, Result};
 use glob_match::glob_match;
 use serde::{Deserialize, Serialize};
-use std::{collections::HashSet, io::Write, net::SocketAddr, path::Path};
+use std::{collections::HashSet, net::SocketAddr, path::Path};
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -153,27 +153,6 @@ impl Config {
         }
 
         None
-    }
-
-    pub fn save(&self, path: &Path) -> Result<()> {
-        self.validate()?;
-        let parent = path
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or(Path::new("."));
-        let mut temp = tempfile::NamedTempFile::new_in(parent)
-            .context("Cannot create temporary configuration")?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            temp.as_file()
-                .set_permissions(std::fs::Permissions::from_mode(0o600))?;
-        }
-        temp.write_all(serde_saphyr::to_string(self)?.as_bytes())?;
-        temp.as_file().sync_all()?;
-        temp.persist(path)
-            .map_err(|_| anyhow::anyhow!("Cannot replace configuration; original retained"))?;
-        Ok(())
     }
 }
 
