@@ -159,45 +159,27 @@ async fn forward(
     query: Option<&str>,
 ) -> Result<Response, ProxyError> {
     let mut retried = false;
-    let mut attempt_headers = headers.clone();
     let context = build_codex_tool_context_from_request(&input);
-    let mut stable_response_options = None;
+    let mut request_context =
+        request::build_context(provider.protocol, provider, headers, &input, query);
+    let stable_response_options = request_context.response_options(model, streaming);
     loop {
-        let prepared = request::prepare_with_query(
+        let prepared = request::prepare_attempt(
+            &mut request_context,
             input.clone(),
             provider,
-            &attempt_headers,
+            headers,
             &app.config.compat,
             &app.history,
-            query,
         )
         .await?;
-        if !attempt_headers.contains_key("x-opencode-session") {
-            if let Some(session) = prepared.headers.get("x-opencode-session") {
-                attempt_headers.insert("x-opencode-session", session.clone());
-            }
-        }
-        // Conversion uses the original client flags and first attempt's repairs,
-        // even when a retry rectifies the upstream request body.
-        if stable_response_options.is_none() {
-            stable_response_options = Some(response::ResponseOptions {
-                model: model.into(),
-                streaming,
-                late_arguments_repair: prepared.late_arguments_repair,
-                native_compaction: prepared.native_compaction,
-                xai_restore: prepared.xai_restore.clone(),
-            });
-        }
         let attempted = transport::send(app, provider.protocol, &prepared).await;
         match attempted {
             Ok(upstream) => {
-                let options = stable_response_options
-                    .take()
-                    .expect("first attempt prepared response options");
                 return response::handle(
                     upstream,
                     provider.protocol,
-                    options,
+                    stable_response_options,
                     context,
                     app.history.clone(),
                 )

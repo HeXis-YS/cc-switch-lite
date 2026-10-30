@@ -27,12 +27,56 @@ pub struct Prepared {
     pub late_arguments_repair: bool,
     pub native_compaction: bool,
     pub request_is_streaming: bool,
+    #[allow(dead_code)]
     pub(crate) xai_restore: Option<
         std::collections::HashMap<
             String,
             providers::transform_codex_responses_namespace::NamespacedName,
         >,
     >,
+}
+
+pub(crate) struct RequestContext {
+    protocol: Protocol,
+    session: String,
+    session_source: crate::proxy::session::SessionIdSource,
+    generated_session: String,
+    fingerprint: Option<String>,
+    one_m: Option<bool>,
+    native_compaction: bool,
+    xai_restore: Option<
+        std::collections::HashMap<
+            String,
+            providers::transform_codex_responses_namespace::NamespacedName,
+        >,
+    >,
+    endpoint: String,
+    url: String,
+    request_is_streaming: bool,
+    late_arguments_repair: bool,
+    impersonate_claude_code: bool,
+    xai_native: bool,
+}
+
+impl RequestContext {
+    fn client_session(&self) -> Option<&str> {
+        (self.session_source != crate::proxy::session::SessionIdSource::Generated)
+            .then_some(self.session.as_str())
+    }
+
+    pub(crate) fn response_options(
+        &self,
+        model: &str,
+        streaming: bool,
+    ) -> crate::compat::response::ResponseOptions {
+        crate::compat::response::ResponseOptions {
+            model: model.to_owned(),
+            streaming,
+            late_arguments_repair: self.late_arguments_repair,
+            native_compaction: self.native_compaction,
+            xai_restore: self.xai_restore.clone(),
+        }
+    }
 }
 
 pub async fn prepare(
@@ -53,30 +97,84 @@ pub async fn prepare_with_query(
     history: &CodexChatHistoryStore,
     query: Option<&str>,
 ) -> Result<Prepared, ProxyError> {
-    let mut input = normalize_thinking_type(input);
+    let mut context = build_context(provider.protocol, provider, headers, &input, query);
+    prepare_attempt(&mut context, input, provider, headers, global, history).await
+}
+
+pub(crate) fn build_context(
+    protocol: Protocol,
+    provider: &Provider,
+    headers: &HeaderMap,
+    input: &Value,
+    query: Option<&str>,
+) -> RequestContext {
+    let normalized_input = normalize_thinking_type(input.clone());
     let upstream = upstream_provider(provider);
-    let native_compaction = provider.protocol == Protocol::Responses
-        && providers::codex_compaction::is_compaction_request(&input);
-    let mut one_m = false;
-    let impersonate = provider.protocol == Protocol::Messages
-        && provider.compat.meta.impersonate_claude_code == Some(true);
-    let xai_native = provider.protocol == Protocol::Responses
-        && codex::provider_is_xai_native_responses(&upstream);
-    let xai_restore = xai_native
-        .then(|| providers::transform_codex_responses_namespace::namespace_restore_map(&input));
-    let extracted_session = crate::proxy::session::extract_session_id(headers, &input, "codex");
-    let session = extracted_session
-        .client_provided
-        .then_some(extracted_session.session_id.as_str());
-    let fingerprint = if session.is_none()
+    let extracted_session =
+        crate::proxy::session::extract_session_id(headers, &normalized_input, "codex");
+    let session_source = extracted_session.source;
+    let session = extracted_session.session_id;
+    let generated_session = if session_source == crate::proxy::session::SessionIdSource::Generated {
+        session.clone()
+    } else {
+        String::new()
+    };
+    let client_session = (session_source != crate::proxy::session::SessionIdSource::Generated)
+        .then_some(session.as_str());
+    let fingerprint = if client_session.is_none()
         && !headers.contains_key("x-opencode-session")
         && native_session_header(headers).is_none()
     {
-        conversation_fingerprint(&input)
+        conversation_fingerprint(&normalized_input)
     } else {
         None
     };
-    if provider.protocol != Protocol::Messages {
+    let xai_native =
+        protocol == Protocol::Responses && codex::provider_is_xai_native_responses(&upstream);
+    let xai_restore = xai_native.then(|| {
+        providers::transform_codex_responses_namespace::namespace_restore_map(&normalized_input)
+    });
+    let endpoint = effective_endpoint(protocol, query);
+    let url = resolve_upstream_url(
+        protocol,
+        &provider.base_url,
+        provider.compat.meta.is_full_url == Some(true),
+        query,
+    );
+    let request_is_streaming = is_streaming_request(&endpoint, &normalized_input, headers);
+
+    RequestContext {
+        protocol,
+        session,
+        session_source,
+        generated_session,
+        fingerprint,
+        one_m: (protocol != Protocol::Messages).then_some(false),
+        native_compaction: protocol == Protocol::Responses
+            && providers::codex_compaction::is_compaction_request(&normalized_input),
+        xai_restore,
+        endpoint,
+        url,
+        request_is_streaming,
+        late_arguments_repair: protocol == Protocol::Responses && !xai_native,
+        impersonate_claude_code: protocol == Protocol::Messages
+            && provider.compat.meta.impersonate_claude_code == Some(true),
+        xai_native,
+    }
+}
+
+pub(crate) async fn prepare_attempt(
+    context: &mut RequestContext,
+    input: Value,
+    provider: &Provider,
+    headers: &HeaderMap,
+    global: &CompatConfig,
+    history: &CodexChatHistoryStore,
+) -> Result<Prepared, ProxyError> {
+    let mut input = normalize_thinking_type(input);
+    let upstream = upstream_provider(provider);
+    let session = context.client_session().map(str::to_owned);
+    if context.protocol != Protocol::Messages {
         if let Some(model) = input.get("model").and_then(Value::as_str) {
             let stripped = strip_one_m_suffix_for_upstream(model);
             if stripped != model {
@@ -84,7 +182,7 @@ pub async fn prepare_with_query(
             }
         }
     }
-    let mut body = match provider.protocol {
+    let mut body = match context.protocol {
         Protocol::ChatCompletions => {
             let explicit = input
                 .get("prompt_cache_key")
@@ -102,7 +200,7 @@ pub async fn prepare_with_query(
                 &upstream,
                 &mut body,
                 explicit.as_deref(),
-                session,
+                session.as_deref(),
             );
             body
         }
@@ -113,14 +211,19 @@ pub async fn prepare_with_query(
             let mut body = providers::transform_codex_anthropic::responses_request_to_anthropic(
                 input, 128000,
             )?;
-            if let Some(model) = body.get("model").and_then(Value::as_str) {
+            let one_m = if let Some(model) = body.get("model").and_then(Value::as_str) {
                 let stripped = strip_one_m_suffix_for_upstream(model);
                 if stripped != model {
-                    one_m = true;
                     body["model"] = json!(stripped);
+                    true
+                } else {
+                    false
                 }
-            }
-            if impersonate {
+            } else {
+                false
+            };
+            context.one_m.get_or_insert(one_m);
+            if context.impersonate_claude_code {
                 prepend_claude_code_system_prompt(&mut body);
             }
             crate::proxy::cache_injector::inject(
@@ -131,7 +234,7 @@ pub async fn prepare_with_query(
         }
         Protocol::Responses => {
             providers::codex_compaction::prepare_native_third_party_request(&mut input);
-            if xai_native {
+            if context.xai_native {
                 providers::transform_codex_responses_namespace::flatten_request_namespaces(
                     &mut input,
                 )?;
@@ -160,33 +263,188 @@ pub async fn prepare_with_query(
             body = prepare_upstream_request_body(body);
         }
     }
-    let effective_endpoint = effective_endpoint(provider.protocol, query);
-    let url = resolve_upstream_url(
-        provider.protocol,
-        &provider.base_url,
-        provider.compat.meta.is_full_url == Some(true),
-        query,
-    );
     let outbound_headers = prepare_headers(
         provider,
         headers,
-        &body,
-        &url,
-        &effective_endpoint,
-        impersonate,
-        one_m,
-        session,
-        fingerprint.as_deref(),
-        &extracted_session.session_id,
+        &context.url,
+        &context.endpoint,
+        context.impersonate_claude_code,
+        context.one_m.unwrap_or(false),
+        session.as_deref(),
+        context.fingerprint.as_deref(),
+        &context.generated_session,
+        context.request_is_streaming,
     )?;
-    let request_is_streaming = is_streaming_request(&effective_endpoint, &body, headers);
     Ok(Prepared {
         body,
         headers: outbound_headers,
-        url,
-        native_compaction,
-        request_is_streaming,
-        late_arguments_repair: provider.protocol == Protocol::Responses && !xai_native,
-        xai_restore,
+        url: context.url.clone(),
+        native_compaction: context.native_compaction,
+        request_is_streaming: context.request_is_streaming,
+        late_arguments_repair: context.late_arguments_repair,
+        xai_restore: context.xai_restore.clone(),
     })
+}
+
+#[cfg(test)]
+mod request_tests {
+    use super::*;
+    use axum::http::HeaderValue;
+    use serde_json::json;
+
+    fn provider(protocol: Protocol) -> Provider {
+        Provider {
+            id: "opencode".into(),
+            name: "OpenCode".into(),
+            protocol,
+            base_url: "https://opencode.ai/v1".into(),
+            api_key: "test-key".into(),
+            compat: ProviderCompat::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn retry_reuses_stable_url_and_identity_headers_after_media_rectification() {
+        let provider = provider(Protocol::Messages);
+        let mut headers = HeaderMap::new();
+        headers.insert("user-agent", HeaderValue::from_static("codex-client"));
+        let input = json!({
+            "model": "claude-test[1m]",
+            "stream": true,
+            "input": [{
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": "describe"},
+                    {"type": "input_image", "image_url": "https://example.com/image.png"}
+                ]
+            }]
+        });
+        let global = CompatConfig::default();
+        let history = CodexChatHistoryStore::default();
+        let mut context = build_context(
+            provider.protocol,
+            &provider,
+            &headers,
+            &input,
+            Some("trace=two"),
+        );
+        let first = prepare_attempt(
+            &mut context,
+            input.clone(),
+            &provider,
+            &headers,
+            &global,
+            &history,
+        )
+        .await
+        .unwrap();
+        let error = ProxyError::UpstreamError {
+            status: 400,
+            body: Some(json!({"error":{"message":"image input is not supported"}}).to_string()),
+        };
+        let rectified =
+            crate::compat::retry::rectify(provider.protocol, &input, &error, &global.rectifier)
+                .unwrap()
+                .expect("unsupported image input should be rectified");
+        let second = prepare_attempt(
+            &mut context,
+            rectified,
+            &provider,
+            &headers,
+            &global,
+            &history,
+        )
+        .await
+        .unwrap();
+
+        assert_ne!(first.body, second.body);
+        assert!(first
+            .body
+            .to_string()
+            .contains("https://example.com/image.png"));
+        assert!(second.body.to_string().contains("[Unsupported Image]"));
+        assert_eq!(first.url, "https://opencode.ai/v1/messages?trace=two");
+        assert_eq!(first.url, second.url);
+        assert_eq!(first.request_is_streaming, second.request_is_streaming);
+        assert_eq!(first.headers, second.headers);
+        assert_eq!(first.headers["user-agent"], "codex-client");
+        assert_eq!(first.headers["anthropic-beta"], "context-1m-2025-08-07");
+        assert!(!first.headers["x-opencode-session"].is_empty());
+        assert_eq!(
+            first.headers["x-opencode-session"],
+            second.headers["x-opencode-session"]
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_reuses_client_session_and_prompt_cache_identity() {
+        let provider = Provider {
+            id: "kimi".into(),
+            name: "Kimi".into(),
+            protocol: Protocol::ChatCompletions,
+            base_url: "https://api.kimi.com/coding/v1".into(),
+            api_key: "test-key".into(),
+            compat: ProviderCompat::default(),
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "session_id",
+            HeaderValue::from_static("client-session-123456789"),
+        );
+        let input = json!({
+            "model": "kimi-for-coding",
+            "input": [{
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": "describe"},
+                    {"type": "input_image", "image_url": "https://example.com/image.png"}
+                ]
+            }]
+        });
+        let global = CompatConfig::default();
+        let history = CodexChatHistoryStore::default();
+        let mut context = build_context(provider.protocol, &provider, &headers, &input, None);
+        let first = prepare_attempt(
+            &mut context,
+            input.clone(),
+            &provider,
+            &headers,
+            &global,
+            &history,
+        )
+        .await
+        .unwrap();
+        let retry_input = crate::compat::retry::rectify(
+            provider.protocol,
+            &input,
+            &ProxyError::UpstreamError {
+                status: 400,
+                body: Some(json!({"error":{"message":"image input is not supported"}}).to_string()),
+            },
+            &global.rectifier,
+        )
+        .unwrap()
+        .unwrap();
+        let second = prepare_attempt(
+            &mut context,
+            retry_input,
+            &provider,
+            &headers,
+            &global,
+            &history,
+        )
+        .await
+        .unwrap();
+
+        assert_ne!(first.body, second.body);
+        assert_eq!(
+            first.body["prompt_cache_key"],
+            "codex_client-session-123456789"
+        );
+        assert_eq!(
+            first.body["prompt_cache_key"],
+            second.body["prompt_cache_key"]
+        );
+        assert_eq!(first.headers, second.headers);
+    }
 }

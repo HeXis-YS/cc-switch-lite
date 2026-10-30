@@ -5,13 +5,11 @@ use crate::{
     proxy::error::ProxyError,
 };
 use axum::http::{self, HeaderMap, HeaderValue};
-use serde_json::Value;
 // The adapter supplies the original forwarder locals without changing header order.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn prepare_headers(
     provider: &Provider,
     headers: &HeaderMap,
-    body: &Value,
     url: &str,
     effective_endpoint: &str,
     codex_impersonate_claude_code: bool,
@@ -19,6 +17,7 @@ pub(super) fn prepare_headers(
     session: Option<&str>,
     fingerprint: Option<&str>,
     generated_session: &str,
+    request_is_streaming: bool,
 ) -> Result<HeaderMap, ProxyError> {
     let codex_responses_to_anthropic = provider.protocol == Protocol::Messages;
     let codex_responses_to_chat = provider.protocol == Protocol::ChatCompletions;
@@ -28,9 +27,8 @@ pub(super) fn prepare_headers(
     let is_copilot = false;
     let copilot_fingerprint_headers: &[&str] = &[];
     let should_send_anthropic_headers = false;
-    let force_identity_encoding = codex_responses_to_chat
-        || codex_responses_to_anthropic
-        || is_streaming_request(effective_endpoint, body, headers);
+    let force_identity_encoding =
+        codex_responses_to_chat || codex_responses_to_anthropic || request_is_streaming;
     let upstream_host = url
         .parse::<http::Uri>()
         .ok()
