@@ -17,7 +17,7 @@ use forwarder::*;
 
 mod headers;
 mod provider;
-use headers::prepare_headers;
+use headers::{prepare_headers, HeaderSource};
 pub use provider::{upstream_provider, CompatMeta, ProviderCompat};
 
 pub struct Prepared {
@@ -50,7 +50,6 @@ pub(crate) struct RequestContext {
             providers::transform_codex_responses_namespace::NamespacedName,
         >,
     >,
-    endpoint: String,
     url: String,
     request_is_streaming: bool,
     late_arguments_repair: bool,
@@ -153,7 +152,6 @@ pub(crate) fn build_context(
         native_compaction: protocol == Protocol::Responses
             && providers::codex_compaction::is_compaction_request(&normalized_input),
         xai_restore,
-        endpoint,
         url,
         request_is_streaming,
         late_arguments_repair: protocol == Protocol::Responses && !xai_native,
@@ -263,18 +261,17 @@ pub(crate) async fn prepare_attempt(
             body = prepare_upstream_request_body(body);
         }
     }
-    let outbound_headers = prepare_headers(
+    let outbound_headers = prepare_headers(HeaderSource {
         provider,
         headers,
-        &context.url,
-        &context.endpoint,
-        context.impersonate_claude_code,
-        context.one_m.unwrap_or(false),
-        session.as_deref(),
-        context.fingerprint.as_deref(),
-        &context.generated_session,
-        context.request_is_streaming,
-    )?;
+        url: &context.url,
+        impersonate_claude_code: context.impersonate_claude_code,
+        anthropic_one_m: context.one_m.unwrap_or(false),
+        session: session.as_deref(),
+        fingerprint: context.fingerprint.as_deref(),
+        generated_session: &context.generated_session,
+        request_is_streaming: context.request_is_streaming,
+    })?;
     Ok(Prepared {
         body,
         headers: outbound_headers,

@@ -5,28 +5,32 @@ use crate::{
     proxy::error::ProxyError,
 };
 use axum::http::{self, HeaderMap, HeaderValue};
-// The adapter supplies the original forwarder locals without changing header order.
-#[allow(clippy::too_many_arguments)]
-pub(super) fn prepare_headers(
-    provider: &Provider,
-    headers: &HeaderMap,
-    url: &str,
-    effective_endpoint: &str,
-    codex_impersonate_claude_code: bool,
-    codex_anthropic_one_m: bool,
-    session: Option<&str>,
-    fingerprint: Option<&str>,
-    generated_session: &str,
-    request_is_streaming: bool,
-) -> Result<HeaderMap, ProxyError> {
+pub(super) struct HeaderSource<'a> {
+    pub provider: &'a Provider,
+    pub headers: &'a HeaderMap,
+    pub url: &'a str,
+    pub impersonate_claude_code: bool,
+    pub anthropic_one_m: bool,
+    pub session: Option<&'a str>,
+    pub fingerprint: Option<&'a str>,
+    pub generated_session: &'a str,
+    pub request_is_streaming: bool,
+}
+
+pub(super) fn prepare_headers(source: HeaderSource<'_>) -> Result<HeaderMap, ProxyError> {
+    let HeaderSource {
+        provider,
+        headers,
+        url,
+        impersonate_claude_code: codex_impersonate_claude_code,
+        anthropic_one_m: codex_anthropic_one_m,
+        session,
+        fingerprint,
+        generated_session,
+        request_is_streaming,
+    } = source;
     let codex_responses_to_anthropic = provider.protocol == Protocol::Messages;
     let codex_responses_to_chat = provider.protocol == Protocol::ChatCompletions;
-    // Scope bindings: API-key routing has no official-login, stack or Copilot branch.
-    let codex_official_auth_passthrough = false;
-    let codex_stack_request = false;
-    let is_copilot = false;
-    let copilot_fingerprint_headers: &[&str] = &[];
-    let should_send_anthropic_headers = false;
     let force_identity_encoding =
         codex_responses_to_chat || codex_responses_to_anthropic || request_is_streaming;
     let upstream_host = url
@@ -100,7 +104,6 @@ pub(super) fn prepare_headers(
     let mut saw_accept = false;
     let mut saw_user_agent = false;
     let mut saw_anthropic_beta = false;
-    let mut saw_anthropic_version = false;
 
     for (key, value) in headers {
         let key_str = key.as_str();
@@ -154,16 +157,6 @@ pub(super) fn prepare_headers(
             || key_str.eq_ignore_ascii_case("x-api-key")
             || key_str.eq_ignore_ascii_case("x-goog-api-key")
         {
-            // Codex official account cards deliberately keep credentials
-            // out of provider storage. `requires_openai_auth = true` makes
-            // Codex send the active ChatGPT authorization, which must reach
-            // the official upstream unchanged. Other credential headers
-            // are still discarded.
-            if codex_official_auth_passthrough && key_str.eq_ignore_ascii_case("authorization") {
-                saw_auth = true;
-                ordered_headers.append(key.clone(), value.clone());
-                continue;
-            }
             if !saw_auth {
                 saw_auth = true;
                 for (ah_name, ah_value) in &auth_headers {
@@ -178,24 +171,8 @@ pub(super) fn prepare_headers(
             continue;
         }
 
-        // --- Codex/OpenAI fingerprint headers — never leak to an Anthropic upstream ---
-        // These are client/session identifiers from the incoming Codex request,
-        // not Anthropic protocol headers. Forwarding them both leaks identity and
-        // can defeat strict gateway fingerprint checks.
-        // The full set lives in `is_codex_client_fingerprint_header` so it stays in one
-        // place. (HeaderName is lowercased by the http crate, so a direct match is safe.)
-        // Codex Stack 请求发往第三方时同样剥掉：官方做路由时 Codex 每个请求都带着 ChatGPT
-        // 身份（`chatgpt-account-id` 等），它们只能发往官方上游。Stack 目标不会是官方账号，
-        // 这里仍按上游判断，防止以后放宽。只限 Codex：Claude Code 自己的 `x-stainless-*`
-        // 是 Anthropic SDK 的正常请求头，Stack 请求照常转发。
-        if should_strip_codex_client_fingerprint_header(
-            key_str,
-            effective_endpoint,
-            codex_responses_to_anthropic,
-            codex_responses_to_chat,
-            codex_stack_request,
-            codex_official_auth_passthrough,
-        ) {
+        // --- Codex/OpenAI fingerprint headers are not Anthropic protocol headers. ---
+        if should_strip_codex_client_fingerprint_header(key_str, codex_responses_to_anthropic) {
             continue;
         }
 
@@ -232,7 +209,7 @@ pub(super) fn prepare_headers(
         }
 
         // --- user-agent: provider-level override for local proxy routing ---
-        if !is_copilot && key_str.eq_ignore_ascii_case("user-agent") {
+        if key_str.eq_ignore_ascii_case("user-agent") {
             if !saw_user_agent {
                 saw_user_agent = true;
                 if let Some(ref ua) = custom_user_agent {
@@ -257,20 +234,8 @@ pub(super) fn prepare_headers(
             continue;
         }
 
-        // --- anthropic-version — 透传客户端值 ---
+        // Client-supplied versions are replaced by the default on the Messages path.
         if key_str.eq_ignore_ascii_case("anthropic-version") {
-            if should_send_anthropic_headers {
-                saw_anthropic_version = true;
-                ordered_headers.append(key.clone(), value.clone());
-            }
-            continue;
-        }
-
-        // --- Copilot 指纹头 — 跳过（由 auth_headers 提供） ---
-        if copilot_fingerprint_headers
-            .iter()
-            .any(|h| key_str.eq_ignore_ascii_case(h))
-        {
             continue;
         }
 
@@ -324,12 +289,8 @@ pub(super) fn prepare_headers(
         }
     }
 
-    // anthropic-version: add the default only when it is missing.
-    // The Codex→Anthropic path also needs this header. Note this is independent
-    // of anthropic-beta: the Claude Code-specific beta is only sent when
-    // impersonation is on (handled above); on the plain Codex→Anthropic path
-    // (impersonation off) anthropic-version is still required but no beta is sent.
-    if (should_send_anthropic_headers || codex_responses_to_anthropic) && !saw_anthropic_version {
+    // The Messages path always sends the protocol default, independently of beta headers.
+    if codex_responses_to_anthropic {
         ordered_headers.append(
             "anthropic-version",
             http::HeaderValue::from_static("2023-06-01"),

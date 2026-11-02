@@ -386,17 +386,6 @@ pub fn is_origin_only_url(value: &str) -> bool {
     }
 }
 
-pub fn is_codex_responses_endpoint(endpoint: &str) -> bool {
-    let path = endpoint
-        .split_once('?')
-        .map_or(endpoint, |(path, _query)| path);
-
-    matches!(
-        path,
-        "/responses" | "/v1/responses" | "/responses/compact" | "/v1/responses/compact"
-    )
-}
-
 pub fn extract_codex_base_url_from_toml(config_text: &str) -> Option<String> {
     let doc = config_text.parse::<toml::Value>().ok()?;
 

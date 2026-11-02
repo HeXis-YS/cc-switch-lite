@@ -124,24 +124,9 @@ pub(super) fn is_codex_client_fingerprint_header(key_str: &str) -> bool {
 
 pub(super) fn should_strip_codex_client_fingerprint_header(
     key_str: &str,
-    endpoint: &str,
     codex_responses_to_anthropic: bool,
-    codex_responses_to_chat: bool,
-    codex_stack_request: bool,
-    codex_official_auth_passthrough: bool,
 ) -> bool {
-    if codex_responses_to_anthropic {
-        return is_codex_client_fingerprint_header(key_str);
-    }
-
-    if codex_stack_request && !codex_official_auth_passthrough {
-        let native_third_party_responses =
-            !codex_responses_to_chat && super::codex::is_codex_responses_endpoint(endpoint);
-        return is_codex_client_fingerprint_header(key_str)
-            && !(native_third_party_responses && key_str == "x-codex-beta-features");
-    }
-
-    false
+    codex_responses_to_anthropic && is_codex_client_fingerprint_header(key_str)
 }
 
 pub(super) fn is_streaming_request(
