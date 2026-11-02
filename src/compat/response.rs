@@ -6,6 +6,7 @@ use crate::{
     proxy::{
         content_encoding::{decompress_body_with_limit, get_content_encoding, DecompressError},
         error::ProxyError,
+        mime::{is_json_mime, is_sse_mime},
         providers::{
             anthropic_sse_tail::repair_anthropic_sse_tail,
             codex_chat_history::{record_responses_sse_stream, CodexChatHistoryStore},
@@ -124,16 +125,8 @@ pub(crate) async fn handle(
     let content_type = headers
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok());
-    let is_sse = content_type.is_some_and(|v| v.contains("text/event-stream"));
-    let is_json = content_type.is_some_and(|v| {
-        let mime = v
-            .split(';')
-            .next()
-            .unwrap_or("")
-            .trim()
-            .to_ascii_lowercase();
-        mime == "application/json" || mime.ends_with("+json")
-    });
+    let is_sse = is_sse_mime(content_type);
+    let is_json = is_json_mime(content_type);
     if protocol == Protocol::Responses {
         if status.is_success() && is_sse {
             if options.native_compaction {

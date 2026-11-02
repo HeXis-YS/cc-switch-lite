@@ -4,6 +4,7 @@ pub mod content_encoding;
 pub mod error;
 pub mod json_canonical;
 pub mod media_sanitizer;
+pub(crate) mod mime;
 pub mod opaque_state_rectifier;
 pub mod providers;
 pub mod session;

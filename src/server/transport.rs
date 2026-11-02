@@ -3,7 +3,9 @@ use super::App;
 use crate::{
     compat::{request, response, retry},
     config::Protocol,
-    proxy::{error::ProxyError, opaque_state_rectifier::carries_encrypted_agent_task},
+    proxy::{
+        error::ProxyError, mime::is_json_mime, opaque_state_rectifier::carries_encrypted_agent_task,
+    },
 };
 pub(super) async fn send(
     app: &App,
@@ -51,19 +53,12 @@ pub(super) async fn send(
             body: String::from_utf8(bytes.to_vec()).ok(),
         });
     }
-    let is_json = upstream
-        .headers()
-        .get("content-type")
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|v| {
-            let mime = v
-                .split(';')
-                .next()
-                .unwrap_or("")
-                .trim()
-                .to_ascii_lowercase();
-            mime == "application/json" || mime.ends_with("+json")
-        });
+    let is_json = is_json_mime(
+        upstream
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok()),
+    );
     if protocol == Protocol::Messages && (!prepared.request_is_streaming || is_json) {
         let (headers, status, bytes) = response::decode_response(upstream).await?;
         retry::validate_anthropic_body(&bytes)?;

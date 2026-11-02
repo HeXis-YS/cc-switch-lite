@@ -1,5 +1,6 @@
 //! Credential boundary: preserve bytes unless an actual configured secret occurs.
 //! JSON and SSE are scrubbed after parsing, so escaped strings remain valid JSON.
+use crate::proxy::mime::is_sse_mime;
 use axum::{
     body::{to_bytes, Body},
     http::header,
@@ -107,11 +108,12 @@ pub async fn protect(response: Response, secrets: Vec<String>) -> Response {
         }
     }
     parts.headers.remove(header::CONTENT_LENGTH);
-    let sse = parts
-        .headers
-        .get(header::CONTENT_TYPE)
-        .and_then(|h| h.to_str().ok())
-        .is_some_and(|s| s.contains("text/event-stream"));
+    let sse = is_sse_mime(
+        parts
+            .headers
+            .get(header::CONTENT_TYPE)
+            .and_then(|h| h.to_str().ok()),
+    );
     if sse {
         let stream = async_stream::stream! {
          let mut source=body.into_data_stream();let mut pending=String::new();let mut remainder=Vec::new();
