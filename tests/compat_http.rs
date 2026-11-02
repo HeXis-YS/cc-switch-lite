@@ -426,6 +426,35 @@ async fn unmarked_sse_bodies_are_aggregated_in_both_transformed_protocols() {
         assert_eq!(value["output"][0]["content"][0]["text"], "hello");
     }
 }
+
+#[tokio::test]
+async fn messages_stream_with_complete_open_tool_input_repairs_missing_terminal_events() {
+    let messages = concat!(
+        "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_tail\",\"model\":\"compat-test-model\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\n",
+        "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_tail\",\"name\":\"weather\",\"input\":{}}}\n\n",
+        "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"city\\\":\\\"Tokyo\\\"}\"}}\n\n"
+    );
+    let fixture = Fixture::new(
+        Protocol::Messages,
+        vec![Reply::new(
+            StatusCode::OK,
+            Some("text/event-stream"),
+            messages,
+        )],
+        |_| {},
+    )
+    .await;
+
+    let response = fixture.send(input(true)).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.text().await.unwrap();
+    assert!(body.contains("event: response.function_call_arguments.done"));
+    assert!(body.contains("event: response.output_item.done"));
+    assert!(body.contains("Tokyo"));
+    assert!(body.contains("event: response.completed"));
+    assert!(!body.contains("event: response.incomplete"));
+}
+
 #[tokio::test]
 async fn compressed_success_and_error_bodies_are_decoded_before_conversion() {
     let fixture = Fixture::new(

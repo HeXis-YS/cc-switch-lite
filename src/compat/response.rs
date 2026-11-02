@@ -7,6 +7,7 @@ use crate::{
         content_encoding::{decompress_body_with_limit, get_content_encoding, DecompressError},
         error::ProxyError,
         providers::{
+            anthropic_sse_tail::repair_anthropic_sse_tail,
             codex_chat_history::{record_responses_sse_stream, CodexChatHistoryStore},
             responses_late_arguments::create_late_arguments_repair_stream,
             streaming_codex_anthropic::{
@@ -210,6 +211,7 @@ pub(crate) async fn handle(
                 history,
             ))
         } else {
+            let source = repair_anthropic_sse_tail(source);
             Body::from_stream(create_responses_sse_stream_from_anthropic_with_context(
                 source, context,
             ))
