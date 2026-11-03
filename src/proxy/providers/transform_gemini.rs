@@ -530,8 +530,10 @@ fn convert_messages_to_contents(
         };
 
         if role == "assistant" && requires_thought_signatures {
-            for part in &parts {
-                if part.get("functionCall").is_some() && !has_thought_signature(part) {
+            if let Some(first_function_call) =
+                parts.iter().find(|part| part.get("functionCall").is_some())
+            {
+                if !has_thought_signature(first_function_call) {
                     return Err(ProxyError::InvalidRequest(
                         "Gemini 3+ requires a stored thought signature for prior function calls"
                             .to_string(),
@@ -2848,6 +2850,48 @@ mod tests {
             result["generationConfig"]["responseJsonSchema"]["required"],
             json!(["ok"])
         );
+    }
+
+    #[test]
+    fn gemini_3_parallel_calls_only_require_first_call_signature() {
+        let store = GeminiShadowStore::with_limits(8, 4);
+        let expected_parts = json!([
+            {
+                "functionCall": {"id": "call_1", "name": "first", "args": {}},
+                "thoughtSignature": "sig-first"
+            },
+            {"functionCall": {"id": "call_2", "name": "second", "args": {}}},
+            {"functionCall": {"id": "call_3", "name": "third", "args": {}}}
+        ]);
+        store.record_assistant_turn(
+            "prov",
+            "sess",
+            json!({"parts": expected_parts.clone()}),
+            vec![GeminiToolCallMeta::new(
+                Some("call_1"),
+                "first",
+                json!({}),
+                Some("sig-first"),
+            )],
+        );
+
+        let input = json!({
+            "model": "gemini-3.1-pro",
+            "messages": [{
+                "role": "assistant",
+                "content": [
+                    {"type": "tool_use", "id": "call_1", "name": "first", "input": {}},
+                    {"type": "tool_use", "id": "call_2", "name": "second", "input": {}},
+                    {"type": "tool_use", "id": "call_3", "name": "third", "input": {}}
+                ]
+            }]
+        });
+
+        let result =
+            anthropic_to_gemini_with_shadow(input, Some(&store), Some("prov"), Some("sess"))
+                .unwrap();
+
+        assert_eq!(result["contents"][0]["parts"], expected_parts);
     }
 
     #[test]
