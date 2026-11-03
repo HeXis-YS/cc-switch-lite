@@ -4,7 +4,9 @@ use crate::{
     compat::{request, response, retry},
     config::Protocol,
     proxy::{
-        error::ProxyError, mime::is_json_mime, opaque_state_rectifier::carries_encrypted_agent_task,
+        error::ProxyError,
+        mime::{is_json_mime, is_sse_mime},
+        opaque_state_rectifier::carries_encrypted_agent_task,
     },
 };
 pub(super) async fn send(
@@ -59,6 +61,20 @@ pub(super) async fn send(
             .get("content-type")
             .and_then(|v| v.to_str().ok()),
     );
+    let is_sse = is_sse_mime(
+        upstream
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok()),
+    );
+    if protocol == Protocol::GeminiNative && (!prepared.request_is_streaming || !is_sse) {
+        let (headers, status, bytes) = response::decode_response(upstream).await?;
+        retry::validate_gemini_body(&bytes)?;
+        let mut response = http::Response::new(bytes);
+        *response.status_mut() = status;
+        *response.headers_mut() = headers;
+        return Ok(response.into());
+    }
     if protocol == Protocol::Messages && (!prepared.request_is_streaming || is_json) {
         let (headers, status, bytes) = response::decode_response(upstream).await?;
         retry::validate_anthropic_body(&bytes)?;

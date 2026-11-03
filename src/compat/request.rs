@@ -5,7 +5,10 @@ use super::CompatConfig;
 use crate::config::{Protocol, Provider};
 use crate::proxy::{
     error::ProxyError,
-    providers::{self, codex_chat_history::CodexChatHistoryStore},
+    providers::{
+        self, codex_chat_history::CodexChatHistoryStore, gemini_shadow::GeminiShadowStore,
+        transform_gemini::AnthropicToolSchemaHints,
+    },
 };
 use axum::http::HeaderMap;
 use serde_json::{json, Value};
@@ -18,7 +21,7 @@ use forwarder::*;
 mod headers;
 mod provider;
 use headers::{prepare_headers, HeaderSource};
-pub use provider::{upstream_provider, CompatMeta, ProviderCompat};
+pub use provider::{upstream_provider, CompatMeta, GeminiCompat, GeminiThinking, ProviderCompat};
 
 pub struct Prepared {
     pub body: Value,
@@ -34,6 +37,7 @@ pub struct Prepared {
             providers::transform_codex_responses_namespace::NamespacedName,
         >,
     >,
+    pub(crate) gemini_tool_schema_hints: Option<AnthropicToolSchemaHints>,
 }
 
 pub(crate) struct RequestContext {
@@ -55,6 +59,9 @@ pub(crate) struct RequestContext {
     late_arguments_repair: bool,
     impersonate_claude_code: bool,
     xai_native: bool,
+    gemini_provider_id: Option<String>,
+    gemini_session_id: Option<String>,
+    gemini_tool_schema_hints: Option<AnthropicToolSchemaHints>,
 }
 
 impl RequestContext {
@@ -70,10 +77,14 @@ impl RequestContext {
     ) -> crate::compat::response::ResponseOptions {
         crate::compat::response::ResponseOptions {
             model: model.to_owned(),
-            streaming,
+            streaming: streaming
+                || (self.protocol == Protocol::GeminiNative && self.request_is_streaming),
             late_arguments_repair: self.late_arguments_repair,
             native_compaction: self.native_compaction,
             xai_restore: self.xai_restore.clone(),
+            gemini_provider_id: self.gemini_provider_id.clone(),
+            gemini_session_id: self.gemini_session_id.clone(),
+            gemini_tool_schema_hints: self.gemini_tool_schema_hints.clone(),
         }
     }
 }
@@ -97,7 +108,17 @@ pub async fn prepare_with_query(
     query: Option<&str>,
 ) -> Result<Prepared, ProxyError> {
     let mut context = build_context(provider.protocol, provider, headers, &input, query);
-    prepare_attempt(&mut context, input, provider, headers, global, history).await
+    let shadow = GeminiShadowStore::default();
+    prepare_attempt(
+        &mut context,
+        input,
+        provider,
+        headers,
+        global,
+        history,
+        Some(&shadow),
+    )
+    .await
 }
 
 pub(crate) fn build_context(
@@ -124,7 +145,11 @@ pub(crate) fn build_context(
         && !headers.contains_key("x-opencode-session")
         && native_session_header(headers).is_none()
     {
-        conversation_fingerprint(&normalized_input)
+        if protocol == Protocol::GeminiNative {
+            gemini_conversation_fingerprint(&normalized_input)
+        } else {
+            conversation_fingerprint(&normalized_input)
+        }
     } else {
         None
     };
@@ -133,14 +158,58 @@ pub(crate) fn build_context(
     let xai_restore = xai_native.then(|| {
         providers::transform_codex_responses_namespace::namespace_restore_map(&normalized_input)
     });
-    let endpoint = effective_endpoint(protocol, query);
-    let url = resolve_upstream_url(
-        protocol,
-        &provider.base_url,
-        provider.compat.meta.is_full_url == Some(true),
-        query,
-    );
-    let request_is_streaming = is_streaming_request(&endpoint, &normalized_input, headers);
+    let request_is_streaming = if protocol == Protocol::GeminiNative {
+        // The client query is ignored for Gemini. Streaming is selected from the
+        // Responses body/header, then the canonical endpoint adds only alt=sse.
+        is_streaming_request("/generateContent", &normalized_input, headers)
+    } else {
+        let endpoint = effective_endpoint(protocol, query);
+        is_streaming_request(&endpoint, &normalized_input, headers)
+    };
+    let url = if protocol == Protocol::GeminiNative {
+        let model = normalized_input
+            .get("model")
+            .and_then(Value::as_str)
+            .map(strip_one_m_suffix_for_upstream)
+            .map(crate::proxy::gemini_url::normalize_gemini_model_id)
+            .unwrap_or("");
+        let method = if request_is_streaming {
+            "streamGenerateContent"
+        } else {
+            "generateContent"
+        };
+        let endpoint = if request_is_streaming {
+            format!("/v1beta/models/{model}:{method}?alt=sse")
+        } else {
+            format!("/v1beta/models/{model}:{method}")
+        };
+        crate::proxy::gemini_url::resolve_gemini_native_url(
+            &provider.base_url,
+            &endpoint,
+            provider.compat.meta.is_full_url == Some(true),
+        )
+    } else {
+        resolve_upstream_url(
+            protocol,
+            &provider.base_url,
+            provider.compat.meta.is_full_url == Some(true),
+            query,
+        )
+    };
+    let opencode_session = headers
+        .get("x-opencode-session")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let gemini_session_id = if protocol == Protocol::GeminiNative {
+        client_session
+            .or(opencode_session)
+            .or_else(|| native_session_header(headers))
+            .or(fingerprint.as_deref())
+            .map(ToOwned::to_owned)
+    } else {
+        None
+    };
 
     RequestContext {
         protocol,
@@ -158,6 +227,9 @@ pub(crate) fn build_context(
         impersonate_claude_code: protocol == Protocol::Messages
             && provider.compat.meta.impersonate_claude_code == Some(true),
         xai_native,
+        gemini_provider_id: (protocol == Protocol::GeminiNative).then(|| provider.id.clone()),
+        gemini_session_id,
+        gemini_tool_schema_hints: None,
     }
 }
 
@@ -168,6 +240,7 @@ pub(crate) async fn prepare_attempt(
     headers: &HeaderMap,
     global: &CompatConfig,
     history: &CodexChatHistoryStore,
+    gemini_shadow: Option<&GeminiShadowStore>,
 ) -> Result<Prepared, ProxyError> {
     let mut input = normalize_thinking_type(input);
     let upstream = upstream_provider(provider);
@@ -230,6 +303,55 @@ pub(crate) async fn prepare_attempt(
             );
             body
         }
+        Protocol::GeminiNative => {
+            let max_output_tokens_was_set = input
+                .get("max_output_tokens")
+                .and_then(Value::as_u64)
+                .is_some_and(|value| value > 0)
+                || provider
+                    .compat
+                    .meta
+                    .max_output_tokens
+                    .is_some_and(|value| value > 0);
+            if let Some(max) = provider.compat.meta.max_output_tokens.filter(|v| *v > 0) {
+                input["max_output_tokens"] = json!(max);
+            }
+            let model = input
+                .get("model")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let reasoning_effort = input
+                .pointer("/reasoning/effort")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned);
+            let anthropic = providers::transform_codex_anthropic::responses_request_to_anthropic(
+                input.clone(),
+                128000,
+            )?;
+            let tool_schema_hints =
+                providers::transform_gemini::extract_anthropic_tool_schema_hints(&anthropic);
+            let mut body =
+                providers::transform_gemini::anthropic_to_gemini_with_shadow_and_options(
+                    anthropic,
+                    gemini_shadow,
+                    context.gemini_provider_id.as_deref(),
+                    context.gemini_session_id.as_deref(),
+                    provider.compat.gemini.thought_signature_replay,
+                )?;
+            if !max_output_tokens_was_set {
+                omit_implicit_gemini_max_output_tokens(&mut body);
+            }
+            copy_responses_sampling_parameters(&mut body, &input);
+            apply_gemini_thinking_level(
+                &mut body,
+                &model,
+                reasoning_effort.as_deref(),
+                &provider.compat.gemini,
+            )?;
+            context.gemini_tool_schema_hints = Some(tool_schema_hints.clone());
+            body
+        }
         Protocol::Responses => {
             providers::codex_compaction::prepare_native_third_party_request(&mut input);
             if context.xai_native {
@@ -280,7 +402,65 @@ pub(crate) async fn prepare_attempt(
         request_is_streaming: context.request_is_streaming,
         late_arguments_repair: context.late_arguments_repair,
         xai_restore: context.xai_restore.clone(),
+        gemini_tool_schema_hints: context.gemini_tool_schema_hints.clone(),
     })
+}
+
+fn omit_implicit_gemini_max_output_tokens(body: &mut Value) {
+    // The Anthropic bridge requires max_tokens and supplies 128000 when the
+    // Responses request omits max_output_tokens. Gemini's field is optional
+    // and model-specific, so that bridge default must not become an upstream
+    // limit that may exceed the selected Gemini model's capacity.
+    let remove_generation_config = body
+        .get_mut("generationConfig")
+        .and_then(Value::as_object_mut)
+        .is_some_and(|config| {
+            config.remove("maxOutputTokens");
+            config.is_empty()
+        });
+    if remove_generation_config {
+        if let Some(object) = body.as_object_mut() {
+            object.remove("generationConfig");
+        }
+    }
+}
+
+fn copy_responses_sampling_parameters(gemini_body: &mut Value, responses_body: &Value) {
+    for (source, target) in [("temperature", "temperature"), ("top_p", "topP")] {
+        if let Some(value) = responses_body.get(source) {
+            gemini_body["generationConfig"][target] = value.clone();
+        }
+    }
+}
+
+fn apply_gemini_thinking_level(
+    gemini_body: &mut Value,
+    model: &str,
+    effort: Option<&str>,
+    compat: &GeminiCompat,
+) -> Result<(), ProxyError> {
+    if compat.thinking != GeminiThinking::Auto
+        || !crate::proxy::providers::transform_gemini::supports_gemini_thinking_level(model)
+    {
+        return Ok(());
+    }
+    let Some(effort) = effort.map(str::trim).filter(|effort| !effort.is_empty()) else {
+        return Ok(());
+    };
+    let level = match effort.to_ascii_lowercase().as_str() {
+        "minimal" => "MINIMAL",
+        "low" => "LOW",
+        "medium" => "MEDIUM",
+        "high" | "xhigh" | "max" | "ultra" => "HIGH",
+        "none" | "off" | "disabled" => return Ok(()),
+        _ => {
+            return Err(ProxyError::InvalidRequest(format!(
+                "Unsupported reasoning.effort for Gemini: {effort}"
+            )))
+        }
+    };
+    gemini_body["generationConfig"]["thinkingConfig"] = json!({ "thinkingLevel": level });
+    Ok(())
 }
 
 #[cfg(test)]
@@ -332,6 +512,7 @@ mod request_tests {
             &headers,
             &global,
             &history,
+            None,
         )
         .await
         .unwrap();
@@ -350,6 +531,7 @@ mod request_tests {
             &headers,
             &global,
             &history,
+            None,
         )
         .await
         .unwrap();
@@ -408,6 +590,7 @@ mod request_tests {
             &headers,
             &global,
             &history,
+            None,
         )
         .await
         .unwrap();
@@ -429,6 +612,7 @@ mod request_tests {
             &headers,
             &global,
             &history,
+            None,
         )
         .await
         .unwrap();
@@ -443,5 +627,196 @@ mod request_tests {
             second.body["prompt_cache_key"]
         );
         assert_eq!(first.headers, second.headers);
+    }
+
+    #[tokio::test]
+    async fn gemini_omits_bridge_default_but_keeps_explicit_output_limits() {
+        let provider = provider(Protocol::GeminiNative);
+        let headers = HeaderMap::new();
+        let global = CompatConfig::default();
+        let history = CodexChatHistoryStore::default();
+
+        let prepare_body = |max_output_tokens| {
+            let mut input = json!({
+                "model": "gemini-2.5-flash",
+                "input": "hello"
+            });
+            if let Some(value) = max_output_tokens {
+                input["max_output_tokens"] = json!(value);
+            }
+            input
+        };
+
+        let mut implicit_context = build_context(
+            provider.protocol,
+            &provider,
+            &headers,
+            &prepare_body(None),
+            None,
+        );
+        let implicit = prepare_attempt(
+            &mut implicit_context,
+            prepare_body(None),
+            &provider,
+            &headers,
+            &global,
+            &history,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(implicit.body["generationConfig"]
+            .get("maxOutputTokens")
+            .is_none());
+
+        let mut explicit_context = build_context(
+            provider.protocol,
+            &provider,
+            &headers,
+            &prepare_body(Some(8192)),
+            None,
+        );
+        let explicit = prepare_attempt(
+            &mut explicit_context,
+            prepare_body(Some(8192)),
+            &provider,
+            &headers,
+            &global,
+            &history,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(explicit.body["generationConfig"]["maxOutputTokens"], 8192);
+    }
+
+    #[tokio::test]
+    async fn gemini_media_retry_reuses_endpoint_session_headers_and_generation_options() {
+        let mut provider = provider(Protocol::GeminiNative);
+        provider.base_url = "https://generativelanguage.googleapis.com/v1beta".into();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "session-id",
+            HeaderValue::from_static("client-session-12345678901234567890"),
+        );
+        headers.insert(
+            "authorization",
+            HeaderValue::from_static("Bearer client-credential"),
+        );
+        headers.insert("x-api-key", HeaderValue::from_static("client-api-key"));
+        headers.insert(
+            "x-goog-api-key",
+            HeaderValue::from_static("client-google-key"),
+        );
+        let input = json!({
+            "model": "gemini-2.5-flash",
+            "stream": true,
+            "max_output_tokens": 512,
+            "temperature": 0.2,
+            "top_p": 0.7,
+            "input": [{
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": "describe"},
+                    {"type": "input_image", "image_url": "data:image/png;base64,aGVsbG8="}
+                ]
+            }]
+        });
+        let global = CompatConfig::default();
+        let history = CodexChatHistoryStore::default();
+        let shadow = GeminiShadowStore::default();
+        let mut context = build_context(
+            provider.protocol,
+            &provider,
+            &headers,
+            &input,
+            Some("alt=client-value&trace=client"),
+        );
+        let session = context.gemini_session_id.clone();
+        let first = prepare_attempt(
+            &mut context,
+            input.clone(),
+            &provider,
+            &headers,
+            &global,
+            &history,
+            Some(&shadow),
+        )
+        .await
+        .unwrap();
+
+        let error = ProxyError::UpstreamError {
+            status: 400,
+            body: Some(
+                json!({"error":{"message":"This model does not support image input"}}).to_string(),
+            ),
+        };
+        let rectified =
+            crate::compat::retry::rectify(provider.protocol, &input, &error, &global.rectifier)
+                .unwrap()
+                .expect("unsupported image input should be rectified");
+        let second = prepare_attempt(
+            &mut context,
+            rectified,
+            &provider,
+            &headers,
+            &global,
+            &history,
+            Some(&shadow),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            first.url,
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:streamGenerateContent?alt=sse"
+        );
+        assert_eq!(first.url, second.url);
+        assert!(first.request_is_streaming);
+        assert_eq!(first.request_is_streaming, second.request_is_streaming);
+        assert_eq!(first.headers, second.headers);
+        assert_eq!(first.headers["x-goog-api-key"], "test-key");
+        assert!(!first.headers.contains_key("authorization"));
+        assert!(!first.headers.contains_key("x-api-key"));
+        assert_eq!(context.gemini_session_id, session);
+        assert_ne!(first.body, second.body);
+        assert_eq!(
+            first.body["generationConfig"],
+            second.body["generationConfig"]
+        );
+        assert!(first.body.to_string().contains("inlineData"));
+        assert!(second.body.to_string().contains("[Unsupported Image]"));
+        assert!(!second.body.to_string().contains("inlineData"));
+    }
+
+    #[test]
+    fn gemini_thinking_effort_only_maps_to_supported_model_levels() {
+        let compat = GeminiCompat::default();
+
+        let mut gemini_3 = json!({});
+        apply_gemini_thinking_level(&mut gemini_3, "models/gemini-3-pro", Some("high"), &compat)
+            .unwrap();
+        assert_eq!(
+            gemini_3["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+            "HIGH"
+        );
+
+        let mut gemini_2 = json!({});
+        apply_gemini_thinking_level(&mut gemini_2, "gemini-2.5-flash", Some("high"), &compat)
+            .unwrap();
+        assert!(gemini_2.get("generationConfig").is_none());
+
+        let mut disabled = json!({});
+        apply_gemini_thinking_level(
+            &mut disabled,
+            "gemini-3-pro",
+            Some("high"),
+            &GeminiCompat {
+                thought_signature_replay: true,
+                thinking: GeminiThinking::Off,
+            },
+        )
+        .unwrap();
+        assert!(disabled.get("generationConfig").is_none());
     }
 }

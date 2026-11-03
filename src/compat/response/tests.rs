@@ -14,6 +14,9 @@ fn options(streaming: bool) -> ResponseOptions {
         late_arguments_repair: false,
         native_compaction: false,
         xai_restore: None,
+        gemini_provider_id: None,
+        gemini_session_id: None,
+        gemini_tool_schema_hints: None,
     }
 }
 async fn run(response: reqwest::Response, protocol: Protocol, streaming: bool) -> Response {
@@ -22,6 +25,7 @@ async fn run(response: reqwest::Response, protocol: Protocol, streaming: bool) -
         protocol,
         options(streaming),
         Default::default(),
+        Arc::default(),
         Arc::default(),
     )
     .await

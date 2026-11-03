@@ -28,6 +28,7 @@ async fn codex_output_schema_survives_protocol_preparation() {
     for protocol in [
         Protocol::ChatCompletions,
         Protocol::Messages,
+        Protocol::GeminiNative,
         Protocol::Responses,
     ] {
         let input = json!({"model":"claude-opus-4-6","input":"Return the answer",
@@ -53,6 +54,13 @@ async fn codex_output_schema_survives_protocol_preparation() {
                 );
                 assert_eq!(out.body["output_config"]["effort"], "high");
             }
+            Protocol::GeminiNative => {
+                assert_eq!(
+                    out.body["generationConfig"]["responseMimeType"],
+                    "application/json"
+                );
+                assert_eq!(out.body["generationConfig"]["responseJsonSchema"], schema);
+            }
             Protocol::Responses => assert_eq!(out.body["text"]["format"], format),
         }
     }
@@ -71,7 +79,11 @@ async fn codex_output_schema_survives_protocol_preparation() {
 
 #[tokio::test]
 async fn output_formats_are_mapped_or_rejected_before_forwarding() {
-    for protocol in [Protocol::ChatCompletions, Protocol::Messages] {
+    for protocol in [
+        Protocol::ChatCompletions,
+        Protocol::Messages,
+        Protocol::GeminiNative,
+    ] {
         for format in [
             json!({"type":"unknown"}),
             json!({"type":"json_schema","schema":null}),

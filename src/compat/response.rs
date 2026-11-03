@@ -10,6 +10,7 @@ use crate::{
         providers::{
             anthropic_sse_tail::repair_anthropic_sse_tail,
             codex_chat_history::{record_responses_sse_stream, CodexChatHistoryStore},
+            gemini_shadow::GeminiShadowStore,
             responses_late_arguments::create_late_arguments_repair_stream,
             streaming_codex_anthropic::{
                 create_responses_sse_stream_from_anthropic_with_context,
@@ -42,6 +43,10 @@ pub(crate) struct ResponseOptions {
     pub late_arguments_repair: bool,
     pub native_compaction: bool,
     pub xai_restore: Option<HashMap<String, NamespacedName>>,
+    pub gemini_provider_id: Option<String>,
+    pub gemini_session_id: Option<String>,
+    pub gemini_tool_schema_hints:
+        Option<crate::proxy::providers::transform_gemini::AnthropicToolSchemaHints>,
 }
 const MAX_RESPONSE_BODY_BYTES: usize = 128 * 1024 * 1024;
 
@@ -119,6 +124,7 @@ pub(crate) async fn handle(
     options: ResponseOptions,
     context: CodexToolContext,
     history: Arc<CodexChatHistoryStore>,
+    gemini_shadow: Arc<GeminiShadowStore>,
 ) -> Result<Response, ProxyError> {
     let status = upstream.status();
     let headers = upstream.headers().clone();
@@ -193,6 +199,43 @@ pub(crate) async fn handle(
             return Ok(response);
         }
         return json_response(status, headers, &value);
+    }
+    if protocol == Protocol::GeminiNative {
+        let (headers, status, bytes) = decode_response(upstream).await?;
+        let text = String::from_utf8_lossy(&bytes);
+        let value: Value = serde_json::from_slice(&bytes).map_err(|error| {
+            upstream_body_parse_error(
+                "Failed to parse upstream Gemini response",
+                &error,
+                &headers,
+                &text,
+            )
+        })?;
+        let mut anthropic =
+            crate::proxy::providers::transform_gemini::gemini_to_anthropic_with_shadow_and_hints(
+                value,
+                Some(&gemini_shadow),
+                options.gemini_provider_id.as_deref(),
+                options.gemini_session_id.as_deref(),
+                options.gemini_tool_schema_hints.as_ref(),
+            )?;
+        if anthropic
+            .get("model")
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty)
+        {
+            anthropic["model"] = serde_json::json!(options.model);
+        }
+        if options.streaming {
+            let events = responses_sse_events_from_anthropic_message(&anthropic, context);
+            return Ok(sse_response(Body::from_stream(futures::stream::iter(
+                events.into_iter().map(Ok::<Bytes, std::io::Error>),
+            ))));
+        }
+        let response = transform_codex_anthropic::anthropic_response_to_responses_with_context(
+            anthropic, &context,
+        )?;
+        return json_response(status, headers, &response);
     }
     if (protocol == Protocol::ChatCompletions && (options.streaming || is_sse))
         || (protocol == Protocol::Messages && (is_sse || (options.streaming && !is_json)))

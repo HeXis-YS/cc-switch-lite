@@ -62,6 +62,7 @@ pub enum Protocol {
     Responses,
     ChatCompletions,
     Messages,
+    GeminiNative,
 }
 
 impl Config {
