@@ -160,6 +160,8 @@ providers:
 | `customUserAgent` | 非空值替换出站 User-Agent，须为有效 HTTP header 值 |
 | `localProxyRequestOverrides` | `headers` 映射与可选的 `body` 对象；用于请求覆盖 |
 
+`providers[].compat.web_search` 位于 `meta` 外，默认 `auto`：Messages Provider 会将 Responses `web_search` 工具转成 Anthropic 托管搜索工具；设为 `off` 时剥离该工具，并忽略其历史搜索条目。
+
 `codexChatReasoning` 可设置 `supportsThinking`、`supportsEffort`、`thinkingParam`、`effortParam`
 和 `effortValueMode`，用于覆盖自动推断；转换语义见 [请求兼容清单](request-compatibility.md#configuration-mapping)。
 其 `outputFormat` 目前是声明字段，不控制响应解析。覆盖 `body.model` 会校验失败；

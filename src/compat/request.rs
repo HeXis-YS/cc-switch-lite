@@ -6,7 +6,10 @@ use crate::config::{Protocol, Provider};
 use crate::proxy::{
     error::ProxyError,
     providers::{
-        self, codex_chat_history::CodexChatHistoryStore, gemini_shadow::GeminiShadowStore,
+        self,
+        codex_chat_history::{CodexChatHistoryStore, WebSearchShadowLookup},
+        gemini_shadow::GeminiShadowStore,
+        transform_codex_chat::CodexToolContext,
         transform_gemini::AnthropicToolSchemaHints,
     },
 };
@@ -21,7 +24,9 @@ use forwarder::*;
 mod headers;
 mod provider;
 use headers::{prepare_headers, HeaderSource};
-pub use provider::{upstream_provider, CompatMeta, GeminiCompat, GeminiThinking, ProviderCompat};
+pub use provider::{
+    upstream_provider, CompatMeta, GeminiCompat, GeminiThinking, ProviderCompat, WebSearchCompat,
+};
 
 pub struct Prepared {
     pub body: Value,
@@ -279,9 +284,20 @@ pub(crate) async fn prepare_attempt(
             if let Some(max) = provider.compat.meta.max_output_tokens.filter(|v| *v > 0) {
                 input["max_output_tokens"] = json!(max);
             }
-            let mut body = providers::transform_codex_anthropic::responses_request_to_anthropic(
-                input, 128000,
-            )?;
+            let mut tool_context =
+                providers::transform_codex_chat::build_codex_tool_context_from_request_with_web_search(
+                    &input,
+                    provider.compat.web_search.is_enabled(),
+                    Some(provider.id.clone()),
+                );
+            attach_anthropic_web_search_history(&input, &provider.id, history, &mut tool_context)
+                .await;
+            let mut body =
+                providers::transform_codex_anthropic::responses_request_to_anthropic_with_context(
+                    input,
+                    128000,
+                    &tool_context,
+                )?;
             let one_m = if let Some(model) = body.get("model").and_then(Value::as_str) {
                 let stripped = strip_one_m_suffix_for_upstream(model);
                 if stripped != model {
@@ -325,10 +341,18 @@ pub(crate) async fn prepare_attempt(
                 .pointer("/reasoning/effort")
                 .and_then(Value::as_str)
                 .map(ToOwned::to_owned);
-            let anthropic = providers::transform_codex_anthropic::responses_request_to_anthropic(
-                input.clone(),
-                128000,
-            )?;
+            let tool_context =
+                providers::transform_codex_chat::build_codex_tool_context_from_request_with_web_search(
+                    &input,
+                    false,
+                    Some(provider.id.clone()),
+                );
+            let anthropic =
+                providers::transform_codex_anthropic::responses_request_to_anthropic_with_context(
+                    input.clone(),
+                    128000,
+                    &tool_context,
+                )?;
             let tool_schema_hints =
                 providers::transform_gemini::extract_anthropic_tool_schema_hints(&anthropic);
             let mut body =
@@ -433,6 +457,53 @@ fn copy_responses_sampling_parameters(gemini_body: &mut Value, responses_body: &
     }
 }
 
+async fn attach_anthropic_web_search_history(
+    input: &Value,
+    provider_id: &str,
+    history: &CodexChatHistoryStore,
+    tool_context: &mut CodexToolContext,
+) {
+    if !tool_context.accepts_web_search() || tool_context.is_compaction_request() {
+        return;
+    }
+    let Some(items) = input.get("input").and_then(Value::as_array) else {
+        return;
+    };
+
+    for item in items {
+        if item.get("type").and_then(Value::as_str) != Some("web_search_call")
+            || item.get("status").and_then(Value::as_str) == Some("incomplete")
+        {
+            continue;
+        }
+        let Some(response_item_id) = item
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+        else {
+            log::warn!("[Codex/Anthropic] Dropping historical web_search_call without an id");
+            continue;
+        };
+
+        match history
+            .lookup_anthropic_web_search_shadow(response_item_id, provider_id)
+            .await
+        {
+            WebSearchShadowLookup::Found(shadow) => {
+                tool_context.add_web_search_shadow(response_item_id.to_string(), shadow);
+            }
+            WebSearchShadowLookup::Missing => {
+                tool_context.mark_web_search_shadow_unavailable(response_item_id.to_string());
+                log::warn!("[Codex/Anthropic] Dropping historical web_search_call without cached Anthropic blocks");
+            }
+            WebSearchShadowLookup::ProviderMismatch => {
+                tool_context.mark_web_search_shadow_unavailable(response_item_id.to_string());
+                log::warn!("[Codex/Anthropic] Dropping historical web_search_call cached for a different Provider");
+            }
+        }
+    }
+}
+
 fn apply_gemini_thinking_level(
     gemini_body: &mut Value,
     model: &str,
@@ -478,6 +549,59 @@ mod request_tests {
             api_key: "test-key".into(),
             compat: ProviderCompat::default(),
         }
+    }
+
+    #[tokio::test]
+    async fn web_search_shadow_is_not_replayed_after_provider_switch() {
+        let history = CodexChatHistoryStore::default();
+        history
+            .record_anthropic_web_search_shadows(
+                "previous-provider",
+                vec![
+                    crate::proxy::providers::codex_chat_history::AnthropicWebSearchShadow {
+                        server_tool_use: json!({
+                            "type":"server_tool_use",
+                            "id":"srvtoolu_1",
+                            "name":"web_search",
+                            "input":{"query":"find docs"},
+                            "encrypted_content":"previous-signature"
+                        }),
+                        web_search_tool_result: json!({
+                            "type":"web_search_tool_result",
+                            "tool_use_id":"srvtoolu_1",
+                            "content":[{"type":"web_search_result","url":"https://example.com"}],
+                            "encrypted_content":"previous-result"
+                        }),
+                    },
+                ],
+            )
+            .await;
+
+        let input = json!({
+            "model":"claude-test",
+            "input":[
+                {"type":"message","role":"user","content":"Find it."},
+                {"type":"web_search_call","id":"ws_srvtoolu_1","status":"completed","action":{"type":"search","query":"find docs"}},
+                {"type":"message","role":"user","content":"Continue."}
+            ],
+            "tools":[{"type":"web_search"}]
+        });
+        let prepared = prepare(
+            input,
+            &provider(Protocol::Messages),
+            &HeaderMap::new(),
+            &CompatConfig::default(),
+            &history,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(prepared.body["tools"][0]["type"], "web_search_20250305");
+        let messages = prepared.body["messages"].to_string();
+        assert!(!messages.contains("server_tool_use"));
+        assert!(!messages.contains("web_search_tool_result"));
+        assert!(!messages.contains("previous-signature"));
+        assert!(!messages.contains("previous-result"));
     }
 
     #[tokio::test]

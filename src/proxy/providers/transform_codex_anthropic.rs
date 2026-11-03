@@ -12,12 +12,12 @@
 //! - `transform_responses.rs`: Anthropic request → Responses request, Responses response → Anthropic response
 //! - this module:               Responses request → Anthropic request, Anthropic response → Responses response
 
-use super::codex_compaction;
 use super::transform_codex_chat::{
-    build_codex_tool_context_from_request, response_tool_call_item_from_chat_name,
+    build_codex_tool_context_from_request_with_web_search, response_tool_call_item_from_chat_name,
     response_tool_call_item_id_from_chat_name, responses_text_format, CodexToolContext,
 };
 use super::transform_responses::{sanitize_anthropic_tool_use_input, TOOL_RESULT_ERROR_MARKER};
+use super::{codex_chat_history::web_search_response_item_id, codex_compaction};
 use crate::proxy::error::ProxyError;
 use crate::proxy::json_canonical::canonical_json_string;
 use crate::proxy::sse::{strip_sse_field, take_sse_block};
@@ -202,6 +202,31 @@ pub(crate) fn build_responses_usage_from_anthropic(usage: Option<&Value>) -> Val
     result
 }
 
+pub(crate) fn web_search_call_item(
+    response_item_id: &str,
+    status: &str,
+    query: Option<&str>,
+) -> Value {
+    let mut item = json!({
+        "id": response_item_id,
+        "type": "web_search_call",
+        "status": status
+    });
+    if let Some(query) = query {
+        item["action"] = json!({ "type": "search", "query": query });
+    }
+    item
+}
+
+pub(crate) fn log_web_search_usage(usage: Option<&Value>) {
+    if let Some(requests) = usage
+        .and_then(|value| value.pointer("/server_tool_use/web_search_requests"))
+        .and_then(Value::as_u64)
+    {
+        log::debug!("[Codex/Anthropic] upstream web_search_requests={requests}");
+    }
+}
+
 /// OpenAI Responses request → Anthropic Messages request
 ///
 /// `default_max_tokens`: injected when the Responses body has no
@@ -232,8 +257,16 @@ pub fn responses_request_to_anthropic(
     body: Value,
     default_max_tokens: u64,
 ) -> Result<Value, ProxyError> {
+    let tool_context = build_codex_tool_context_from_request_with_web_search(&body, true, None);
+    responses_request_to_anthropic_with_context(body, default_max_tokens, &tool_context)
+}
+
+pub(crate) fn responses_request_to_anthropic_with_context(
+    body: Value,
+    default_max_tokens: u64,
+    tool_context: &CodexToolContext,
+) -> Result<Value, ProxyError> {
     let mut result = json!({});
-    let tool_context = build_codex_tool_context_from_request(&body);
     let model = body
         .get("model")
         .and_then(|value| value.as_str())
@@ -269,7 +302,7 @@ pub fn responses_request_to_anthropic(
 
     // input → messages
     let mut messages = match body.get("input") {
-        Some(Value::Array(items)) => convert_input_to_messages(items, &tool_context)?,
+        Some(Value::Array(items)) => convert_input_to_messages(items, tool_context)?,
         Some(Value::String(text)) if is_meaningful_text(text) => vec![json!({
             "role": "user",
             "content": [{ "type": "text", "text": text }]
@@ -387,10 +420,11 @@ pub fn responses_request_to_anthropic(
         result["stream"] = v.clone();
     }
 
-    // Reuse the Codex tool context so function, namespace, custom, tool_search, and
-    // dynamically loaded tools all receive stable flat names upstream.
-    // 压缩回合只要一段摘要，不带工具，与 Codex 本地压缩请求同形。
-    let anth_tools: Vec<Value> = if tool_context.is_compaction_request() {
+    // Reuse the Codex tool context so client tools retain their stable flat names.
+    // Hosted web search is declared separately because it is an Anthropic-managed
+    // tool, not a client function. Compaction requests omit both kinds.
+    let compaction = tool_context.is_compaction_request();
+    let client_tools: Vec<Value> = if compaction {
         Vec::new()
     } else {
         tool_context
@@ -399,18 +433,29 @@ pub fn responses_request_to_anthropic(
             .filter_map(chat_tool_to_anthropic_tool)
             .collect()
     };
-    let has_tools = !anth_tools.is_empty();
-    if has_tools {
+    let has_client_tools = !client_tools.is_empty();
+    let mut anth_tools = client_tools;
+    if !compaction {
+        if let Some(search) = tool_context.hosted_web_search() {
+            let mut web_search = json!({
+                "type": "web_search_20250305",
+                "name": "web_search"
+            });
+            if let Some(allowed_domains) = &search.allowed_domains {
+                web_search["allowed_domains"] = allowed_domains.clone();
+            }
+            anth_tools.push(web_search);
+        }
+    }
+    if !anth_tools.is_empty() {
         result["tools"] = json!(anth_tools);
     }
 
-    // Only forward tool_choice when tools survived the filter. Anthropic 400s on a
-    // tool_choice with no tools ("tool_choice may only be specified while providing
-    // tools"), and that 400 is non-retryable — so a request whose only tools were
-    // unsupported hosted tools (for example web_search) must drop tool_choice too.
-    if has_tools {
+    // Anthropic rejects tool_choice when no client tool definitions are present.
+    // A hosted web_search tool alone therefore does not make tool_choice valid.
+    if has_client_tools {
         if let Some(tc) = body.get("tool_choice") {
-            let mut mapped = map_tool_choice_to_anthropic(tc, &tool_context);
+            let mut mapped = map_tool_choice_to_anthropic(tc, tool_context);
             let forced = matches!(
                 mapped.get("type").and_then(|value| value.as_str()),
                 Some("any" | "tool")
@@ -574,7 +619,7 @@ fn convert_input_to_messages(
         let item_type = item.get("type").and_then(|t| t.as_str());
         if matches!(
             item_type,
-            Some("function_call" | "custom_tool_call" | "tool_search_call")
+            Some("function_call" | "custom_tool_call" | "tool_search_call" | "web_search_call")
         ) && item.get("status").and_then(Value::as_str) == Some("incomplete")
         {
             log::warn!("[Codex/Anthropic] Dropping incomplete historical tool call");
@@ -662,6 +707,36 @@ fn convert_input_to_messages(
                         "name": TOOL_SEARCH_PROXY_NAME,
                         "input": input
                     }),
+                );
+            }
+            Some("web_search_call") => {
+                if tool_context.is_compaction_request() || !tool_context.accepts_web_search() {
+                    continue;
+                }
+                let Some(response_item_id) = item
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty())
+                else {
+                    log::warn!(
+                        "[Codex/Anthropic] Dropping historical web_search_call without an id"
+                    );
+                    continue;
+                };
+                let Some(shadow) = tool_context.web_search_shadow(response_item_id) else {
+                    if !tool_context.web_search_shadow_lookup_was_attempted(response_item_id) {
+                        log::warn!("[Codex/Anthropic] Dropping historical web_search_call without cached Anthropic blocks");
+                    }
+                    continue;
+                };
+                // Anthropic requires the server tool request and its result in the
+                // same assistant turn. Keep both source blocks intact, including any
+                // opaque content fields such as encrypted_content.
+                push_block(&mut messages, "assistant", shadow.server_tool_use.clone());
+                push_block(
+                    &mut messages,
+                    "assistant",
+                    shadow.web_search_tool_result.clone(),
                 );
             }
             Some("function_call_output" | "custom_tool_call_output" | "tool_search_output") => {
@@ -1334,7 +1409,12 @@ fn document_block_from_input_file(part: &Value) -> Option<Value> {
 /// Anthropic Messages response → OpenAI Responses response (non-streaming)
 #[allow(dead_code)]
 pub fn anthropic_response_to_responses(body: Value) -> Result<Value, ProxyError> {
-    anthropic_response_to_responses_with_context(body, &CodexToolContext::default())
+    let context = build_codex_tool_context_from_request_with_web_search(
+        &json!({ "tools": [{ "type": "web_search" }] }),
+        true,
+        None,
+    );
+    anthropic_response_to_responses_with_context(body, &context)
 }
 
 pub(crate) fn anthropic_response_to_responses_with_context(
@@ -1417,6 +1497,29 @@ pub(crate) fn anthropic_response_to_responses_with_context(
                         tool_context,
                     ));
                 }
+                "server_tool_use"
+                    if tool_context.hosted_web_search().is_some()
+                        && block.get("name").and_then(Value::as_str) == Some("web_search") =>
+                {
+                    flush_text(&mut output, &mut text_parts);
+                    let Some(server_tool_id) = block
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .filter(|value| !value.is_empty())
+                    else {
+                        log::warn!(
+                            "[Codex/Anthropic] Ignoring web_search server_tool_use without an id"
+                        );
+                        continue;
+                    };
+                    let query = block
+                        .pointer("/input/query")
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    let item_id = web_search_response_item_id(server_tool_id);
+                    output.push(web_search_call_item(&item_id, "completed", Some(query)));
+                }
+                "web_search_tool_result" => {}
                 "thinking" | "redacted_thinking" => {
                     flush_text(&mut output, &mut text_parts);
                     let idx = output.len();
@@ -1433,6 +1536,7 @@ pub(crate) fn anthropic_response_to_responses_with_context(
     }
     flush_text(&mut output, &mut text_parts);
 
+    log_web_search_usage(body.get("usage"));
     let usage = build_responses_usage_from_anthropic(body.get("usage"));
 
     let mut result = json!({
@@ -1697,6 +1801,8 @@ fn append_str_field(block: &mut Value, field: &str, text: &str) {
 
 #[cfg(test)]
 mod tests {
+    use super::super::codex_chat_history::AnthropicWebSearchShadow;
+    use super::super::transform_codex_chat::build_codex_tool_context_from_request;
     use super::*;
 
     // ==================== Request: Responses → Anthropic ====================
@@ -1786,11 +1892,42 @@ mod tests {
         });
         let result = responses_request_to_anthropic(input, 4096).unwrap();
         let tools = result["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 2);
+        assert_eq!(tools.len(), 3);
         assert_eq!(tools[0]["name"], "get_weather");
         assert_eq!(tools[0]["input_schema"]["type"], "object");
         assert!(tools[0].get("parameters").is_none());
         assert_eq!(tools[1]["name"], "apply_patch");
+        assert_eq!(
+            tools[2],
+            json!({"type":"web_search_20250305","name":"web_search"})
+        );
+    }
+
+    #[test]
+    fn test_request_hosted_web_search_maps_domains_without_tool_choice() {
+        let input = json!({
+            "model": "claude",
+            "max_output_tokens": 100,
+            "input": [{ "role": "user", "content": "find sources" }],
+            "tools": [{
+                "type": "web_search",
+                "filters": {
+                    "allowed_domains": ["example.com", "docs.example.org"],
+                    "user_location": { "type": "approximate", "country": "US" }
+                }
+            }],
+            "tool_choice": "required"
+        });
+        let result = responses_request_to_anthropic(input, 4096).unwrap();
+        assert_eq!(
+            result["tools"],
+            json!([{
+                "type":"web_search_20250305",
+                "name":"web_search",
+                "allowed_domains":["example.com", "docs.example.org"]
+            }])
+        );
+        assert!(result.get("tool_choice").is_none());
     }
 
     #[test]
@@ -2365,8 +2502,9 @@ mod tests {
             "tool_choice": "required"
         });
         let result = responses_request_to_anthropic(input, 4096).unwrap();
-        assert_eq!(result["tools"].as_array().unwrap().len(), 1);
+        assert_eq!(result["tools"].as_array().unwrap().len(), 2);
         assert_eq!(result["tools"][0]["name"], "apply_patch");
+        assert_eq!(result["tools"][1]["type"], "web_search_20250305");
         assert_eq!(result["tool_choice"], json!({ "type": "any" }));
     }
 
@@ -2611,6 +2749,124 @@ mod tests {
         assert_eq!(result["output"][0]["call_id"], "call_1");
         assert_eq!(result["output"][0]["name"], "get_weather");
         assert_eq!(result["output"][0]["arguments"], "{\"city\":\"Tokyo\"}");
+    }
+
+    #[test]
+    fn test_response_hosted_web_search_preserves_item_order_and_usage_boundary() {
+        let context = build_codex_tool_context_from_request_with_web_search(
+            &json!({ "tools": [{ "type": "web_search" }] }),
+            true,
+            None,
+        );
+        let response = anthropic_response_to_responses_with_context(
+            json!({
+                "id": "msg_search",
+                "model": "claude",
+                "content": [
+                    { "type": "text", "text": "Searching." },
+                    { "type": "server_tool_use", "id": "srvtoolu_1", "name": "web_search", "input": { "query": "current weather" } },
+                    { "type": "web_search_tool_result", "tool_use_id": "srvtoolu_1", "content": [{ "type": "web_search_result", "title": "Weather", "url": "https://example.com" }] },
+                    { "type": "text", "text": "It is sunny." }
+                ],
+                "stop_reason": "end_turn",
+                "usage": {
+                    "input_tokens": 8,
+                    "output_tokens": 4,
+                    "server_tool_use": { "web_search_requests": 1 }
+                }
+            }),
+            &context,
+        )
+        .unwrap();
+
+        let output = response["output"].as_array().unwrap();
+        assert_eq!(output.len(), 3);
+        assert_eq!(output[0]["type"], "message");
+        assert_eq!(output[0]["content"][0]["text"], "Searching.");
+        assert_eq!(
+            output[1],
+            json!({
+                "id":"ws_srvtoolu_1",
+                "type":"web_search_call",
+                "status":"completed",
+                "action":{"type":"search","query":"current weather"}
+            })
+        );
+        assert_eq!(output[2]["type"], "message");
+        assert_eq!(output[2]["content"][0]["text"], "It is sunny.");
+        assert!(response["usage"].get("server_tool_use").is_none());
+    }
+
+    #[test]
+    fn test_request_replays_cached_web_search_blocks_in_assistant_turn() {
+        let body = json!({
+            "model": "claude",
+            "input": [
+                { "type": "message", "role": "user", "content": "Find a source." },
+                { "type": "web_search_call", "id": "ws_srvtoolu_1", "status": "completed", "action": { "type": "search", "query": "source" }, "encrypted_content": "preserve-me" },
+                { "type": "message", "role": "assistant", "content": [{ "type": "output_text", "text": "Found it." }] },
+                { "type": "message", "role": "user", "content": "Summarize it." }
+            ],
+        });
+        let mut context = build_codex_tool_context_from_request_with_web_search(
+            &body,
+            true,
+            Some("anthropic-one".into()),
+        );
+        context.add_web_search_shadow(
+            "ws_srvtoolu_1".to_string(),
+            AnthropicWebSearchShadow {
+                server_tool_use: json!({
+                    "type":"server_tool_use",
+                    "id":"srvtoolu_1",
+                    "name":"web_search",
+                    "input":{"query":"source"},
+                    "encrypted_content":"preserve-me"
+                }),
+                web_search_tool_result: json!({
+                    "type":"web_search_tool_result",
+                    "tool_use_id":"srvtoolu_1",
+                    "content":[{"type":"web_search_result","url":"https://example.com"}],
+                    "encrypted_content":"also-preserve-me"
+                }),
+            },
+        );
+
+        let result = responses_request_to_anthropic_with_context(body, 4096, &context).unwrap();
+        let messages = result["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[1]["role"], "assistant");
+        assert_eq!(messages[1]["content"][0]["type"], "server_tool_use");
+        assert_eq!(
+            messages[1]["content"][0]["encrypted_content"],
+            "preserve-me"
+        );
+        assert_eq!(messages[1]["content"][1]["type"], "web_search_tool_result");
+        assert_eq!(
+            messages[1]["content"][1]["encrypted_content"],
+            "also-preserve-me"
+        );
+        assert_eq!(messages[1]["content"][2]["text"], "Found it.");
+        assert_eq!(messages[2]["role"], "user");
+    }
+
+    #[test]
+    fn test_request_drops_web_search_call_without_cached_shadow() {
+        let body = json!({
+            "model": "claude",
+            "input": [
+                { "type": "message", "role": "user", "content": "Find a source." },
+                { "type": "web_search_call", "id": "ws_missing", "status": "completed" },
+                { "type": "message", "role": "user", "content": "Continue." }
+            ],
+            "tools": [{ "type": "web_search" }]
+        });
+        let context = build_codex_tool_context_from_request_with_web_search(&body, true, None);
+        let result = responses_request_to_anthropic_with_context(body, 4096, &context).unwrap();
+        assert!(!result["messages"].to_string().contains("server_tool_use"));
+        assert!(!result["messages"]
+            .to_string()
+            .contains("web_search_tool_result"));
     }
 
     #[test]
@@ -3193,11 +3449,15 @@ data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":
             "input": [
                 { "type": "compaction", "encrypted_content": codex_compaction::encode_compaction_summary("prior work") },
                 { "type": "message", "role": "user", "content": [{ "type": "input_text", "text": "fix bug" }] },
+                { "type": "web_search_call", "id": "ws_old", "status": "completed", "action": {"type":"search", "query":"old query"} },
                 { "type": "function_call", "call_id": "toolu_1", "name": "shell", "arguments": "{}" },
                 { "type": "function_call_output", "call_id": "toolu_1", "output": "ok" },
                 { "type": "compaction_trigger" }
             ],
-            "tools": [{ "type": "function", "name": "shell", "parameters": { "type": "object" } }],
+            "tools": [
+                { "type": "function", "name": "shell", "parameters": { "type": "object" } },
+                { "type": "web_search" }
+            ],
             "tool_choice": "auto"
         });
         let result = responses_request_to_anthropic(body, 8192).unwrap();
@@ -3205,6 +3465,9 @@ data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":
         assert!(result.get("tool_choice").is_none());
 
         let messages = result["messages"].as_array().unwrap();
+        assert!(!serde_json::to_string(messages)
+            .unwrap()
+            .contains("web_search"));
         let first = serde_json::to_string(&messages[0]).unwrap();
         assert!(first.contains("prior work"));
         let last = messages.last().unwrap();

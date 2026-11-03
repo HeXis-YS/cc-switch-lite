@@ -1138,3 +1138,98 @@ async fn gemini_native_errors_do_not_echo_the_provider_key() {
         assert!(!body.contains("test-key-not-for-output"));
     }
 }
+
+#[tokio::test]
+async fn anthropic_hosted_web_search_replays_raw_blocks_in_the_next_turn() {
+    let fixture = Fixture::new(
+        Protocol::Messages,
+        vec![
+            Reply::json(
+                StatusCode::OK,
+                json!({
+                    "id":"msg_search",
+                    "type":"message",
+                    "role":"assistant",
+                    "model":"claude-test",
+                    "content":[
+                        {"type":"server_tool_use","id":"srvtoolu_1","name":"web_search","input":{"query":"current weather"},"encrypted_content":"use-opaque"},
+                        {"type":"web_search_tool_result","tool_use_id":"srvtoolu_1","content":[{"type":"web_search_result","title":"Weather","url":"https://example.com"}],"encrypted_content":"result-opaque"},
+                        {"type":"text","text":"It is sunny."}
+                    ],
+                    "stop_reason":"end_turn",
+                    "usage":{"input_tokens":5,"output_tokens":3,"server_tool_use":{"web_search_requests":1}}
+                }),
+            ),
+            Reply::json(
+                StatusCode::OK,
+                json!({
+                    "id":"msg_followup",
+                    "type":"message",
+                    "role":"assistant",
+                    "model":"claude-test",
+                    "content":[{"type":"text","text":"The source says it is sunny."}],
+                    "stop_reason":"end_turn",
+                    "usage":{"input_tokens":8,"output_tokens":5}
+                }),
+            ),
+        ],
+        |_| {},
+    )
+    .await;
+
+    let first = fixture
+        .send(json!({
+            "model":"claude-test",
+            "stream":false,
+            "input":"Find the current weather.",
+            "tools":[{"type":"web_search"}],
+            "tool_choice":"required"
+        }))
+        .await;
+    assert_eq!(first.status(), StatusCode::OK);
+    let first: Value = first.json().await.unwrap();
+    assert_eq!(first["output"][0]["type"], "web_search_call");
+    assert_eq!(first["output"][0]["id"], "ws_srvtoolu_1");
+    assert_eq!(first["output"][0]["action"]["query"], "current weather");
+    assert!(first["usage"].get("server_tool_use").is_none());
+
+    let second = fixture
+        .send(json!({
+            "model":"claude-test",
+            "stream":false,
+            "previous_response_id":first["id"],
+            "input":[
+                {"type":"message","role":"user","content":"Find the current weather."},
+                {"type":"web_search_call","id":"ws_srvtoolu_1","status":"completed","action":{"type":"search","query":"current weather"},"encrypted_content":"codex-opaque"},
+                {"type":"message","role":"assistant","content":[{"type":"output_text","text":"It is sunny."}]},
+                {"type":"message","role":"user","content":"Summarize the source."}
+            ],
+            "tools":[{"type":"web_search"}]
+        }))
+        .await;
+    assert_eq!(second.status(), StatusCode::OK);
+    let second: Value = second.json().await.unwrap();
+    assert_eq!(
+        second["output"][0]["content"][0]["text"],
+        "The source says it is sunny."
+    );
+
+    let calls = fixture.mock.calls.lock().await;
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[0]["tools"][0]["type"], "web_search_20250305");
+    assert!(calls[0].get("tool_choice").is_none());
+    let assistant = calls[1]["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|message| message["role"] == "assistant")
+        .unwrap();
+    assert_eq!(assistant["content"][0]["type"], "server_tool_use");
+    assert_eq!(assistant["content"][0]["encrypted_content"], "use-opaque");
+    assert_eq!(assistant["content"][1]["type"], "web_search_tool_result");
+    assert_eq!(
+        assistant["content"][1]["encrypted_content"],
+        "result-opaque"
+    );
+    assert_eq!(assistant["content"][2]["text"], "It is sunny.");
+}

@@ -1,7 +1,7 @@
 use axum::http::{HeaderMap, HeaderValue};
 use cc_switch_lite::{
     compat::{
-        request::{prepare, prepare_with_query, ProviderCompat},
+        request::{prepare, prepare_with_query, ProviderCompat, WebSearchCompat},
         CompatConfig,
     },
     config::{Protocol, Provider},
@@ -164,6 +164,52 @@ async fn anthropic_default_budget_preserves_explicit_client_limit() {
         .unwrap();
         assert_eq!(out.body["max_tokens"], expected);
     }
+}
+
+#[tokio::test]
+async fn anthropic_web_search_compat_can_be_disabled_without_leaking_to_gemini() {
+    let input = json!({
+        "model": "claude-sonnet-5",
+        "input": "Search for current information.",
+        "tools": [{ "type": "web_search" }],
+        "tool_choice": "required"
+    });
+    let mut p = provider(Protocol::Messages, "https://example.test/v1");
+    let automatic = prepare(
+        input.clone(),
+        &p,
+        &HeaderMap::new(),
+        &CompatConfig::default(),
+        &CodexChatHistoryStore::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(automatic.body["tools"][0]["type"], "web_search_20250305");
+    assert!(automatic.body.get("tool_choice").is_none());
+
+    p.compat.web_search = WebSearchCompat::Off;
+    let disabled = prepare(
+        input.clone(),
+        &p,
+        &HeaderMap::new(),
+        &CompatConfig::default(),
+        &CodexChatHistoryStore::default(),
+    )
+    .await
+    .unwrap();
+    assert!(disabled.body.get("tools").is_none());
+    assert!(disabled.body.get("tool_choice").is_none());
+
+    let native_gemini = prepare(
+        input,
+        &provider(Protocol::GeminiNative, "https://example.test/v1"),
+        &HeaderMap::new(),
+        &CompatConfig::default(),
+        &CodexChatHistoryStore::default(),
+    )
+    .await
+    .unwrap();
+    assert!(native_gemini.body.get("tools").is_none());
 }
 
 #[tokio::test]

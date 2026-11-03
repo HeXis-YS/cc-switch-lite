@@ -34,6 +34,26 @@ pub struct ProviderCompat {
     pub settings_config: Value,
     #[serde(default, skip_serializing_if = "GeminiCompat::is_default")]
     pub gemini: GeminiCompat,
+    #[serde(default, skip_serializing_if = "WebSearchCompat::is_auto")]
+    pub web_search: WebSearchCompat,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WebSearchCompat {
+    #[default]
+    Auto,
+    Off,
+}
+
+impl WebSearchCompat {
+    pub(crate) fn is_auto(&self) -> bool {
+        matches!(self, Self::Auto)
+    }
+
+    pub(crate) fn is_enabled(self) -> bool {
+        matches!(self, Self::Auto)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -72,6 +92,7 @@ impl Default for ProviderCompat {
             meta: CompatMeta::default(),
             settings_config: empty_object(),
             gemini: GeminiCompat::default(),
+            web_search: WebSearchCompat::default(),
         }
     }
 }

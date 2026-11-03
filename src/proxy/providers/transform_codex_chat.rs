@@ -11,9 +11,9 @@ use super::codex_chat_common::{
     extract_reasoning_summary_text, response_function_call_item,
     response_function_call_item_with_namespace,
 };
-use super::codex_compaction;
 use super::inline_think::split_leading_think_block;
 use super::transform::unwrap_chat_completion_envelope;
+use super::{codex_chat_history::AnthropicWebSearchShadow, codex_compaction};
 use crate::provider::CodexChatReasoningConfig;
 use crate::proxy::{
     error::ProxyError,
@@ -74,8 +74,18 @@ pub(crate) struct CodexToolContext {
     seen_chat_names: HashSet<String>,
     chat_name_to_spec: HashMap<String, CodexToolSpec>,
     namespace_name_to_chat_name: HashMap<(String, String), String>,
+    accept_web_search: bool,
+    hosted_web_search: Option<CodexWebSearchSpec>,
+    web_search_provider_id: Option<String>,
+    web_search_shadows: HashMap<String, AnthropicWebSearchShadow>,
+    unavailable_web_search_shadows: HashSet<String>,
     /// 这个请求是 Codex 远程压缩（input 里有 `compaction_trigger`），见 `codex_compaction`。
     compaction_request: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct CodexWebSearchSpec {
+    pub(crate) allowed_domains: Option<Value>,
 }
 
 impl CodexToolContext {
@@ -85,6 +95,42 @@ impl CodexToolContext {
 
     pub(crate) fn is_compaction_request(&self) -> bool {
         self.compaction_request
+    }
+
+    pub(crate) fn hosted_web_search(&self) -> Option<&CodexWebSearchSpec> {
+        self.hosted_web_search.as_ref()
+    }
+
+    pub(crate) fn accepts_web_search(&self) -> bool {
+        self.accept_web_search
+    }
+
+    pub(crate) fn web_search_provider_id(&self) -> Option<&str> {
+        self.web_search_provider_id.as_deref()
+    }
+
+    pub(crate) fn web_search_shadow(
+        &self,
+        response_item_id: &str,
+    ) -> Option<&AnthropicWebSearchShadow> {
+        self.web_search_shadows.get(response_item_id)
+    }
+
+    pub(crate) fn add_web_search_shadow(
+        &mut self,
+        response_item_id: String,
+        shadow: AnthropicWebSearchShadow,
+    ) {
+        self.web_search_shadows.insert(response_item_id, shadow);
+    }
+
+    pub(crate) fn mark_web_search_shadow_unavailable(&mut self, response_item_id: String) {
+        self.unavailable_web_search_shadows.insert(response_item_id);
+    }
+
+    pub(crate) fn web_search_shadow_lookup_was_attempted(&self, response_item_id: &str) -> bool {
+        self.unavailable_web_search_shadows
+            .contains(response_item_id)
     }
 
     pub(crate) fn lookup_chat_name(&self, chat_name: &str) -> Option<&CodexToolSpec> {
@@ -214,6 +260,15 @@ impl CodexToolContext {
         self.add_chat_tool(TOOL_SEARCH_PROXY_NAME.to_string(), spec, chat_tool);
     }
 
+    fn add_hosted_web_search_tool(&mut self, tool: &Value) {
+        if !self.accept_web_search || self.hosted_web_search.is_some() {
+            return;
+        }
+        self.hosted_web_search = Some(CodexWebSearchSpec {
+            allowed_domains: tool.pointer("/filters/allowed_domains").cloned(),
+        });
+    }
+
     fn add_namespace_tool(&mut self, namespace_tool: &Value) {
         let Some(namespace) = namespace_tool.get("name").and_then(|v| v.as_str()) else {
             return;
@@ -250,6 +305,7 @@ impl CodexToolContext {
                 Some("function") => self.add_function_tool(tool, None),
                 Some("custom") => self.add_custom_tool(tool, None),
                 Some("tool_search") => self.add_tool_search_tool(),
+                Some("web_search") => self.add_hosted_web_search_tool(tool),
                 Some("namespace") => self.add_namespace_tool(tool),
                 _ => {}
             },
@@ -259,7 +315,19 @@ impl CodexToolContext {
 }
 
 pub(crate) fn build_codex_tool_context_from_request(body: &Value) -> CodexToolContext {
-    let mut context = CodexToolContext::default();
+    build_codex_tool_context_from_request_with_web_search(body, false, None)
+}
+
+pub(crate) fn build_codex_tool_context_from_request_with_web_search(
+    body: &Value,
+    accept_web_search: bool,
+    provider_id: Option<String>,
+) -> CodexToolContext {
+    let mut context = CodexToolContext {
+        accept_web_search,
+        web_search_provider_id: provider_id,
+        ..CodexToolContext::default()
+    };
 
     if let Some(tools) = body.get("tools").and_then(|v| v.as_array()) {
         for tool in tools {
@@ -3687,6 +3755,29 @@ mod tests {
                     "properties": {"slug": {"type": "string"}}
                 }
             ])
+        );
+    }
+
+    #[test]
+    fn hosted_web_search_is_separate_from_client_chat_tools() {
+        let request = json!({
+            "tools": [{
+                "type": "web_search",
+                "filters": { "allowed_domains": ["example.com"] }
+            }]
+        });
+        let context = build_codex_tool_context_from_request_with_web_search(
+            &request,
+            true,
+            Some("messages-provider".into()),
+        );
+
+        assert!(context.accepts_web_search());
+        assert!(context.chat_tools().is_empty());
+        assert!(context.lookup_chat_name("web_search").is_none());
+        assert_eq!(
+            context.hosted_web_search().unwrap().allowed_domains,
+            Some(json!(["example.com"]))
         );
     }
 

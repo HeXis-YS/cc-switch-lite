@@ -9,7 +9,7 @@ use crate::{
         },
         providers::{
             codex_chat_history::CodexChatHistoryStore, gemini_shadow::GeminiShadowStore,
-            transform_codex_chat::build_codex_tool_context_from_request,
+            transform_codex_chat::build_codex_tool_context_from_request_with_web_search,
         },
     },
 };
@@ -161,7 +161,13 @@ async fn forward(
     query: Option<&str>,
 ) -> Result<Response, ProxyError> {
     let mut retried = false;
-    let context = build_codex_tool_context_from_request(&input);
+    let accept_web_search =
+        provider.protocol == Protocol::Messages && provider.compat.web_search.is_enabled();
+    let context = build_codex_tool_context_from_request_with_web_search(
+        &input,
+        accept_web_search,
+        Some(provider.id.clone()),
+    );
     let mut request_context =
         request::build_context(provider.protocol, provider, headers, &input, query);
     let mut stable_response_options = request_context.response_options(model, streaming);

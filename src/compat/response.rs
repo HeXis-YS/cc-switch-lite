@@ -14,6 +14,7 @@ use crate::{
             responses_late_arguments::create_late_arguments_repair_stream,
             streaming_codex_anthropic::{
                 create_responses_sse_stream_from_anthropic_with_context,
+                create_responses_sse_stream_from_anthropic_with_history,
                 responses_sse_events_from_anthropic_message,
             },
             streaming_codex_chat::create_responses_sse_stream_from_chat_with_context,
@@ -262,8 +263,8 @@ pub(crate) async fn handle(
             ))
         } else {
             let source = repair_anthropic_sse_tail(source);
-            Body::from_stream(create_responses_sse_stream_from_anthropic_with_context(
-                source, context,
+            Body::from_stream(create_responses_sse_stream_from_anthropic_with_history(
+                source, context, history,
             ))
         };
         return Ok(sse_response(body));
@@ -293,6 +294,13 @@ pub(crate) async fn handle(
             ))
         }
     };
+    if protocol == Protocol::Messages && context.hosted_web_search().is_some() {
+        if let Some(provider_id) = context.web_search_provider_id() {
+            history
+                .record_anthropic_web_search_message(provider_id, &value)
+                .await;
+        }
+    }
     if protocol == Protocol::Messages && options.streaming {
         let events = responses_sse_events_from_anthropic_message(&value, context);
         return Ok(sse_response(Body::from_stream(futures::stream::iter(

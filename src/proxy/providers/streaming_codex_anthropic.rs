@@ -8,11 +8,11 @@
 //! those in `streaming_codex_chat.rs` (Chat → Responses); the Codex client only recognizes
 //! this set of events.
 
-use super::codex_compaction;
 use super::codex_responses_sse as sse;
 use super::transform_codex_anthropic::{
-    build_responses_usage_from_anthropic, map_anthropic_stop_reason_to_status,
-    responses_reasoning_item_from_anthropic_block,
+    build_responses_usage_from_anthropic, log_web_search_usage,
+    map_anthropic_stop_reason_to_status, responses_reasoning_item_from_anthropic_block,
+    web_search_call_item,
 };
 #[cfg(test)]
 use super::transform_codex_anthropic::{
@@ -23,18 +23,29 @@ use super::transform_codex_chat::{
     CodexToolContext,
 };
 use super::transform_responses::sanitize_anthropic_tool_use_input_json;
+use super::{
+    codex_chat_history::{
+        web_search_response_item_id, AnthropicWebSearchShadow, CodexChatHistoryStore,
+    },
+    codex_compaction,
+};
 use crate::proxy::json_canonical::canonicalize_tool_arguments_str;
 use crate::proxy::sse::{strip_sse_field, take_sse_block};
 use bytes::Bytes;
 use futures::stream::{Stream, StreamExt};
 use serde_json::{json, Map, Value};
-use std::collections::BTreeMap;
+use std::{
+    collections::{BTreeMap, HashMap},
+    sync::Arc,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BlockKind {
     Text,
     Tool,
     Thinking,
+    WebSearch,
+    WebSearchResult,
 }
 
 #[derive(Debug)]
@@ -65,6 +76,9 @@ struct AnthropicToResponsesState {
     anthropic_usage: Map<String, Value>,
     stop_reason: Option<String>,
     tool_context: CodexToolContext,
+    web_search_uses: HashMap<String, Value>,
+    web_search_results: HashMap<String, Value>,
+    ready_web_search_shadows: Vec<AnthropicWebSearchShadow>,
 }
 
 impl Default for AnthropicToResponsesState {
@@ -80,6 +94,9 @@ impl Default for AnthropicToResponsesState {
             anthropic_usage: Map::new(),
             stop_reason: None,
             tool_context: CodexToolContext::default(),
+            web_search_uses: HashMap::new(),
+            web_search_results: HashMap::new(),
+            ready_web_search_shadows: Vec::new(),
         }
     }
 }
@@ -131,6 +148,49 @@ impl AnthropicToResponsesState {
                 self.anthropic_usage.insert(key.clone(), value.clone());
             }
         }
+    }
+
+    fn add_completed_web_search_use(&mut self, call_id: String, block: Value) {
+        self.web_search_uses.insert(call_id.clone(), block);
+        self.pair_completed_web_search_shadow(&call_id);
+    }
+
+    fn add_completed_web_search_result(&mut self, call_id: String, block: Value) {
+        self.web_search_results.insert(call_id.clone(), block);
+        self.pair_completed_web_search_shadow(&call_id);
+    }
+
+    fn pair_completed_web_search_shadow(&mut self, call_id: &str) {
+        if !self.web_search_uses.contains_key(call_id)
+            || !self.web_search_results.contains_key(call_id)
+        {
+            return;
+        }
+        let server_tool_use = self.web_search_uses.remove(call_id).unwrap();
+        let web_search_tool_result = self.web_search_results.remove(call_id).unwrap();
+        self.ready_web_search_shadows
+            .push(AnthropicWebSearchShadow {
+                server_tool_use,
+                web_search_tool_result,
+            });
+    }
+
+    fn complete_open_web_search_call(&mut self, call_id: &str) -> Vec<Bytes> {
+        let Some(index) = self
+            .blocks
+            .iter()
+            .find(|(_, block)| {
+                block.kind == BlockKind::WebSearch && block.call_id == call_id && !block.done
+            })
+            .map(|(index, _)| *index)
+        else {
+            return Vec::new();
+        };
+        self.close_block(index, true)
+    }
+
+    fn take_ready_web_search_shadows(&mut self) -> Vec<AnthropicWebSearchShadow> {
+        std::mem::take(&mut self.ready_web_search_shadows)
     }
 
     fn ensure_response_started(&mut self) -> Vec<Bytes> {
@@ -239,6 +299,66 @@ impl AnthropicToResponsesState {
                     },
                 );
             }
+            "server_tool_use"
+                if self.tool_context.hosted_web_search().is_some()
+                    && block.get("name").and_then(Value::as_str) == Some("web_search") =>
+            {
+                let call_id = block.get("id").and_then(Value::as_str).unwrap_or("");
+                if call_id.is_empty() {
+                    log::warn!(
+                        "[Codex/Anthropic] Ignoring web_search server_tool_use without an id"
+                    );
+                    return events;
+                }
+                let output_index = self.next_output_index();
+                let item_id = web_search_response_item_id(call_id);
+                let item = web_search_call_item(&item_id, "in_progress", None);
+                events.push(sse::output_item_added(output_index, &item));
+                let start_input = block
+                    .get("input")
+                    .filter(|value| value.as_object().is_some_and(|object| !object.is_empty()))
+                    .map(Value::to_string)
+                    .unwrap_or_default();
+                self.blocks.insert(
+                    index,
+                    BlockState {
+                        kind: BlockKind::WebSearch,
+                        output_index,
+                        item_id,
+                        call_id: call_id.to_string(),
+                        name: "web_search".to_string(),
+                        accum: String::new(),
+                        start_input,
+                        source_block: block.clone(),
+                        has_visible_summary: false,
+                        done: false,
+                    },
+                );
+            }
+            "web_search_tool_result" if self.tool_context.hosted_web_search().is_some() => {
+                let call_id = block
+                    .get("tool_use_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                if call_id.is_empty() {
+                    return events;
+                }
+                self.blocks.insert(
+                    index,
+                    BlockState {
+                        kind: BlockKind::WebSearchResult,
+                        output_index: 0,
+                        item_id: String::new(),
+                        call_id: call_id.to_string(),
+                        name: String::new(),
+                        accum: String::new(),
+                        start_input: String::new(),
+                        source_block: block.clone(),
+                        has_visible_summary: false,
+                        done: false,
+                    },
+                );
+            }
             "thinking" | "redacted_thinking" => {
                 let output_index = self.next_output_index();
                 let item_id = format!("rs_{}_{output_index}", self.response_id);
@@ -297,9 +417,15 @@ impl AnthropicToResponsesState {
                     .get("partial_json")
                     .and_then(|t| t.as_str())
                     .unwrap_or("");
+                if block.kind == BlockKind::WebSearchResult {
+                    return Vec::new();
+                }
                 block.accum.push_str(partial);
                 // The Read tool needs to be sanitized at close time, to avoid emitting pages:"" deltas mid-stream
-                if block.name == "Read" || self.tool_context.is_custom_tool_chat_name(&block.name) {
+                if block.kind == BlockKind::WebSearch
+                    || block.name == "Read"
+                    || self.tool_context.is_custom_tool_chat_name(&block.name)
+                {
                     return Vec::new();
                 }
                 vec![sse::function_call_arguments_delta(
@@ -349,6 +475,7 @@ impl AnthropicToResponsesState {
         let text = block.accum.clone();
         let call_id = block.call_id.clone();
         let name = block.name.clone();
+        let start_input = block.start_input.clone();
         let source_block = block.source_block.clone();
         let has_visible_summary = block.has_visible_summary;
 
@@ -368,7 +495,7 @@ impl AnthropicToResponsesState {
                 // content_block_start when the gateway emitted no deltas (mirrors the
                 // non-streaming aggregator's precedence in transform_codex_anthropic).
                 let raw_input = if text.trim().is_empty() {
-                    block.start_input.clone()
+                    start_input
                 } else {
                     text
                 };
@@ -406,6 +533,42 @@ impl AnthropicToResponsesState {
                 }
                 events.push(sse::output_item_done(output_index, &item));
                 self.output_items.push((output_index, item));
+                events
+            }
+            BlockKind::WebSearch => {
+                if !complete {
+                    return Vec::new();
+                }
+                let raw_input = if text.trim().is_empty() {
+                    start_input
+                } else {
+                    text
+                };
+                let parsed_input = serde_json::from_str::<Value>(&raw_input)
+                    .ok()
+                    .filter(Value::is_object);
+                let mut source_block = source_block;
+                if let Some(input) = parsed_input.as_ref() {
+                    source_block["input"] = input.clone();
+                }
+                let query = parsed_input
+                    .as_ref()
+                    .and_then(|input| input.get("query"))
+                    .and_then(Value::as_str)
+                    .or_else(|| source_block.pointer("/input/query").and_then(Value::as_str))
+                    .unwrap_or("");
+                let item = web_search_call_item(&item_id, "completed", Some(query));
+                let event = sse::output_item_done(output_index, &item);
+                self.output_items.push((output_index, item));
+                self.add_completed_web_search_use(call_id, source_block);
+                vec![event]
+            }
+            BlockKind::WebSearchResult => {
+                if !complete {
+                    return Vec::new();
+                }
+                let events = self.complete_open_web_search_call(&call_id);
+                self.add_completed_web_search_result(call_id, source_block);
                 events
             }
             BlockKind::Thinking => {
@@ -447,9 +610,10 @@ impl AnthropicToResponsesState {
     fn has_substantive_output(&self) -> bool {
         !self.output_items.is_empty()
             || self.blocks.values().any(|b| {
-                !b.accum.trim().is_empty()
-                    || !b.call_id.trim().is_empty()
-                    || !b.name.trim().is_empty()
+                b.kind != BlockKind::WebSearchResult
+                    && (!b.accum.trim().is_empty()
+                        || !b.call_id.trim().is_empty()
+                        || !b.name.trim().is_empty())
             })
     }
 
@@ -477,6 +641,7 @@ impl AnthropicToResponsesState {
 
         let (status, incomplete_reason) =
             map_anthropic_stop_reason_to_status(self.stop_reason.as_deref());
+        log_web_search_usage(Some(&Value::Object(self.anthropic_usage.clone())));
 
         let mut output = self.output_items.clone();
         output.sort_by_key(|(output_index, _)| *output_index);
@@ -735,6 +900,24 @@ pub(crate) fn create_responses_sse_stream_from_anthropic_with_context<
     stream: impl Stream<Item = Result<Bytes, E>> + Send + 'static,
     tool_context: CodexToolContext,
 ) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send {
+    create_responses_sse_stream_inner(stream, tool_context, None)
+}
+
+pub(crate) fn create_responses_sse_stream_from_anthropic_with_history<
+    E: std::error::Error + Send + 'static,
+>(
+    stream: impl Stream<Item = Result<Bytes, E>> + Send + 'static,
+    tool_context: CodexToolContext,
+    history: Arc<CodexChatHistoryStore>,
+) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send {
+    create_responses_sse_stream_inner(stream, tool_context, Some(history))
+}
+
+fn create_responses_sse_stream_inner<E: std::error::Error + Send + 'static>(
+    stream: impl Stream<Item = Result<Bytes, E>> + Send + 'static,
+    tool_context: CodexToolContext,
+    history: Option<Arc<CodexChatHistoryStore>>,
+) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send {
     async_stream::stream! {
         let mut buffer = String::new();
         let mut utf8_remainder: Vec<u8> = Vec::new();
@@ -754,6 +937,7 @@ pub(crate) fn create_responses_sse_stream_from_anthropic_with_context<
                     if json_document_candidate(&buffer).is_none() {
                         while let Some(block) = take_sse_block(&mut buffer) {
                             let (events, failed) = process_anthropic_sse_block(&mut state, &block);
+                            persist_ready_web_search_shadows(&mut state, history.as_ref()).await;
                             for event in events {
                                 yield Ok(event);
                             }
@@ -788,6 +972,12 @@ pub(crate) fn create_responses_sse_stream_from_anthropic_with_context<
             if !state.response_started {
                 if let Some(candidate) = json_document_candidate(&buffer) {
                     if let Ok(body) = serde_json::from_str::<Value>(candidate) {
+                        record_web_search_shadows_from_message(
+                            &state.tool_context,
+                            history.as_ref(),
+                            &body,
+                        )
+                        .await;
                         for event in responses_sse_events_from_anthropic_message(
                             &body,
                             state.tool_context.clone(),
@@ -800,6 +990,7 @@ pub(crate) fn create_responses_sse_stream_from_anthropic_with_context<
             }
             if !state.completed {
                 let (events, failed) = process_anthropic_sse_block(&mut state, &buffer);
+                persist_ready_web_search_shadows(&mut state, history.as_ref()).await;
                 for event in events {
                     yield Ok(event);
                 }
@@ -814,6 +1005,7 @@ pub(crate) fn create_responses_sse_stream_from_anthropic_with_context<
                 for event in state.finalize() {
                     yield Ok(event);
                 }
+                persist_ready_web_search_shadows(&mut state, history.as_ref()).await;
             } else if state.has_substantive_output() {
                 // Codex uses the terminal event type, not response.status, to
                 // distinguish truncated output from a successful completion.
@@ -821,6 +1013,7 @@ pub(crate) fn create_responses_sse_stream_from_anthropic_with_context<
                 for event in state.finalize() {
                     yield Ok(event);
                 }
+                persist_ready_web_search_shadows(&mut state, history.as_ref()).await;
             } else {
                 // Stream ended before any terminal signal or output: surface a failure.
                 if let Some(event) = state.failed_event(
@@ -834,8 +1027,46 @@ pub(crate) fn create_responses_sse_stream_from_anthropic_with_context<
     }
 }
 
+async fn persist_ready_web_search_shadows(
+    state: &mut AnthropicToResponsesState,
+    history: Option<&Arc<CodexChatHistoryStore>>,
+) {
+    let shadows = state.take_ready_web_search_shadows();
+    let (Some(history), Some(provider_id)) = (
+        history,
+        state
+            .tool_context
+            .web_search_provider_id()
+            .map(ToOwned::to_owned),
+    ) else {
+        return;
+    };
+    history
+        .record_anthropic_web_search_shadows(&provider_id, shadows)
+        .await;
+}
+
+async fn record_web_search_shadows_from_message(
+    tool_context: &CodexToolContext,
+    history: Option<&Arc<CodexChatHistoryStore>>,
+    message: &Value,
+) {
+    let (Some(history), Some(provider_id)) = (
+        history,
+        tool_context.web_search_provider_id().map(ToOwned::to_owned),
+    ) else {
+        return;
+    };
+    if tool_context.hosted_web_search().is_some() {
+        history
+            .record_anthropic_web_search_message(&provider_id, message)
+            .await;
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::super::codex_chat_history::WebSearchShadowLookup;
     use super::*;
     use futures::stream;
 
@@ -861,6 +1092,71 @@ mod tests {
             .into_iter()
             .map(|chunk| String::from_utf8_lossy(chunk.unwrap().as_ref()).to_string())
             .collect()
+    }
+
+    async fn run_chunked_with_context(
+        input: &str,
+        chunk_size: usize,
+        context: CodexToolContext,
+    ) -> String {
+        let chunks = input
+            .as_bytes()
+            .chunks(chunk_size)
+            .map(|chunk| Ok::<_, std::io::Error>(Bytes::copy_from_slice(chunk)))
+            .collect::<Vec<_>>();
+        create_responses_sse_stream_from_anthropic_with_context(stream::iter(chunks), context)
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .map(|chunk| String::from_utf8_lossy(chunk.unwrap().as_ref()).to_string())
+            .collect()
+    }
+
+    fn hosted_search_context(provider_id: Option<&str>) -> CodexToolContext {
+        super::super::transform_codex_chat::build_codex_tool_context_from_request_with_web_search(
+            &json!({ "tools": [{ "type": "web_search" }] }),
+            true,
+            provider_id.map(ToOwned::to_owned),
+        )
+    }
+
+    fn format_sse_events(events: Vec<Value>) -> String {
+        events
+            .into_iter()
+            .map(|event| {
+                format!(
+                    "event: {}\ndata: {}\n\n",
+                    event["type"].as_str().unwrap(),
+                    event
+                )
+            })
+            .collect()
+    }
+
+    fn hosted_search_sse(stop_search_block: bool) -> String {
+        let large_excerpt = "x".repeat(5000);
+        let mut events = vec![
+            json!({"type":"message_start","message":{"id":"msg_search","model":"claude","usage":{"input_tokens":4}}}),
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Searching."}}),
+            json!({"type":"content_block_stop","index":0}),
+            json!({"type":"content_block_start","index":1,"content_block":{"type":"server_tool_use","id":"srvtoolu_1","name":"web_search","input":{}}}),
+            json!({"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"query\":\"current "}}),
+            json!({"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"weather\"}"}}),
+        ];
+        if stop_search_block {
+            events.push(json!({"type":"content_block_stop","index":1}));
+        }
+        events.extend([
+            json!({"type":"content_block_start","index":2,"content_block":{"type":"web_search_tool_result","tool_use_id":"srvtoolu_1","content":[{"type":"web_search_result","title":"Weather","url":"https://example.com","excerpt":large_excerpt}],"encrypted_content":"opaque-result"}}),
+            json!({"type":"content_block_stop","index":2}),
+            json!({"type":"content_block_start","index":3,"content_block":{"type":"text","text":""}}),
+            json!({"type":"content_block_delta","index":3,"delta":{"type":"text_delta","text":"It is sunny."}}),
+            json!({"type":"content_block_stop","index":3}),
+            json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":4,"server_tool_use":{"web_search_requests":1}}}),
+            json!({"type":"message_stop"}),
+        ]);
+        format_sse_events(events)
     }
 
     fn render_message_events(body: &Value) -> String {
@@ -908,6 +1204,95 @@ mod tests {
         assert!(merged.contains("event: response.completed"));
         assert!(merged.contains("\"status\":\"completed\""));
         assert!(!merged.contains("event: response.failed"));
+    }
+
+    #[tokio::test]
+    async fn hosted_web_search_stream_has_completed_item_and_fragmented_query() {
+        let input = hosted_search_sse(true);
+        for chunk_size in [1, 7, 4096] {
+            let merged =
+                run_chunked_with_context(&input, chunk_size, hosted_search_context(None)).await;
+            assert!(merged.contains("\"type\":\"web_search_call\",\"status\":\"in_progress\""));
+            assert!(merged.contains("\"id\":\"ws_srvtoolu_1\""));
+            assert!(merged.contains("\"query\":\"current weather\""));
+            assert!(merged.contains("event: response.output_item.done"));
+            assert!(merged.contains("event: response.completed"));
+            assert!(merged.contains("\"text\":\"It is sunny.\""));
+
+            let added_item = merged
+                .find("\"type\":\"web_search_call\",\"status\":\"in_progress\"")
+                .unwrap();
+            let completed_item = merged
+                .find("\"type\":\"web_search_call\",\"status\":\"completed\"")
+                .unwrap();
+            let added_event = merged[..added_item]
+                .rfind("event: response.output_item.added")
+                .unwrap();
+            let completed_event = merged[..completed_item]
+                .rfind("event: response.output_item.done")
+                .unwrap();
+            assert!(added_event < completed_event);
+            assert!(completed_event < completed_item);
+            assert!(!merged.contains("web_search_tool_result"));
+            assert!(!merged.contains("web_search_requests"));
+        }
+    }
+
+    #[tokio::test]
+    async fn hosted_web_search_result_can_complete_an_open_server_tool_block() {
+        let merged = run_with_context(&hosted_search_sse(false), hosted_search_context(None)).await;
+        assert!(merged.contains("event: response.output_item.done"));
+        assert!(merged.contains("\"query\":\"current weather\""));
+        assert!(merged.contains("event: response.completed"));
+    }
+
+    #[tokio::test]
+    async fn hosted_web_search_shadow_is_saved_with_raw_result_blocks() {
+        let history = Arc::new(CodexChatHistoryStore::default());
+        let input = hosted_search_sse(true);
+        let chunks = input
+            .as_bytes()
+            .chunks(7)
+            .map(|chunk| Ok::<_, std::io::Error>(Bytes::copy_from_slice(chunk)))
+            .collect::<Vec<_>>();
+        let output = create_responses_sse_stream_from_anthropic_with_history(
+            stream::iter(chunks),
+            hosted_search_context(Some("provider-a")),
+            history.clone(),
+        )
+        .collect::<Vec<_>>()
+        .await;
+        assert!(output.iter().all(Result::is_ok));
+
+        let shadow = history
+            .lookup_anthropic_web_search_shadow("ws_srvtoolu_1", "provider-a")
+            .await;
+        let WebSearchShadowLookup::Found(shadow) = shadow else {
+            panic!("the completed hosted search pair should be cached");
+        };
+        assert_eq!(shadow.server_tool_use["input"]["query"], "current weather");
+        assert_eq!(
+            shadow.web_search_tool_result["type"],
+            "web_search_tool_result"
+        );
+        assert_eq!(
+            shadow.web_search_tool_result["encrypted_content"],
+            "opaque-result"
+        );
+    }
+
+    #[tokio::test]
+    async fn unfinished_hosted_web_search_is_not_completed_at_eof() {
+        let input = format_sse_events(vec![
+            json!({"type":"message_start","message":{"id":"msg_partial","model":"claude"}}),
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"server_tool_use","id":"srvtoolu_partial","name":"web_search","input":{}}}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"query\":\"unfinished"}}),
+        ]);
+        let merged = run_with_context(&input, hosted_search_context(None)).await;
+        assert!(merged.contains("event: response.output_item.added"));
+        assert!(!merged.contains("event: response.output_item.done"));
+        assert!(merged.contains("event: response.incomplete"));
+        assert!(!merged.contains("event: response.completed"));
     }
 
     #[tokio::test]

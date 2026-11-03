@@ -160,6 +160,25 @@ fn gemini_native_protocol_and_compat_defaults_parse_from_yaml() {
 }
 
 #[test]
+fn provider_web_search_mode_defaults_to_auto_and_parses_off() {
+    let config: Config = serde_saphyr::from_str(VALID_CONFIG_YAML).unwrap();
+    assert_eq!(
+        config.providers[0].compat.web_search,
+        cc_switch_lite::compat::request::WebSearchCompat::Auto
+    );
+
+    let configured = VALID_CONFIG_YAML.replace(
+        "    api_key: \"test-private-key\"",
+        "    api_key: \"test-private-key\"\n    compat:\n      web_search: off",
+    );
+    let config: Config = serde_saphyr::from_str(&configured).unwrap();
+    assert_eq!(
+        config.providers[0].compat.web_search,
+        cc_switch_lite::compat::request::WebSearchCompat::Off
+    );
+}
+
+#[test]
 fn gemini_native_rejects_api_key_query_auth_even_for_full_urls() {
     let mut config = valid_config();
     config.providers[0].protocol = Protocol::GeminiNative;

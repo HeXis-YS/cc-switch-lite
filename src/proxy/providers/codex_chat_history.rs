@@ -7,9 +7,31 @@ use futures::{Stream, StreamExt};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 
 const MAX_CACHED_RESPONSES: usize = 512;
+const WEB_SEARCH_SHADOW_TTL: Duration = Duration::from_secs(15 * 60);
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct AnthropicWebSearchShadow {
+    pub(crate) server_tool_use: Value,
+    pub(crate) web_search_tool_result: Value,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum WebSearchShadowLookup {
+    Found(AnthropicWebSearchShadow),
+    Missing,
+    ProviderMismatch,
+}
+
+#[derive(Debug, Clone)]
+struct CachedWebSearchShadow {
+    provider_id: String,
+    shadow: AnthropicWebSearchShadow,
+    inserted_at: Instant,
+}
 
 #[derive(Debug, Clone, Default)]
 struct CachedResponse {
@@ -22,6 +44,8 @@ struct CodexChatHistoryInner {
     responses: HashMap<String, CachedResponse>,
     response_order: VecDeque<String>,
     call_index: HashMap<String, VecDeque<String>>,
+    web_search_shadows: HashMap<String, CachedWebSearchShadow>,
+    web_search_shadow_order: VecDeque<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -73,6 +97,102 @@ impl CodexChatHistoryStore {
 
         let mut inner = self.inner.write().await;
         inner.insert_calls(response_id, calls)
+    }
+
+    pub(crate) async fn record_anthropic_web_search_message(
+        &self,
+        provider_id: &str,
+        message: &Value,
+    ) -> usize {
+        let Some(blocks) = message.get("content").and_then(Value::as_array) else {
+            return 0;
+        };
+
+        let mut uses = Vec::new();
+        let mut results = HashMap::new();
+        for block in blocks {
+            match block.get("type").and_then(Value::as_str) {
+                Some("server_tool_use")
+                    if block.get("name").and_then(Value::as_str) == Some("web_search") =>
+                {
+                    if let Some(id) = block
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .filter(|value| !value.is_empty())
+                    {
+                        uses.push((id.to_string(), block.clone()));
+                    }
+                }
+                Some("web_search_tool_result") => {
+                    if let Some(id) = block
+                        .get("tool_use_id")
+                        .and_then(Value::as_str)
+                        .filter(|value| !value.is_empty())
+                    {
+                        results.insert(id.to_string(), block.clone());
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let shadows = uses
+            .into_iter()
+            .filter_map(|(id, server_tool_use)| {
+                results
+                    .remove(&id)
+                    .map(|web_search_tool_result| AnthropicWebSearchShadow {
+                        server_tool_use,
+                        web_search_tool_result,
+                    })
+            })
+            .collect::<Vec<_>>();
+        self.record_anthropic_web_search_shadows(provider_id, shadows)
+            .await
+    }
+
+    pub(crate) async fn record_anthropic_web_search_shadows(
+        &self,
+        provider_id: &str,
+        shadows: Vec<AnthropicWebSearchShadow>,
+    ) -> usize {
+        if shadows.is_empty() {
+            return 0;
+        }
+        let now = Instant::now();
+        let mut inner = self.inner.write().await;
+        let mut recorded = 0;
+        for shadow in shadows {
+            let Some(server_tool_id) = shadow
+                .server_tool_use
+                .get("id")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+            else {
+                continue;
+            };
+            let response_item_id = web_search_response_item_id(server_tool_id);
+            inner.insert_web_search_shadow(response_item_id, provider_id, shadow, now);
+            recorded += 1;
+        }
+        recorded
+    }
+
+    pub(crate) async fn lookup_anthropic_web_search_shadow(
+        &self,
+        response_item_id: &str,
+        provider_id: &str,
+    ) -> WebSearchShadowLookup {
+        let now = Instant::now();
+        let mut inner = self.inner.write().await;
+        inner.prune_web_search_shadows(now);
+        match inner.web_search_shadows.get(response_item_id) {
+            Some(cached) if cached.provider_id == provider_id => {
+                WebSearchShadowLookup::Found(cached.shadow.clone())
+            }
+            Some(_) => WebSearchShadowLookup::ProviderMismatch,
+            None => WebSearchShadowLookup::Missing,
+        }
     }
 
     async fn record_call_item(&self, response_id: Option<&str>, item: &Value) -> bool {
@@ -247,6 +367,48 @@ impl CodexChatHistoryInner {
         }
     }
 
+    fn insert_web_search_shadow(
+        &mut self,
+        response_item_id: String,
+        provider_id: &str,
+        shadow: AnthropicWebSearchShadow,
+        now: Instant,
+    ) {
+        self.web_search_shadows.insert(
+            response_item_id.clone(),
+            CachedWebSearchShadow {
+                provider_id: provider_id.to_string(),
+                shadow,
+                inserted_at: now,
+            },
+        );
+        self.web_search_shadow_order
+            .retain(|cached_id| cached_id != &response_item_id);
+        self.web_search_shadow_order.push_back(response_item_id);
+        self.prune_web_search_shadows(now);
+    }
+
+    fn prune_web_search_shadows(&mut self, now: Instant) {
+        let expired = self
+            .web_search_shadows
+            .iter()
+            .filter(|(_, cached)| now.duration_since(cached.inserted_at) >= WEB_SEARCH_SHADOW_TTL)
+            .map(|(response_item_id, _)| response_item_id.clone())
+            .collect::<HashSet<_>>();
+        if !expired.is_empty() {
+            self.web_search_shadows
+                .retain(|response_item_id, _| !expired.contains(response_item_id));
+            self.web_search_shadow_order
+                .retain(|response_item_id| !expired.contains(response_item_id));
+        }
+        while self.web_search_shadow_order.len() > MAX_CACHED_RESPONSES {
+            let Some(response_item_id) = self.web_search_shadow_order.pop_front() else {
+                break;
+            };
+            self.web_search_shadows.remove(&response_item_id);
+        }
+    }
+
     fn index_call(&mut self, call_id: &str, response_id: &str) {
         let response_ids = self.call_index.entry(call_id.to_string()).or_default();
         if !response_ids
@@ -348,6 +510,10 @@ impl CachedLookup {
         );
         group
     }
+}
+
+pub(crate) fn web_search_response_item_id(server_tool_id: &str) -> String {
+    format!("ws_{server_tool_id}")
 }
 
 fn append_restore_group(
@@ -989,5 +1155,77 @@ mod tests {
 
         assert_eq!(history.enrich_request(&mut request).await, 1);
         assert_eq!(request["input"][0]["reasoning_content"], "Need a file.");
+    }
+
+    #[tokio::test]
+    async fn web_search_shadows_are_provider_scoped_and_preserve_source_blocks() {
+        let history = CodexChatHistoryStore::default();
+        let shadow = AnthropicWebSearchShadow {
+            server_tool_use: json!({
+                "type":"server_tool_use",
+                "id":"srvtoolu_1",
+                "name":"web_search",
+                "input":{"query":"weather"},
+                "encrypted_content":"opaque"
+            }),
+            web_search_tool_result: json!({
+                "type":"web_search_tool_result",
+                "tool_use_id":"srvtoolu_1",
+                "content":[{"type":"web_search_result","url":"https://example.com"}]
+            }),
+        };
+        assert_eq!(
+            history
+                .record_anthropic_web_search_shadows("provider-a", vec![shadow.clone()])
+                .await,
+            1
+        );
+        assert_eq!(
+            history
+                .lookup_anthropic_web_search_shadow("ws_srvtoolu_1", "provider-a")
+                .await,
+            WebSearchShadowLookup::Found(shadow)
+        );
+        assert_eq!(
+            history
+                .lookup_anthropic_web_search_shadow("ws_srvtoolu_1", "provider-b")
+                .await,
+            WebSearchShadowLookup::ProviderMismatch
+        );
+        assert_eq!(
+            history
+                .lookup_anthropic_web_search_shadow("ws_missing", "provider-a")
+                .await,
+            WebSearchShadowLookup::Missing
+        );
+    }
+
+    #[test]
+    fn web_search_shadow_cache_is_bounded_and_expires_entries() {
+        let now = Instant::now();
+        let shadow_for = |index: usize| AnthropicWebSearchShadow {
+            server_tool_use: json!({"id": format!("srvtoolu_{index}")}),
+            web_search_tool_result: json!({"tool_use_id": format!("srvtoolu_{index}")}),
+        };
+        let mut inner = CodexChatHistoryInner::default();
+        for index in 0..=MAX_CACHED_RESPONSES {
+            let response_item_id = format!("ws_srvtoolu_{index}");
+            inner.insert_web_search_shadow(response_item_id, "provider", shadow_for(index), now);
+        }
+        assert_eq!(inner.web_search_shadows.len(), MAX_CACHED_RESPONSES);
+        assert!(!inner.web_search_shadows.contains_key("ws_srvtoolu_0"));
+
+        let expired_id = "ws_expired".to_string();
+        inner.web_search_shadows.insert(
+            expired_id.clone(),
+            CachedWebSearchShadow {
+                provider_id: "provider".to_string(),
+                shadow: shadow_for(9999),
+                inserted_at: now - WEB_SEARCH_SHADOW_TTL - Duration::from_secs(1),
+            },
+        );
+        inner.web_search_shadow_order.push_back(expired_id.clone());
+        inner.prune_web_search_shadows(now);
+        assert!(!inner.web_search_shadows.contains_key(&expired_id));
     }
 }
