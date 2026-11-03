@@ -1,7 +1,7 @@
 //! End-to-end compatibility checks through real proxy and mock HTTP sockets.
 use axum::{
     body::Body,
-    extract::{DefaultBodyLimit, State},
+    extract::{DefaultBodyLimit, OriginalUri, State},
     http::{HeaderMap, StatusCode},
     response::Response,
     routing::post,
@@ -48,9 +48,24 @@ impl Reply {
 #[derive(Clone)]
 struct Mock {
     calls: Arc<Mutex<Vec<Value>>>,
+    requests: Arc<Mutex<Vec<ObservedRequest>>>,
     replies: Arc<Vec<Reply>>,
 }
-async fn upstream(State(mock): State<Mock>, Json(body): Json<Value>) -> Response {
+#[derive(Clone)]
+struct ObservedRequest {
+    uri: String,
+    headers: HeaderMap,
+}
+async fn upstream(
+    State(mock): State<Mock>,
+    OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    mock.requests.lock().await.push(ObservedRequest {
+        uri: uri.to_string(),
+        headers,
+    });
     let mut calls = mock.calls.lock().await;
     let i = calls.len();
     calls.push(body);
@@ -86,6 +101,7 @@ impl Fixture {
     ) -> Self {
         let mock = Mock {
             calls: Arc::default(),
+            requests: Arc::default(),
             replies: Arc::new(replies),
         };
         let (url, upstream_task) = start(
@@ -93,6 +109,7 @@ impl Fixture {
                 .route("/v1/responses", post(upstream))
                 .route("/v1/chat/completions", post(upstream))
                 .route("/v1/messages", post(upstream))
+                .route("/v1beta/models/:model_action", post(upstream))
                 .layer(DefaultBodyLimit::max(200 * 1024 * 1024))
                 .with_state(mock.clone()),
         )
@@ -125,12 +142,22 @@ impl Fixture {
         }
     }
     async fn send(&self, input: Value) -> reqwest::Response {
-        reqwest::Client::new()
-            .post(format!("{}/v1/responses", self.url))
-            .json(&input)
-            .send()
-            .await
-            .unwrap()
+        self.send_with_headers_and_query(input, None, &[]).await
+    }
+    async fn send_with_headers_and_query(
+        &self,
+        input: Value,
+        query: Option<&str>,
+        headers: &[(&str, &str)],
+    ) -> reqwest::Response {
+        let query = query.map(|value| format!("?{value}")).unwrap_or_default();
+        let mut request = reqwest::Client::new()
+            .post(format!("{}/v1/responses{query}", self.url))
+            .json(&input);
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
+        request.send().await.unwrap()
     }
     async fn send_body(&self, body: Vec<u8>, content_encoding: Option<&str>) -> reqwest::Response {
         let mut request = reqwest::Client::new()
@@ -717,4 +744,397 @@ async fn native_compaction_request_and_stream_are_both_adapted() {
     assert!(calls[0]
         .to_string()
         .contains("CONTEXT CHECKPOINT COMPACTION"));
+}
+
+#[tokio::test]
+async fn gemini_native_json_bridge_uses_native_url_auth_and_request_mapping() {
+    let fixture = Fixture::new(
+        Protocol::GeminiNative,
+        vec![Reply::json(
+            StatusCode::OK,
+            json!({
+                "responseId": "gemini-response-1",
+                "modelVersion": "gemini-3-pro",
+                "candidates": [{
+                    "content": {"role": "model", "parts": [
+                        {"text": "Checking the weather."},
+                        {"functionCall": {"id": "weather-call", "name": "lookup", "args": {"city": "Tokyo"}},
+                         "thoughtSignature": "signature-1"}
+                    ]},
+                    "finishReason": "STOP"
+                }],
+                "usageMetadata": {
+                    "promptTokenCount": 10,
+                    "cachedContentTokenCount": 2,
+                    "totalTokenCount": 15
+                }
+            }),
+        )],
+        |config| {
+            let origin = config.providers[0]
+                .base_url
+                .strip_suffix("/v1")
+                .unwrap()
+                .to_string();
+            // Gemini accepts an OpenAI-compatible base path as input; the
+            // native protocol resolver must replace it with the REST method.
+            config.providers[0].base_url = format!("{origin}/v1beta/openai/chat/completions");
+        },
+    )
+    .await;
+
+    let input = json!({
+        "model": "models/gemini-3-pro",
+        "instructions": "Use the weather tool when needed.",
+        "temperature": 0.2,
+        "top_p": 0.7,
+        "max_output_tokens": 1024,
+        "reasoning": {"effort": "high"},
+        "tools": [{
+            "type": "function",
+            "name": "lookup",
+            "description": "Look up a city's weather",
+            "parameters": {
+                "type": "object",
+                "properties": {"city": {"type": "string"}},
+                "required": ["city"]
+            }
+        }],
+        "tool_choice": {"type": "function", "name": "lookup"},
+        "input": [{
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": "What is the weather in Tokyo?"},
+                {"type": "input_image", "image_url": "data:image/png;base64,aGVsbG8="},
+                {"type": "input_file", "filename": "report.pdf", "file_data": "data:application/pdf;base64,cGRm"}
+            ]
+        }]
+    });
+    let response = fixture
+        .send_with_headers_and_query(
+            input,
+            Some("alt=client-value&trace=client"),
+            &[
+                ("authorization", "Bearer client-authorization"),
+                ("x-api-key", "client-anthropic-key"),
+                ("x-goog-api-key", "client-google-key"),
+            ],
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let response: Value = response.json().await.unwrap();
+    assert_eq!(response["usage"]["input_tokens"], 10);
+    assert_eq!(response["usage"]["output_tokens"], 5);
+    assert_eq!(response["usage"]["total_tokens"], 15);
+    assert_eq!(
+        response["usage"]["input_tokens_details"]["cached_tokens"],
+        2
+    );
+    let output = response["output"].as_array().unwrap();
+    assert!(output
+        .iter()
+        .any(|item| item["content"][0]["text"] == "Checking the weather."));
+    assert!(output.iter().any(|item| {
+        item["type"] == "function_call"
+            && item["name"] == "lookup"
+            && item["call_id"] == "weather-call"
+    }));
+
+    let calls = fixture.mock.calls.lock().await;
+    let sent = &calls[0];
+    assert_eq!(
+        sent["systemInstruction"]["parts"][0]["text"],
+        "Use the weather tool when needed."
+    );
+    assert_eq!(
+        sent["contents"][0]["parts"][0]["text"],
+        "What is the weather in Tokyo?"
+    );
+    assert_eq!(
+        sent["contents"][0]["parts"][1]["inlineData"]["mimeType"],
+        "image/png"
+    );
+    assert_eq!(
+        sent["contents"][0]["parts"][1]["inlineData"]["data"],
+        "aGVsbG8="
+    );
+    assert_eq!(
+        sent["contents"][0]["parts"][2]["inlineData"]["mimeType"],
+        "application/pdf"
+    );
+    assert_eq!(
+        sent["contents"][0]["parts"][2]["inlineData"]["data"],
+        "cGRm"
+    );
+    assert_eq!(sent["generationConfig"]["maxOutputTokens"], 1024);
+    assert_eq!(sent["generationConfig"]["temperature"], 0.2);
+    assert_eq!(sent["generationConfig"]["topP"], 0.7);
+    assert_eq!(
+        sent["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+        "HIGH"
+    );
+    assert_eq!(
+        sent["tools"][0]["functionDeclarations"][0]["name"],
+        "lookup"
+    );
+    assert_eq!(sent["toolConfig"]["functionCallingConfig"]["mode"], "ANY");
+    assert_eq!(
+        sent["toolConfig"]["functionCallingConfig"]["allowedFunctionNames"],
+        json!(["lookup"])
+    );
+    drop(calls);
+
+    let requests = fixture.mock.requests.lock().await;
+    assert_eq!(
+        requests[0].uri,
+        "/v1beta/models/gemini-3-pro:generateContent"
+    );
+    assert_eq!(
+        requests[0].headers["x-goog-api-key"],
+        "test-key-not-for-output"
+    );
+    assert!(!requests[0].headers.contains_key("authorization"));
+    assert!(!requests[0].headers.contains_key("x-api-key"));
+}
+
+#[tokio::test]
+async fn gemini_native_stream_uses_alt_sse_and_completes_responses_events() {
+    let chunks = concat!(
+        "data: {\"responseId\":\"stream-1\",\"modelVersion\":\"gemini-2.5-flash\",\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"hello\"}]}}],\"usageMetadata\":{\"promptTokenCount\":3,\"totalTokenCount\":5}}\n\n",
+        "data: {\"responseId\":\"stream-1\",\"modelVersion\":\"gemini-2.5-flash\",\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"hello\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":3,\"totalTokenCount\":5}}\n\n"
+    );
+    let fixture = Fixture::new(
+        Protocol::GeminiNative,
+        vec![Reply::new(
+            StatusCode::OK,
+            Some("text/event-stream"),
+            chunks,
+        )],
+        |_| {},
+    )
+    .await;
+    let response = fixture
+        .send_with_headers_and_query(
+            json!({"model":"gemini-2.5-flash","stream":true,"input":"hello"}),
+            Some("alt=json&trace=client"),
+            &[],
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["content-type"], "text/event-stream");
+    let body = response.text().await.unwrap();
+    assert!(body.contains("event: response.output_text.delta"));
+    assert!(body.contains("\"delta\":\"hello\""));
+    assert!(body.contains("event: response.completed"));
+    assert!(!body.contains("event: response.incomplete"));
+    assert_eq!(body.matches("event: response.output_text.delta").count(), 1);
+
+    let calls = fixture.mock.calls.lock().await;
+    assert!(calls[0].get("stream").is_none());
+    drop(calls);
+    let requests = fixture.mock.requests.lock().await;
+    assert_eq!(
+        requests[0].uri,
+        "/v1beta/models/gemini-2.5-flash:streamGenerateContent?alt=sse"
+    );
+}
+
+#[tokio::test]
+async fn gemini_native_replays_tool_signatures_with_fingerprint_sessions() {
+    let fixture = Fixture::new(
+        Protocol::GeminiNative,
+        vec![
+            Reply::json(
+                StatusCode::OK,
+                json!({
+                    "responseId": "tool-1",
+                    "modelVersion": "gemini-3-pro",
+                    "candidates": [{
+                        "content": {"parts": [{
+                            "functionCall": {"name": "lookup", "args": {"city": "Tokyo"}},
+                            "thoughtSignature": "signature-replay"
+                        }]},
+                        "finishReason": "STOP"
+                    }],
+                    "usageMetadata": {"promptTokenCount": 5, "totalTokenCount": 8}
+                }),
+            ),
+            Reply::json(
+                StatusCode::OK,
+                json!({
+                    "responseId": "tool-2",
+                    "modelVersion": "gemini-3-pro",
+                    "candidates": [{
+                        "content": {"parts": [{"text": "It is sunny."}]},
+                        "finishReason": "STOP"
+                    }],
+                    "usageMetadata": {"promptTokenCount": 8, "totalTokenCount": 12}
+                }),
+            ),
+        ],
+        |_| {},
+    )
+    .await;
+    let user_message = json!({
+        "role": "user",
+        "content": [{"type": "input_text", "text": "Find the weather in Tokyo."}]
+    });
+    let tools = json!([{
+        "type": "function",
+        "name": "lookup",
+        "description": "Look up a city's weather",
+        "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}
+    }]);
+    let first = fixture
+        .send(json!({
+            "model": "gemini-3-pro",
+            "input": [user_message.clone()],
+            "tools": tools.clone()
+        }))
+        .await;
+    assert_eq!(first.status(), StatusCode::OK);
+    let first: Value = first.json().await.unwrap();
+    let tool_call = first["output"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["type"] == "function_call")
+        .unwrap();
+    let client_call_id = tool_call["call_id"].as_str().unwrap().to_string();
+    assert!(client_call_id.starts_with("gemini_synth_"));
+
+    let second = fixture
+        .send(json!({
+            "model": "gemini-3-pro",
+            "input": [
+                user_message,
+                {
+                    "type": "function_call",
+                    "call_id": client_call_id.clone(),
+                    "name": "lookup",
+                    "arguments": "{\"city\":\"Tokyo\"}"
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": client_call_id,
+                    "output": "sunny"
+                }
+            ],
+            "tools": tools
+        }))
+        .await;
+    assert_eq!(second.status(), StatusCode::OK);
+
+    let calls = fixture.mock.calls.lock().await;
+    let contents = calls[1]["contents"].as_array().unwrap();
+    let assistant_call = contents
+        .iter()
+        .flat_map(|content| content["parts"].as_array().into_iter().flatten())
+        .find(|part| part.get("functionCall").is_some())
+        .unwrap();
+    assert_eq!(assistant_call["thoughtSignature"], "signature-replay");
+    assert!(assistant_call["functionCall"].get("id").is_none());
+    let function_response = contents
+        .iter()
+        .flat_map(|content| content["parts"].as_array().into_iter().flatten())
+        .find(|part| part.get("functionResponse").is_some())
+        .unwrap();
+    assert_eq!(function_response["functionResponse"]["name"], "lookup");
+    assert!(function_response["functionResponse"].get("id").is_none());
+}
+
+#[tokio::test]
+async fn gemini_native_incomplete_tool_call_is_not_committed() {
+    let fixture = Fixture::new(
+        Protocol::GeminiNative,
+        vec![Reply::json(
+            StatusCode::OK,
+            json!({
+                "responseId": "truncated-tool",
+                "modelVersion": "gemini-2.5-pro",
+                "candidates": [{
+                    "content": {"parts": [{
+                        "functionCall": {"name": "lookup", "args": {"city": "Tokyo"}}
+                    }]},
+                    "finishReason": "MAX_TOKENS"
+                }],
+                "usageMetadata": {"promptTokenCount": 5, "totalTokenCount": 8}
+            }),
+        )],
+        |_| {},
+    )
+    .await;
+    let response = fixture
+        .send(json!({
+            "model": "gemini-2.5-pro",
+            "input": "Find the weather in Tokyo.",
+            "tools": [{
+                "type": "function",
+                "name": "lookup",
+                "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}
+            }]
+        }))
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let response: Value = response.json().await.unwrap();
+    assert_eq!(response["status"], "incomplete");
+    assert_eq!(response["output"], json!([]));
+    assert_eq!(
+        response["incomplete_details"]["reason"],
+        "max_output_tokens"
+    );
+}
+
+#[tokio::test]
+async fn gemini_native_rejects_remote_image_and_document_sources_before_forwarding() {
+    for media in [
+        json!({"type":"input_image","image_url":"https://example.com/image.png"}),
+        json!({"type":"input_file","file_url":"https://example.com/report.pdf"}),
+    ] {
+        let fixture = Fixture::new(
+            Protocol::GeminiNative,
+            vec![Reply::json(StatusCode::OK, json!({}))],
+            |_| {},
+        )
+        .await;
+        let response = fixture
+            .send(json!({
+                "model": "gemini-2.5-flash",
+                "input": [{"role":"user","content":[media]}]
+            }))
+            .await;
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(response
+            .text()
+            .await
+            .unwrap()
+            .contains("only supports base64"));
+        assert!(fixture.mock.calls.lock().await.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn gemini_native_errors_do_not_echo_the_provider_key() {
+    for (reply, expected_status) in [
+        (
+            Reply::json(
+                StatusCode::BAD_GATEWAY,
+                json!({"error":{"message":"upstream diagnostic test-key-not-for-output"}}),
+            ),
+            StatusCode::BAD_GATEWAY,
+        ),
+        (
+            Reply::json(
+                StatusCode::OK,
+                json!({"error":{"status":"INVALID_ARGUMENT","message":"test-key-not-for-output"}}),
+            ),
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+    ] {
+        let fixture = Fixture::new(Protocol::GeminiNative, vec![reply], |_| {}).await;
+        let response = fixture.send(input(false)).await;
+        assert_eq!(response.status(), expected_status);
+        let body = response.text().await.unwrap();
+        assert!(!body.contains("test-key-not-for-output"));
+    }
 }

@@ -17,6 +17,7 @@ use crate::{
                 responses_sse_events_from_anthropic_message,
             },
             streaming_codex_chat::create_responses_sse_stream_from_chat_with_context,
+            streaming_gemini::create_anthropic_sse_stream_from_gemini,
             transform_codex_anthropic,
             transform_codex_chat::{self, CodexToolContext},
             transform_codex_responses_namespace::{restore_response_namespaces, NamespacedName},
@@ -177,6 +178,19 @@ pub(crate) async fn handle(
             }
         }
         return Ok(build(status, headers, Body::from(bytes), false));
+    }
+    if protocol == Protocol::GeminiNative && status.is_success() && is_sse {
+        let gemini_stream = create_anthropic_sse_stream_from_gemini(
+            upstream.bytes_stream(),
+            Some(gemini_shadow),
+            options.gemini_provider_id.clone(),
+            options.gemini_session_id.clone(),
+            options.gemini_tool_schema_hints.clone(),
+        );
+        let anthropic_stream = repair_anthropic_sse_tail(gemini_stream);
+        return Ok(sse_response(Body::from_stream(
+            create_responses_sse_stream_from_anthropic_with_context(anthropic_stream, context),
+        )));
     }
     if !status.is_success() {
         let (headers, status, bytes) = decode_response(upstream).await?;
