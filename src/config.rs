@@ -11,6 +11,8 @@ pub struct Config {
     pub compat: crate::compat::CompatConfig,
     pub server: Server,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub model_mappings: Vec<ModelMappingRule>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub routes: Vec<RouteRule>,
     pub providers: Vec<Provider>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -36,6 +38,13 @@ pub struct RouteRule {
     pub name: String,
     pub model_pattern: String,
     pub provider: String,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelMappingRule {
+    pub model_pattern: String,
+    pub target_model: String,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -113,6 +122,15 @@ impl Config {
             }
         }
 
+        for mapping in &self.model_mappings {
+            if mapping.model_pattern.trim().is_empty() {
+                bail!("Model mapping has empty model_pattern");
+            }
+            if mapping.target_model.trim().is_empty() {
+                bail!("Model mapping has empty target_model");
+            }
+        }
+
         // 验证路由规则
         let mut route_names = HashSet::new();
         for route in &self.routes {
@@ -164,6 +182,14 @@ impl Config {
 
         None
     }
+
+    /// Maps the original model once, using the first matching rule.
+    pub fn map_model<'a>(&'a self, model: &'a str) -> &'a str {
+        self.model_mappings
+            .iter()
+            .find(|rule| glob_match(&rule.model_pattern, model))
+            .map_or(model, |rule| rule.target_model.as_str())
+    }
 }
 
 #[cfg(test)]
@@ -176,6 +202,7 @@ mod tests {
             version: 1,
             compat: Default::default(),
             server: Server::default(),
+            model_mappings: vec![],
             routes: vec![
                 RouteRule {
                     name: "claude".into(),
@@ -251,6 +278,7 @@ mod tests {
             version: 1,
             compat: Default::default(),
             server: Server::default(),
+            model_mappings: vec![],
             routes: vec![
                 RouteRule {
                     name: "specific".into(),
@@ -290,6 +318,7 @@ fn test_route_ccs_model() {
         version: 1,
         compat: Default::default(),
         server: Server::default(),
+        model_mappings: vec![],
         routes: vec![RouteRule {
             name: "claude-models".into(),
             model_pattern: "claude-*".into(),

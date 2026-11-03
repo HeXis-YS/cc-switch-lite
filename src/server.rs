@@ -92,17 +92,26 @@ async fn responses(
         } else {
             Ok(body)
         };
-    let input = decoded.and_then(|bytes| {
+    let mut input = decoded.and_then(|bytes| {
         serde_json::from_slice::<Value>(&bytes)
             .map_err(|_| ProxyError::InvalidRequest("Invalid JSON request".into()))
     });
-    let model = input
+    let mut model = input
         .as_ref()
         .ok()
         .and_then(|v| v.get("model"))
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_owned();
+    if !model.trim().is_empty() {
+        let mapped_model = app.config.map_model(&model).to_owned();
+        if mapped_model != model {
+            model = mapped_model;
+            if let Ok(input) = &mut input {
+                input["model"] = Value::String(model.clone());
+            }
+        }
+    }
     let streaming = input
         .as_ref()
         .ok()

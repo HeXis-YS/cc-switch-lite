@@ -1,6 +1,6 @@
 # cc-switch-lite
 
-独立 Rust 单端口代理，为 Codex CLI 提供 `POST /v1/responses`，按模型选择 Provider。
+独立 Rust 单端口代理，为 Codex CLI 提供 `POST /v1/responses`，可先映射请求模型名，再按模型选择 Provider。
 支持 Responses 透传，以及 Chat Completions、Anthropic Messages 和原生 Gemini 转换（JSON/SSE、工具调用及思考等级）。
 
 ## 使用
@@ -17,8 +17,9 @@ install -m 600 config.example.yaml config.yaml
 ```
 
 配置文件仅支持 YAML。直接编辑 [config.example.yaml](config.example.yaml) 的副本，字段、协议地址、
-路由匹配及兼容选项见 [配置指南](docs/configuration.md)。单 Provider 可以只配置 `default_route`；
-多个 Provider 可通过有序的 `routes` 列表按模型选择，首个匹配生效，路由不改写模型名。
+模型映射、路由匹配及兼容选项见 [配置指南](docs/configuration.md)。单 Provider 可以只配置 `default_route`；
+多个 Provider 可先用 `model_mappings` 将客户端模型名映射为上游模型名，再由有序的 `routes` 选择 Provider。
+映射和路由都按列表顺序使用首个匹配项；未映射时沿用客户端模型名，路由本身只选择 Provider。
 旧配置中的顶层 `route.provider` 需迁移为 `default_route.provider`；旧 `route` 字段会被 `validate` 拒绝。
 
 每次修改后先运行 `validate`，成功时输出 `Configuration valid`，再重启服务。
@@ -42,7 +43,7 @@ Responses 的 `previous_response_id` 原样交上游。Chat 路径复用 `CodexC
 在进程内缓存最近 512 条含工具调用的响应，恢复工具结果之前的调用及 reasoning 内容；重启后缓存消失。
 Messages 保持参考转换行为，不额外套用 Chat 缓存。
 Gemini Native 路径在进程内按 Provider 和客户端会话或会话指纹保存最多 200 个会话、每个会话 64 轮的工具签名状态；服务重启后状态消失。
-不提供跨 Provider/实例会话迁移、自定义模型映射、负载均衡、OAuth、管理 API 或热加载。
+不提供跨 Provider/实例会话迁移、负载均衡、OAuth、管理 API 或热加载。
 
 Chat、Messages 和 Gemini 的截断通过 `response.incomplete` 报告；未完成的工具调用不提交执行。
 三条转换路径支持 namespace 内的 custom 工具，并将 Codex `text.format` 的 JSON schema 映射到对应上游字段。

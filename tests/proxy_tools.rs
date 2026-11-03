@@ -74,6 +74,7 @@ async fn setup(protocol: Protocol, body: String, sse: bool) -> (String, Config, 
         default_route: Some(DefaultRoute {
             provider: "one".into(),
         }),
+        model_mappings: vec![],
         routes: vec![],
         providers: vec![Provider {
             id: "one".into(),

@@ -35,7 +35,7 @@ providers:
     api_key: "replace-with-your-key"
 ```
 
-客户端仍需自行将 Responses endpoint 指向代理的 `/v1`，并发送上游接受的模型名。
+客户端仍需自行将 Responses endpoint 指向代理的 `/v1`。模型名可以直接使用上游名称，也可以通过 `model_mappings` 映射。
 代理不提供入口鉴权；监听非回环地址时，应部署在可信内网或由外部网络层限制访问。
 
 ## 顶层字段
@@ -45,8 +45,9 @@ providers:
 | `version` | 必需，必须为 `1` | 配置版本 |
 | `server.listen` | 必需，无文件默认值 | 监听 IP 和端口，例如 `"127.0.0.1:15721"`；不是 URL 或主机名 |
 | `providers` | 必需 | Provider 列表，字段见下表 |
-| `default_route.provider` | 可省略 | 未命中任何规则时使用的 Provider ID |
-| `routes` | 默认 `[]` | 按顺序匹配完整请求模型名的规则列表 |
+| `default_route.provider` | 可省略 | 未命中 `routes` 时使用的 Provider ID |
+| `model_mappings` | 默认 `[]` | 路由前按顺序匹配并改写模型名的规则列表 |
+| `routes` | 默认 `[]` | 按顺序匹配完整有效模型名的规则列表 |
 | `compat` | 可省略 | 全局兼容选项，通常沿用默认值即可 |
 
 必须至少配置一条 `routes` 规则或一个默认 Provider。所有路由引用必须指向已有 Provider；
@@ -88,9 +89,27 @@ Gemini 形态的完整模型 endpoint 会改写为当前请求的模型和方法
 此时 `base_url` 可含 query。Chat 和 Messages 对标准完整 endpoint 也有自动识别；
 普通接入优先使用上表中的 API 前缀写法。
 
-## 按模型分流
+## 模型映射与按模型分流
 
-[完整示例](../config.example.yaml) 将 `claude-*` 发给 Messages Provider，将 `gpt-[45]*`
+### 全局模型映射
+
+`model_mappings` 是可选的全局有序映射列表。代理先用原始请求模型名查找首个匹配规则；命中后将模型名改为
+`target_model`，再用该名称匹配 `routes` 并准备上游请求。映射只执行一次，目标模型不会再次匹配映射规则；
+没有规则命中时沿用原始请求模型名；所选协议仍执行既有请求转换。空白的 `model_pattern` 或 `target_model` 会导致配置校验失败。
+
+每条 `model_mappings[]` 规则包含两个必填字符串：
+
+| 字段 | 含义 |
+| --- | --- |
+| `model_pattern` | 非空 glob，匹配完整的原始请求模型名；不是 regex |
+| `target_model` | 非空的替换模型名 |
+
+映射使用与 `routes` 相同的 glob 语法：`*` 不跨 `/`，`**` 可跨 `/`。规则按列表顺序检查，首个匹配生效；
+映射规则没有 `name` 字段。完整配置中的写法见[示例](../config.example.yaml)。
+
+### Provider 路由
+
+完整示例将 `claude-*` 发给 Messages Provider，将 `gpt-[45]*`
 发给 Chat Provider，其他模型使用默认 Responses Provider。
 
 每条 `routes[]` 规则包含三个必填字符串：
@@ -98,7 +117,7 @@ Gemini 形态的完整模型 endpoint 会改写为当前请求的模型和方法
 | 字段 | 含义 |
 | --- | --- |
 | `name` | 非空且唯一的规则名称 |
-| `model_pattern` | 非空的 glob，匹配整个请求 `model`；不是 regex |
+| `model_pattern` | 非空的 glob，匹配完整模型名；不是 regex。有映射时匹配 `target_model`，否则匹配原始请求名 |
 | `provider` | 目标 Provider 的 `id` |
 
 规则按列表顺序检查，首个匹配生效，没有单独的优先级字段。
@@ -114,8 +133,8 @@ Gemini 形态的完整模型 endpoint 会改写为当前请求的模型和方法
 | `deepseek/*` | `deepseek/deepseek-chat` | `deepseek/team/model` |
 | `**` | `gpt-4.1`、`vendor/model` | — |
 
-`*` 不跨 `/`，跨路径匹配使用 `**`。路由不添加、删除或映射模型前缀：
-请求 `vendor/claude-opus-5-5` 时，规则也需要匹配完整名称，且上游必须接受该名称。
+`*` 不跨 `/`，跨路径匹配使用 `**`。`routes` 只选择 Provider，不修改模型名。
+例如没有映射时，请求 `vendor/claude-opus-5-5` 需要由能匹配完整名称的路由处理，且上游必须接受该名称。
 协议兼容分支对模型标记的处理另见 [请求兼容清单](request-compatibility.md)。
 
 手工维护时：新增 Provider 后再添加引用它的规则；改名 `id` 时同步修改所有路由引用；
@@ -207,8 +226,8 @@ Gemini 图片和文档输入只接受 Base64 内容；远程 URL 输入会在本
 
 ## 校验边界与排查
 
-`validate` 检查版本、必填字段、ID 与规则名称唯一性、Provider 引用、地址、凭据和受限兼容选项。
-顶层配置、`providers[]`、`routes[]`、`default_route`、顶层及 Provider 的 `compat`、
+`validate` 检查版本、必填字段、映射规则的非空 pattern 和目标模型、ID 与路由名称唯一性、Provider 引用、地址、凭据和受限兼容选项。
+顶层配置、`model_mappings[]`、`providers[]`、`routes[]`、`default_route`、顶层及 Provider 的 `compat`、
 `compat.transport`、Provider 的 `compat.meta` 和 `localProxyRequestOverrides` 对象会拒绝未知字段。
 `server`、`optimizer`、`rectifier` 和 `codexChatReasoning` 的未知字段沿用当前反序列化行为，可能被忽略；
 不能依赖 `validate` 发现这些子结构中的所有拼写错误。

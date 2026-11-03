@@ -50,7 +50,7 @@
 | signature/budget retries | **仅 ProviderType Claude/ClaudeAuth** | Codex 转 Messages 仍是 Codex Provider，因此不能因输出协议就启用这些重试 |
 | timeouts | handler context 在 failover=false 时传零 | 保留 forwarder 的流式 600 秒响应头等待和 24 小时总时限；不额外添加连接或 idle 超时；加密任务自身 hold 上限仍有效 |
 
-故障转移、熔断计量、stack 模型映射、官方账号/OAuth、Copilot、Bedrock 专用分支及其他客户端入口明确范围外。原版日志中的上游原始内容不能照搬到生产日志：凭据脱敏是已约定差异。
+故障转移、熔断计量、Stack 模型映射、官方账号/OAuth、Copilot、Bedrock 专用分支及其他客户端入口明确范围外。原版日志中的上游原始内容不能照搬到生产日志：凭据脱敏是已约定差异。
 
 ## Codex 协议契约修复
 

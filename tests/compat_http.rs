@@ -8,7 +8,7 @@ use axum::{
     Json, Router,
 };
 use cc_switch_lite::{
-    config::{Config, DefaultRoute, Protocol, Provider, Server},
+    config::{Config, DefaultRoute, ModelMappingRule, Protocol, Provider, RouteRule, Server},
     server,
 };
 use serde_json::{json, Value};
@@ -123,6 +123,7 @@ impl Fixture {
             default_route: Some(DefaultRoute {
                 provider: "one".into(),
             }),
+            model_mappings: vec![],
             routes: vec![],
             providers: vec![Provider {
                 id: "one".into(),
@@ -779,12 +780,22 @@ async fn gemini_native_json_bridge_uses_native_url_auth_and_request_mapping() {
             // Gemini accepts an OpenAI-compatible base path as input; the
             // native protocol resolver must replace it with the REST method.
             config.providers[0].base_url = format!("{origin}/v1beta/openai/chat/completions");
+            config.model_mappings.push(ModelMappingRule {
+                model_pattern: "client-gemini-*".into(),
+                target_model: "models/gemini-3-pro".into(),
+            });
+            config.routes.push(RouteRule {
+                name: "mapped-gemini".into(),
+                model_pattern: "models/gemini-*".into(),
+                provider: "one".into(),
+            });
+            config.default_route = None;
         },
     )
     .await;
 
     let input = json!({
-        "model": "models/gemini-3-pro",
+        "model": "client-gemini-alias",
         "instructions": "Use the weather tool when needed.",
         "temperature": 0.2,
         "top_p": 0.7,

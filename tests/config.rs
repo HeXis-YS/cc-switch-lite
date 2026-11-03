@@ -1,4 +1,4 @@
-use cc_switch_lite::config::{Config, DefaultRoute, Protocol, Provider, Server};
+use cc_switch_lite::config::{Config, DefaultRoute, ModelMappingRule, Protocol, Provider, Server};
 use std::fs;
 
 const VALID_CONFIG_YAML: &str = r#"version: 1
@@ -21,6 +21,7 @@ fn valid_config() -> Config {
         server: Server {
             listen: "127.0.0.1:15721".parse().unwrap(),
         },
+        model_mappings: vec![],
         routes: vec![],
         default_route: Some(DefaultRoute {
             provider: "a".into(),
@@ -66,6 +67,67 @@ fn missing_routing_and_duplicate_provider_are_rejected() {
     });
     config.providers.push(config.providers[0].clone());
     assert!(config.validate().is_err());
+}
+
+#[test]
+fn model_mappings_match_in_order_once_and_use_route_globs() {
+    let mut config = valid_config();
+    config.model_mappings = vec![
+        ModelMappingRule {
+            model_pattern: "client-*".into(),
+            target_model: "internal/team/model".into(),
+        },
+        ModelMappingRule {
+            model_pattern: "client-special".into(),
+            target_model: "later-match".into(),
+        },
+        ModelMappingRule {
+            model_pattern: "internal/**".into(),
+            target_model: "recursive-match".into(),
+        },
+        ModelMappingRule {
+            model_pattern: "vendor/*".into(),
+            target_model: "single-segment".into(),
+        },
+        ModelMappingRule {
+            model_pattern: "vendor/**".into(),
+            target_model: "multiple-segments".into(),
+        },
+    ];
+
+    assert_eq!(config.map_model("client-special"), "internal/team/model");
+    assert_eq!(config.map_model("vendor/model"), "single-segment");
+    assert_eq!(config.map_model("vendor/team/model"), "multiple-segments");
+    assert_eq!(config.map_model("unmapped/model"), "unmapped/model");
+}
+
+#[test]
+fn model_mappings_validate_required_strings_and_reject_unknown_fields() {
+    for rule in [
+        ModelMappingRule {
+            model_pattern: "  ".into(),
+            target_model: "mapped-model".into(),
+        },
+        ModelMappingRule {
+            model_pattern: "client-model".into(),
+            target_model: "\t".into(),
+        },
+    ] {
+        let mut config = valid_config();
+        config.model_mappings.push(rule);
+        assert!(config.validate().is_err());
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.yaml");
+    let input = format!(
+        "model_mappings:\n  - model_pattern: client-model\n    target_model: mapped-model\n    name: alias\n{VALID_CONFIG_YAML}"
+    );
+    fs::write(&path, input).unwrap();
+    assert_eq!(
+        Config::load(&path).err().unwrap().to_string(),
+        "Invalid YAML configuration"
+    );
 }
 
 #[test]

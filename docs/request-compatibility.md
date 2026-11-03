@@ -62,9 +62,10 @@ own enabled flag while honoring `cacheInjection`.
 
 - Provider storage is a typed in-memory projection; its optional UI/database
   fields exist only to compile unchanged source test fixtures.
-- Configured upstream model selection, Grok Build parsing, Stack routing,
-  Copilot normalization, OAuth auth passthrough and Claude inbound conversion
-  have no corresponding supported input. They are not simulated with live calls.
+- Grok Build parsing, Stack routing, Copilot normalization, OAuth auth
+  passthrough and Claude inbound conversion have no corresponding supported
+  input. They are not simulated with live calls. The global `model_mappings`
+  field is a separate route-mode feature; it does not implement these integrations.
 - The extracted Codex model helper omits the Grok Build configuration parser;
   public compatibility settings cannot supply a model or raw config string.
 - OpenCode's fallback User-Agent keeps `cc-switch/<package version>` syntax,

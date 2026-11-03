@@ -7,7 +7,7 @@ use axum::{
     Json, Router,
 };
 use cc_switch_lite::{
-    config::{Config, DefaultRoute, Protocol, Provider, Server},
+    config::{Config, DefaultRoute, ModelMappingRule, Protocol, Provider, Server},
     server,
 };
 use serde_json::{json, Value};
@@ -64,6 +64,7 @@ fn config(url: &str, protocol: Protocol) -> Config {
         default_route: Some(DefaultRoute {
             provider: "one".into(),
         }),
+        model_mappings: vec![],
         routes: vec![],
         providers: vec![Provider {
             id: "one".into(),
@@ -175,6 +176,10 @@ async fn model_routes_select_upstream_credentials_and_reject_unmatched_requests(
     provider.api_key = "messages-only-key".into();
     config.providers.push(provider);
     config.default_route = None;
+    config.model_mappings.push(ModelMappingRule {
+        model_pattern: "client-claude-*".into(),
+        target_model: "claude-opus-5-5".into(),
+    });
     config.routes.push(RouteRule {
         name: "claude".into(),
         model_pattern: "claude-*".into(),
@@ -182,7 +187,7 @@ async fn model_routes_select_upstream_credentials_and_reject_unmatched_requests(
     });
     // No default: matched requests must work without consulting a legacy selection.
     let (url, p) = start(server::router(config.clone()).unwrap()).await;
-    let response = send(&url, json!({"model":"claude-opus-5-5","input":"hi"})).await;
+    let response = send(&url, json!({"model":"client-claude-alias","input":"hi"})).await;
     assert_eq!(response.status(), StatusCode::OK);
     let result: Value = response.json().await.unwrap();
     assert_eq!(result["object"], "response");

@@ -6,12 +6,18 @@ server:
   # Use 127.0.0.1:15721 for local access only. No gateway authentication.
   listen: "0.0.0.0:15721"
 
+# Rewrite a client model name once before routing and forwarding.
+# The first matching rule wins; models without a match keep their request name.
+model_mappings:
+  - model_pattern: "gpt-latest"
+    target_model: "gpt-5"
+
 default_route:
-  # Used when no rule matches; must reference a providers[].id below.
+  # Used when no routes rule matches; must reference a providers[].id below.
   provider: provider-a
 
-# Rules match the complete request model in order; the first match wins.
-# Matching selects a provider and does not strip or rewrite model prefixes.
+# After optional model mapping, rules match the complete model in order;
+# the first match wins. Routes select a provider without rewriting that model.
 # "*" does not cross "/"; use "**" to match across path separators.
 # Omit routes for a single-provider configuration. Without a default route,
 # unmatched models fail. Restart the service after changing this file.
