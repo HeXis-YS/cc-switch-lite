@@ -475,7 +475,7 @@ fn convert_messages_to_contents(
 
         let gemini_role = if role == "assistant" { "model" } else { "user" };
 
-        let parts = if role == "assistant" {
+        let mut parts = if role == "assistant" {
             let positional_shadow_index = assistant_seen_index
                 .checked_sub(shadow_start_index)
                 .filter(|index| *index < effective_shadow_turns.len())
@@ -530,14 +530,13 @@ fn convert_messages_to_contents(
         };
 
         if role == "assistant" && requires_thought_signatures {
-            if let Some(first_function_call) =
-                parts.iter().find(|part| part.get("functionCall").is_some())
+            if let Some(first_function_call_index) = parts
+                .iter()
+                .position(|part| part.get("functionCall").is_some())
             {
-                if !has_thought_signature(first_function_call) {
-                    return Err(ProxyError::InvalidRequest(
-                        "Gemini 3+ requires a stored thought signature for prior function calls"
-                            .to_string(),
-                    ));
+                if !has_thought_signature(&parts[first_function_call_index]) {
+                    parts[first_function_call_index]["thoughtSignature"] =
+                        json!(GEMINI_SKIP_THOUGHT_SIGNATURE);
                 }
             }
         }
@@ -555,12 +554,22 @@ fn convert_messages_to_contents(
     Ok(contents)
 }
 
+const GEMINI_SKIP_THOUGHT_SIGNATURE: &str = "skip_thought_signature_validator";
+
 fn has_thought_signature(part: &Value) -> bool {
-    part.get("thoughtSignature")
-        .or_else(|| part.pointer("/functionCall/thoughtSignature"))
-        .or_else(|| part.pointer("/functionCall/thought_signature"))
-        .and_then(Value::as_str)
-        .is_some_and(|signature| !signature.is_empty())
+    [
+        part.get("thoughtSignature"),
+        part.get("thought_signature"),
+        part.pointer("/functionCall/thoughtSignature"),
+        part.pointer("/functionCall/thought_signature"),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|value| {
+        value
+            .as_str()
+            .is_some_and(|signature| !signature.is_empty())
+    })
 }
 
 fn strip_thought_signatures(mut parts: Vec<Value>) -> Vec<Value> {
@@ -2895,30 +2904,38 @@ mod tests {
     }
 
     #[test]
-    fn gemini_3_requires_signature_but_gemini_2_does_not_synthesize_one() {
+    fn gemini_3_falls_back_only_for_first_call_while_gemini_2_stays_unchanged() {
         let history = json!([
-            {"role": "assistant", "content": [{
-                "type": "tool_use", "id": "call_1", "name": "lookup", "input": {}
-            }]},
-            {"role": "user", "content": [{
-                "type": "tool_result", "tool_use_id": "call_1", "content": "done"
-            }]}
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "call_1", "name": "first", "input": {}},
+                {"type": "tool_use", "id": "call_2", "name": "second", "input": {}},
+                {"type": "tool_use", "id": "call_3", "name": "third", "input": {}}
+            ]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "call_1", "content": "done"},
+                {"type": "tool_result", "tool_use_id": "call_2", "content": "done"},
+                {"type": "tool_result", "tool_use_id": "call_3", "content": "done"}
+            ]}
         ]);
         let gemini_3 = json!({
             "model": "gemini-3.1-pro",
             "messages": history.clone()
         });
-        assert!(anthropic_to_gemini(gemini_3).is_err());
+        let result = anthropic_to_gemini(gemini_3).unwrap();
+        let parts = result["contents"][0]["parts"].as_array().unwrap();
+        assert_eq!(parts[0]["thoughtSignature"], GEMINI_SKIP_THOUGHT_SIGNATURE);
+        assert!(parts[1].get("thoughtSignature").is_none());
+        assert!(parts[2].get("thoughtSignature").is_none());
 
         let gemini_2 = json!({"model": "gemini-2.5-pro", "messages": history});
         let result = anthropic_to_gemini(gemini_2).unwrap();
-        assert!(result["contents"][0]["parts"][0]["functionCall"]
-            .get("thoughtSignature")
-            .is_none());
+        for part in result["contents"][0]["parts"].as_array().unwrap() {
+            assert!(part.get("thoughtSignature").is_none());
+        }
     }
 
     #[test]
-    fn disabling_signature_replay_keeps_tool_name_history_without_signature() {
+    fn disabling_signature_replay_uses_fallback_for_gemini_3() {
         let store = GeminiShadowStore::with_limits(8, 4);
         store.record_assistant_turn(
             "prov",
@@ -2937,7 +2954,7 @@ mod tests {
             )],
         );
         let input = json!({
-            "model": "gemini-2.5-pro",
+            "model": "gemini-3.1-pro",
             "messages": [
                 {"role": "assistant", "content": [{
                     "type": "tool_use", "id": "call_1", "name": "lookup", "input": {}
@@ -2963,6 +2980,10 @@ mod tests {
         assert_eq!(
             result["contents"][1]["parts"][0]["functionResponse"]["name"],
             "lookup"
+        );
+        assert_eq!(
+            result["contents"][0]["parts"][0]["thoughtSignature"],
+            GEMINI_SKIP_THOUGHT_SIGNATURE
         );
         assert!(!result.to_string().contains("private-signature"));
     }
