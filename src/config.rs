@@ -97,6 +97,15 @@ impl Config {
             {
                 bail!("Provider URL must be HTTP(S), without credentials, query or fragment");
             }
+            if p.protocol == Protocol::GeminiNative
+                && url
+                    .query_pairs()
+                    .any(|(name, _)| name.eq_ignore_ascii_case("key"))
+            {
+                bail!(
+                    "Gemini Native API keys must use the api_key header, not a key query parameter"
+                );
+            }
             if p.api_key.trim().is_empty()
                 || reqwest::header::HeaderValue::from_str(&format!("Bearer {}", p.api_key)).is_err()
             {

@@ -16,6 +16,12 @@ default_route:
 # Omit routes for a single-provider configuration. Without a default route,
 # unmatched models fail. Restart the service after changing this file.
 routes:
+  - name: gemini
+    model_pattern: "gemini-*"
+    provider: provider-d
+  - name: gemini-resource-name
+    model_pattern: "models/gemini-*"
+    provider: provider-d
   - name: claude
     model_pattern: "claude-*"
     provider: provider-c
@@ -42,3 +48,13 @@ providers:
     # Converts Responses requests and sends them to /v1/messages.
     base_url: "https://api.anthropic.com/v1"
     api_key: "replace-with-your-key"
+  - id: provider-d
+    name: Google Gemini
+    protocol: gemini_native
+    # Converts Responses requests and sends them to /v1beta/models/{model}:generateContent.
+    base_url: "https://generativelanguage.googleapis.com"
+    api_key: "replace-with-your-google-api-key"
+    compat:
+      gemini:
+        thought_signature_replay: true
+        thinking: auto

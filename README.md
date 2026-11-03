@@ -1,7 +1,7 @@
 # cc-switch-lite
 
 独立 Rust 单端口代理，为 Codex CLI 提供 `POST /v1/responses`，按模型选择 Provider。
-支持 Responses 透传、Chat Completions 和 Anthropic Messages 转换（JSON/SSE、工具调用及思考内容）。
+支持 Responses 透传，以及 Chat Completions、Anthropic Messages 和原生 Gemini 转换（JSON/SSE、工具调用及思考等级）。
 
 ## 使用
 
@@ -41,11 +41,12 @@ JSON 错误脱敏后转换为 Responses 风格错误，保留上游错误类型�
 Responses 的 `previous_response_id` 原样交上游。Chat 路径复用 `CodexChatHistoryStore`，
 在进程内缓存最近 512 条含工具调用的响应，恢复工具结果之前的调用及 reasoning 内容；重启后缓存消失。
 Messages 保持参考转换行为，不额外套用 Chat 缓存。
+Gemini Native 路径在进程内按 Provider 和客户端会话或会话指纹保存最多 200 个会话、每个会话 64 轮的工具签名状态；服务重启后状态消失。
 不提供跨 Provider/实例会话迁移、自定义模型映射、负载均衡、OAuth、管理 API 或热加载。
 
-Chat/Messages 的截断和内容过滤通过 `response.incomplete` 报告；未完成的工具调用不提交执行。
-两条路径支持 namespace 内的 custom 工具，并将 Codex `text.format` 的 JSON schema 映射到对应上游字段。
-Messages 不支持无 schema 的 `json_object` 请求，转换时返回错误；实际 schema 和模型支持由上游校验。
+Chat、Messages 和 Gemini 的截断通过 `response.incomplete` 报告；未完成的工具调用不提交执行。
+三条转换路径支持 namespace 内的 custom 工具，并将 Codex `text.format` 的 JSON schema 映射到对应上游字段。
+Messages 和 Gemini Native 不支持无 schema 的 `json_object` 请求；Gemini Native 需要对象类型的 JSON schema。实际 schema 和模型支持由上游校验。
 
 Messages 转换对 Opus 5.5 应用 [cc-switch #8048](https://github.com/farion1231/cc-switch/pull/8048)，
 并按本项目指定范围对 Sonnet 5.5、Fable 5.1、Haiku 5.5 启用相同行为：保留 adaptive thinking，允许完整的无签名工具历史。

@@ -59,7 +59,7 @@ providers:
 | --- | --- |
 | `id` | 必需、非空且唯一；供路由引用 |
 | `name` | 必需、非空；用于供应商识别，也可能参与上游兼容逻辑的自动推断 |
-| `protocol` | 必需：`responses`、`chat_completions`、`messages` 之一 |
+| `protocol` | 必需：`responses`、`chat_completions`、`messages`、`gemini_native` 之一 |
 | `base_url` | 必需：HTTP(S) 地址，不能含用户名、密码或 fragment；默认也不允许 query |
 | `api_key` | 必需、非空且能用作 HTTP header 值；代理为选中的 Provider 注入该凭据 |
 | `compat` | 可省略：该 Provider 的兼容选项，见后文 |
@@ -71,10 +71,18 @@ providers:
 | `responses` | `https://example.com/v1` | `https://example.com/v1/responses` |
 | `chat_completions` | `https://example.com/v1` | `https://example.com/v1/chat/completions` |
 | `messages` | `https://example.com/v1` | `https://example.com/v1/messages` |
+| `gemini_native` | `https://generativelanguage.googleapis.com` | `https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent` |
 
-`responses` 使用原生 Responses 路径；另外两种协议转换请求、JSON 响应和 SSE。
+`responses` 使用原生 Responses 路径；其他协议将 Responses 请求和 JSON/SSE 响应转换为对应格式。
 原版兼容分支可能修复或转换 Responses 内容，具体见 [行为清单](compatibility.md)。
 Provider 失败直接返回错误，不会改用其他 Provider；符合条件的请求修正只会在同一 Provider 上重试。
+
+`gemini_native` 接受 origin、`/v1`、`/v1beta`、`/v1beta/models` 和 Gemini OpenAI 兼容路径作为 `base_url`，
+并按请求中的模型和流式标志生成原生 `generateContent` 或 `streamGenerateContent` endpoint。模型名开头重复的 `models/` 会被移除。
+Gemini 形态的完整模型 endpoint 会改写为当前请求的模型和方法。设置 `compat.meta.isFullUrl: true` 后，完整 Vertex AI publisher URL 和其他不透明自定义 endpoint 会保留原路径。
+入口 query 不会转发到 Gemini；流式请求固定使用 `alt=sse`。
+代理使用 Provider 的 `api_key` 设置 `x-goog-api-key`，不使用 Google OAuth 或 `?key=` 查询认证，也不会把客户端 `Authorization`、`x-api-key` 或 `x-goog-api-key` 转发给上游。
+即使启用了 `isFullUrl`，Gemini Native 的 `base_url` 也不能包含 `key` query 参数；其余完整 endpoint query 会保留，流式 endpoint 的 `alt=sse` 会覆盖已有 `alt` 值。
 
 如果供应商给的是完整 endpoint，在该 Provider 下设置 `compat.meta.isFullUrl: true`，
 此时 `base_url` 可含 query。Chat 和 Messages 对标准完整 endpoint 也有自动识别；
@@ -146,7 +154,7 @@ providers:
 | --- | --- |
 | `codexChatReasoning` | Chat reasoning 能力声明；缺省时按 Provider 名称、地址与请求模型自动推断 |
 | `promptCacheRouting` | `auto`（缺省）、`enabled`、`disabled`；控制 Chat prompt cache key 注入 |
-| `maxOutputTokens` | 缺省或 `0` 不覆盖客户端值；正整数在 Messages 转换前覆盖输出上限 |
+| `maxOutputTokens` | 缺省或 `0` 不覆盖客户端值；正整数在 Messages/Gemini 转换前覆盖输出上限 |
 | `impersonateClaudeCode` | 默认 `false`；启用原版 Claude Code 身份相关兼容处理 |
 | `isFullUrl` | 默认 `false`；将 `base_url` 作为完整上游 endpoint |
 | `customUserAgent` | 非空值替换出站 User-Agent，须为有效 HTTP header 值 |
@@ -161,6 +169,20 @@ providers:
 用于每模型 reasoning 档位和媒体能力声明，不能放第二份地址、密钥或模型映射。
 它不会自动生成路由，仍需在 `routes` 中配置 Provider 选择。
 Messages 未指定 Provider 上限且请求也未给上限时，转换默认使用 `128000`，实际支持值由上游决定。
+
+### Gemini Native 兼容选项
+
+以下字段位于 `providers[].compat.gemini`：
+
+| 字段 | 默认值 | 用途 |
+| --- | --- | --- |
+| `thought_signature_replay` | `true` | 在后续请求中回放进程内保存的 Gemini `thoughtSignature`；关闭后不注入签名。Gemini 3+ 的既有函数调用仍必须带有效签名，否则请求会在转发前失败。 |
+| `thinking` | `auto` | `auto` 时将 Responses `reasoning.effort` 映射到 Gemini 3+ 的 `thinkingLevel`；`off` 时不发送该字段。Gemini 2.x 不发送 `thinkingLevel`。 |
+
+`auto` 会将 `reasoning.effort` 的 `minimal`、`low`、`medium`、`high` 分别映射到 `MINIMAL`、`LOW`、`MEDIUM`、`HIGH`；`xhigh`、`max` 和 `ultra` 映射到 `HIGH`。
+仅当 `auto` 用于支持 `thinkingLevel` 的模型时，未识别的 effort 值会被拒绝。Gemini 未收到 `max_output_tokens` 且 Provider 未配置 `maxOutputTokens` 时，会使用模型自己的输出上限。
+Gemini 图片和文档输入只接受 Base64 内容；远程 URL 输入会在本地报错。
+字段支持范围见 [Gemini GenerateContent API 参考](https://ai.google.dev/api/generate-content)。
 
 ### 全局兼容选项
 
