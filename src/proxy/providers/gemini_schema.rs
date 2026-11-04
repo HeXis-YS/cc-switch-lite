@@ -58,6 +58,7 @@ fn normalize_json_schema(schema: Value) -> Value {
         Value::Object(mut obj) => {
             obj.remove("$schema");
             obj.remove("$id");
+            obj.remove("encrypted");
 
             if let Some(properties) = obj
                 .get_mut("properties")
@@ -257,6 +258,29 @@ mod tests {
         assert!(result.get("parameters").is_some());
         assert!(result.get("parametersJsonSchema").is_none());
         assert_eq!(result["parameters"]["properties"]["city"]["type"], "string");
+    }
+
+    #[test]
+    fn gemini_schema_strips_encrypted_annotation_from_property_schema() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "token": { "type": "string", "encrypted": true }
+            },
+            "required": ["token"]
+        });
+
+        let result = build_gemini_function_declaration("lookup", Some("Lookup"), schema);
+
+        assert!(result.get("parameters").is_some());
+        assert!(result.get("parametersJsonSchema").is_none());
+        assert_eq!(
+            result["parameters"]["properties"]["token"]["type"],
+            "string"
+        );
+        assert!(result["parameters"]["properties"]["token"]
+            .get("encrypted")
+            .is_none());
     }
 
     #[test]
