@@ -1268,10 +1268,16 @@ async fn gemini_native_web_search_maps_grounding_queries_and_skips_history_repla
                     "usageMetadata": {"promptTokenCount": 6, "candidatesTokenCount": 4, "totalTokenCount": 10}
                 }),
             ),
-            Reply::sse(vec![
+            Reply::new(
+                StatusCode::OK,
+                Some("text/event-stream"),
+                [
                 "data: {\"responseId\":\"gem_resp_2\",\"modelVersion\":\"gemini-3-pro\",\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"Details: \"}]}}],\"usageMetadata\":{\"promptTokenCount\":10,\"totalTokenCount\":12}}\n\n",
                 "data: {\"responseId\":\"gem_resp_2\",\"modelVersion\":\"gemini-3-pro\",\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"Details: edition 2024.\"}]},\"finishReason\":\"STOP\",\"groundingMetadata\":{\"webSearchQueries\":[\"rust 1.90 release notes\",\"rust 1.90 release notes\"]}}],\"usageMetadata\":{\"promptTokenCount\":10,\"candidatesTokenCount\":6,\"totalTokenCount\":16}}\n\n",
-            ]),
+                ]
+                .join("")
+                .into_bytes(),
+            ),
         ],
         |_| {},
     )

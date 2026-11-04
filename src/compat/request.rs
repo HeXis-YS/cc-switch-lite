@@ -10,7 +10,7 @@ use crate::proxy::{
         codex_chat_history::{CodexChatHistoryStore, WebSearchShadowLookup},
         gemini_shadow::GeminiShadowStore,
         transform_codex_chat::CodexToolContext,
-        transform_gemini::AnthropicToolSchemaHints,
+        transform_gemini::GeminiToolSchemaHints,
     },
 };
 use axum::http::HeaderMap;
@@ -42,7 +42,7 @@ pub struct Prepared {
             providers::transform_codex_responses_namespace::NamespacedName,
         >,
     >,
-    pub(crate) gemini_tool_schema_hints: Option<AnthropicToolSchemaHints>,
+    pub(crate) gemini_tool_schema_hints: Option<GeminiToolSchemaHints>,
 }
 
 pub(crate) struct RequestContext {
@@ -66,7 +66,7 @@ pub(crate) struct RequestContext {
     xai_native: bool,
     gemini_provider_id: Option<String>,
     gemini_session_id: Option<String>,
-    gemini_tool_schema_hints: Option<AnthropicToolSchemaHints>,
+    gemini_tool_schema_hints: Option<GeminiToolSchemaHints>,
 }
 
 impl RequestContext {
@@ -320,27 +320,9 @@ pub(crate) async fn prepare_attempt(
             body
         }
         Protocol::GeminiNative => {
-            let max_output_tokens_was_set = input
-                .get("max_output_tokens")
-                .and_then(Value::as_u64)
-                .is_some_and(|value| value > 0)
-                || provider
-                    .compat
-                    .meta
-                    .max_output_tokens
-                    .is_some_and(|value| value > 0);
             if let Some(max) = provider.compat.meta.max_output_tokens.filter(|v| *v > 0) {
                 input["max_output_tokens"] = json!(max);
             }
-            let model = input
-                .get("model")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string();
-            let reasoning_effort = input
-                .pointer("/reasoning/effort")
-                .and_then(Value::as_str)
-                .map(ToOwned::to_owned);
             let mut tool_context =
                 providers::transform_codex_chat::build_codex_tool_context_from_request_with_web_search(
                     &input,
@@ -348,31 +330,14 @@ pub(crate) async fn prepare_attempt(
                     Some(provider.id.clone()),
                 );
             mark_gemini_web_search_history_unavailable(&input, &mut tool_context);
-            let anthropic =
-                providers::transform_codex_anthropic::responses_request_to_anthropic_with_context(
-                    input.clone(),
-                    128000,
-                    &tool_context,
-                )?;
-            let tool_schema_hints =
-                providers::transform_gemini::extract_anthropic_tool_schema_hints(&anthropic);
-            let mut body =
-                providers::transform_gemini::anthropic_to_gemini_with_shadow_and_options(
-                    anthropic,
-                    gemini_shadow,
-                    context.gemini_provider_id.as_deref(),
-                    context.gemini_session_id.as_deref(),
-                    provider.compat.gemini.thought_signature_replay,
-                )?;
-            if !max_output_tokens_was_set {
-                omit_implicit_gemini_max_output_tokens(&mut body);
-            }
-            copy_responses_sampling_parameters(&mut body, &input);
-            apply_gemini_thinking_level(
-                &mut body,
-                &model,
-                reasoning_effort.as_deref(),
-                &provider.compat.gemini,
+            let (body, tool_schema_hints) = providers::transform_gemini::responses_to_gemini(
+                &input,
+                gemini_shadow,
+                context.gemini_provider_id.as_deref(),
+                context.gemini_session_id.as_deref(),
+                &tool_context,
+                provider.compat.gemini.thought_signature_replay,
+                provider.compat.gemini.thinking,
             )?;
             context.gemini_tool_schema_hints = Some(tool_schema_hints.clone());
             body
@@ -429,33 +394,6 @@ pub(crate) async fn prepare_attempt(
         xai_restore: context.xai_restore.clone(),
         gemini_tool_schema_hints: context.gemini_tool_schema_hints.clone(),
     })
-}
-
-fn omit_implicit_gemini_max_output_tokens(body: &mut Value) {
-    // The Anthropic bridge requires max_tokens and supplies 128000 when the
-    // Responses request omits max_output_tokens. Gemini's field is optional
-    // and model-specific, so that bridge default must not become an upstream
-    // limit that may exceed the selected Gemini model's capacity.
-    let remove_generation_config = body
-        .get_mut("generationConfig")
-        .and_then(Value::as_object_mut)
-        .is_some_and(|config| {
-            config.remove("maxOutputTokens");
-            config.is_empty()
-        });
-    if remove_generation_config {
-        if let Some(object) = body.as_object_mut() {
-            object.remove("generationConfig");
-        }
-    }
-}
-
-fn copy_responses_sampling_parameters(gemini_body: &mut Value, responses_body: &Value) {
-    for (source, target) in [("temperature", "temperature"), ("top_p", "topP")] {
-        if let Some(value) = responses_body.get(source) {
-            gemini_body["generationConfig"][target] = value.clone();
-        }
-    }
 }
 
 async fn attach_anthropic_web_search_history(
@@ -524,36 +462,6 @@ fn mark_gemini_web_search_history_unavailable(input: &Value, tool_context: &mut 
             tool_context.mark_web_search_shadow_unavailable(response_item_id.to_string());
         }
     }
-}
-
-fn apply_gemini_thinking_level(
-    gemini_body: &mut Value,
-    model: &str,
-    effort: Option<&str>,
-    compat: &GeminiCompat,
-) -> Result<(), ProxyError> {
-    if compat.thinking != GeminiThinking::Auto
-        || !crate::proxy::providers::transform_gemini::supports_gemini_thinking_level(model)
-    {
-        return Ok(());
-    }
-    let Some(effort) = effort.map(str::trim).filter(|effort| !effort.is_empty()) else {
-        return Ok(());
-    };
-    let level = match effort.to_ascii_lowercase().as_str() {
-        "minimal" => "MINIMAL",
-        "low" => "LOW",
-        "medium" => "MEDIUM",
-        "high" | "xhigh" | "max" | "ultra" => "HIGH",
-        "none" | "off" | "disabled" => return Ok(()),
-        _ => {
-            return Err(ProxyError::InvalidRequest(format!(
-                "Unsupported reasoning.effort for Gemini: {effort}"
-            )))
-        }
-    };
-    gemini_body["generationConfig"]["thinkingConfig"] = json!({ "thinkingLevel": level });
-    Ok(())
 }
 
 #[cfg(test)]
@@ -937,32 +845,37 @@ mod request_tests {
 
     #[test]
     fn gemini_thinking_effort_only_maps_to_supported_model_levels() {
-        let compat = GeminiCompat::default();
+        let build = |model: &str, thinking| {
+            let input = json!({
+                "model": model,
+                "input": "hello",
+                "reasoning": {"effort": "high"}
+            });
+            let tool_context =
+                providers::transform_codex_chat::build_codex_tool_context_from_request(&input);
+            providers::transform_gemini::responses_to_gemini(
+                &input,
+                None,
+                None,
+                None,
+                &tool_context,
+                true,
+                thinking,
+            )
+            .unwrap()
+            .0
+        };
 
-        let mut gemini_3 = json!({});
-        apply_gemini_thinking_level(&mut gemini_3, "models/gemini-3-pro", Some("high"), &compat)
-            .unwrap();
+        let gemini_3 = build("models/gemini-3-pro", GeminiThinking::Auto);
         assert_eq!(
             gemini_3["generationConfig"]["thinkingConfig"]["thinkingLevel"],
             "HIGH"
         );
 
-        let mut gemini_2 = json!({});
-        apply_gemini_thinking_level(&mut gemini_2, "gemini-2.5-flash", Some("high"), &compat)
-            .unwrap();
+        let gemini_2 = build("gemini-2.5-flash", GeminiThinking::Auto);
         assert!(gemini_2.get("generationConfig").is_none());
 
-        let mut disabled = json!({});
-        apply_gemini_thinking_level(
-            &mut disabled,
-            "gemini-3-pro",
-            Some("high"),
-            &GeminiCompat {
-                thought_signature_replay: true,
-                thinking: GeminiThinking::Off,
-            },
-        )
-        .unwrap();
+        let disabled = build("gemini-3-pro", GeminiThinking::Off);
         assert!(disabled.get("generationConfig").is_none());
     }
 }

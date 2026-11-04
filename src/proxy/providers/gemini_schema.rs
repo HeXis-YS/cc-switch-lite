@@ -4,8 +4,7 @@
 //! - `parameters`: a restricted `Schema` subset
 //! - `parametersJsonSchema`: richer JSON Schema via arbitrary JSON `Value`
 //!
-//! Anthropic tool schemas are closer to JSON Schema, so we choose the richer
-//! channel when unsupported `Schema` fields are present.
+//! Responses function schemas are normalized before building Gemini declarations.
 
 // Derived from cc-switch@214e75ba7f625c679dd4e61df166ec4463245fe7.
 // Copyright (c) 2025 Jason Young. MIT; see providers/LICENSE-cc-switch.
@@ -33,8 +32,7 @@ pub fn build_gemini_function_parameters(input_schema: Value) -> GeminiFunctionPa
 ///
 /// > functionDeclaration parameters schema should be of type OBJECT.
 ///
-/// Anthropic tools sometimes arrive with empty or type-less `input_schema`
-/// (e.g. no-argument tools like Claude Code's `TodoRead`). Normalize those to
+/// Function tools can arrive with empty or type-less schemas. Normalize those to
 /// `{type: "object", properties: {}}` so the Gemini upstream accepts them.
 ///
 /// References: google-gemini/generative-ai-python#423, BerriAI/litellm#5055.
@@ -239,6 +237,12 @@ pub fn build_gemini_function_declaration(
     Value::Object(declaration)
 }
 
+/// Expose the same Gemini-compatible schema shape used for declarations so
+/// response argument repair can index the original Responses schema directly.
+pub(crate) fn normalize_gemini_function_schema(input_schema: Value) -> Value {
+    ensure_object_schema(normalize_json_schema(input_schema))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -327,7 +331,7 @@ mod tests {
     }
 
     /// Regression for P2 (Vertex AI rejecting empty schemas): zero-argument
-    /// Anthropic tools (no `input_schema`) must produce `parameters` with an
+    /// Tools with no schema must produce `parameters` with an
     /// explicit `type: "object"` and an empty `properties` map so the Gemini
     /// upstream does not return `schema should be of type OBJECT`.
     #[test]

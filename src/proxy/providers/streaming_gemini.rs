@@ -1,39 +1,29 @@
 //! Gemini Native streaming conversion module.
 //!
-//! Converts Gemini `streamGenerateContent?alt=sse` chunks into Anthropic-style
-//! SSE events for Claude-compatible clients.
+//! Converts Gemini `streamGenerateContent?alt=sse` chunks directly into
+//! OpenAI Responses SSE events.
 
 // Derived from cc-switch@214e75ba7f625c679dd4e61df166ec4463245fe7.
 // Copyright (c) 2025 Jason Young. MIT; see providers/LICENSE-cc-switch.
 
+use super::codex_responses_sse as sse;
 use super::gemini_shadow::{GeminiShadowStore, GeminiToolCallMeta};
-use super::transform_gemini::{
-    build_anthropic_usage, is_synthesized_tool_call_id, rectify_tool_call_parts,
-    synthesize_tool_call_id, AnthropicToolSchemaHints,
+use super::transform_codex_chat::{
+    custom_tool_input_from_chat_arguments, response_tool_call_item_from_chat_name,
+    response_tool_call_item_id_from_chat_name, CodexToolContext,
 };
+use super::transform_gemini::{
+    build_responses_usage, gemini_web_search_call_id, gemini_web_search_call_item,
+    is_synthesized_tool_call_id, map_gemini_finish_reason, rectify_tool_call_parts, response_id,
+    synthesize_tool_call_id, GeminiToolSchemaHints,
+};
+use crate::proxy::json_canonical::canonical_json_string;
 use crate::proxy::sse::{append_utf8_safe, strip_sse_field, take_sse_block};
 use bytes::Bytes;
 use futures::stream::{self, Stream, StreamExt};
 use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::sync::Arc;
-
-fn map_finish_reason(reason: Option<&str>, has_tool_use: bool, blocked: bool) -> &'static str {
-    if blocked {
-        return "refusal";
-    }
-
-    match reason {
-        Some("MAX_TOKENS") => "max_tokens",
-        Some("SAFETY")
-        | Some("RECITATION")
-        | Some("SPII")
-        | Some("BLOCKLIST")
-        | Some("PROHIBITED_CONTENT") => "refusal",
-        _ if has_tool_use => "tool_use",
-        _ => "end_turn",
-    }
-}
 
 fn extract_visible_text(parts: &[Value]) -> String {
     parts
@@ -45,7 +35,7 @@ fn extract_visible_text(parts: &[Value]) -> String {
 
 fn extract_tool_calls(
     parts: &[Value],
-    tool_schema_hints: Option<&AnthropicToolSchemaHints>,
+    tool_schema_hints: Option<&GeminiToolSchemaHints>,
 ) -> Vec<GeminiToolCallMeta> {
     let mut rectified_parts = parts.to_vec();
     rectify_tool_call_parts(&mut rectified_parts, tool_schema_hints);
@@ -59,7 +49,7 @@ fn extract_tool_calls(
             // without this filter the `Some("")` value would flow into
             // `merge_tool_call_snapshots`, match itself across chunks, and
             // collapse parallel no-id calls into a single snapshot with an
-            // empty-string tool_use id.
+            // empty-string function-call id.
             let id = function_call
                 .get("id")
                 .and_then(|value| value.as_str())
@@ -133,7 +123,7 @@ fn merge_tool_call_snapshots(
                     // then upgrade it to a genuine id on a later chunk. A
                     // pure id-match would miss the existing synthesized
                     // snapshot and push a second entry, yielding duplicate
-                    // `tool_use` content blocks at stream end. If the
+                    // Responses function-call items at stream end. If the
                     // same-position slot currently holds a synthesized id,
                     // merge into it — `or(preserved_id)` below will keep
                     // the real id, dropping the synthesized one.
@@ -163,7 +153,7 @@ fn merge_tool_call_snapshots(
 
         if let Some(index) = existing_index {
             // Preserve any synthesized id assigned on a previous chunk so the
-            // Anthropic-visible id stays stable across the whole stream.
+            // Responses-visible id stays stable across the whole stream.
             // When incoming carries a real Gemini id and the slot holds a
             // synthesized one, `Some(real).or(Some(synth)) == Some(real)`
             // so the upgrade wins naturally.
@@ -230,40 +220,420 @@ fn build_shadow_assistant_parts(
     parts
 }
 
-fn encode_sse(event_name: &str, payload: &Value) -> Bytes {
-    Bytes::from(format!(
-        "event: {event_name}\ndata: {}\n\n",
-        serde_json::to_string(payload).unwrap_or_default()
-    ))
+#[derive(Debug, Default)]
+struct GeminiTextState {
+    output_index: Option<u32>,
+    item_id: String,
+    text: String,
+    added: bool,
+    done: bool,
 }
 
-pub fn create_anthropic_sse_stream_from_gemini<E: std::error::Error + Send + 'static>(
+#[derive(Debug)]
+struct GeminiToResponsesState {
+    response_started: bool,
+    completed: bool,
+    response_id: String,
+    gemini_response_id: Option<String>,
+    model: String,
+    next_output_index: u32,
+    text: GeminiTextState,
+    output_items: Vec<(u32, Value)>,
+    tool_call_snapshots: Vec<GeminiToolCallMeta>,
+    seen_web_search_queries: HashSet<String>,
+    pending_web_search_queries: Vec<(String, String)>,
+    next_web_search_index: usize,
+    text_thought_signature: Option<String>,
+    latest_usage: Option<Value>,
+    latest_finish_reason: Option<String>,
+    blocked_reason: Option<String>,
+    saw_done_marker: bool,
+    shadow_store: Option<Arc<GeminiShadowStore>>,
+    provider_id: Option<String>,
+    session_id: Option<String>,
+    tool_schema_hints: Option<GeminiToolSchemaHints>,
+    tool_context: CodexToolContext,
+}
+
+impl GeminiToResponsesState {
+    fn new(
+        shadow_store: Option<Arc<GeminiShadowStore>>,
+        provider_id: Option<String>,
+        session_id: Option<String>,
+        tool_schema_hints: Option<GeminiToolSchemaHints>,
+        tool_context: CodexToolContext,
+        model_fallback: String,
+    ) -> Self {
+        Self {
+            response_started: false,
+            completed: false,
+            response_id: "resp_ccswitch".to_string(),
+            gemini_response_id: None,
+            model: model_fallback,
+            next_output_index: 0,
+            text: GeminiTextState::default(),
+            output_items: Vec::new(),
+            tool_call_snapshots: Vec::new(),
+            seen_web_search_queries: HashSet::new(),
+            pending_web_search_queries: Vec::new(),
+            next_web_search_index: 0,
+            text_thought_signature: None,
+            latest_usage: None,
+            latest_finish_reason: None,
+            blocked_reason: None,
+            saw_done_marker: false,
+            shadow_store,
+            provider_id,
+            session_id,
+            tool_schema_hints,
+            tool_context,
+        }
+    }
+
+    fn handle_gemini_chunk(&mut self, chunk: &Value) -> Vec<Bytes> {
+        if !self.response_started {
+            if let Some(id) = chunk
+                .get("responseId")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+            {
+                self.gemini_response_id = Some(id.to_string());
+                self.response_id = response_id(Some(id));
+            }
+            if let Some(model) = chunk
+                .get("modelVersion")
+                .and_then(Value::as_str)
+                .filter(|model| !model.is_empty())
+            {
+                self.model = model.to_string();
+            }
+        }
+        if let Some(usage) = chunk.get("usageMetadata") {
+            self.latest_usage = Some(usage.clone());
+        }
+
+        let mut events = self.ensure_response_started();
+        if let Some(reason) = chunk
+            .pointer("/promptFeedback/blockReason")
+            .and_then(Value::as_str)
+        {
+            self.blocked_reason = Some(reason.to_string());
+        }
+
+        let Some(candidate) = chunk
+            .get("candidates")
+            .and_then(Value::as_array)
+            .and_then(|items| items.first())
+        else {
+            return events;
+        };
+
+        if let Some(reason) = candidate.get("finishReason").and_then(Value::as_str) {
+            self.latest_finish_reason = Some(reason.to_string());
+        }
+        if self.blocked_reason.is_none() && self.tool_context.hosted_web_search().is_some() {
+            for query in super::transform_gemini::extract_gemini_web_search_queries(candidate) {
+                if !self.seen_web_search_queries.insert(query.clone()) {
+                    continue;
+                }
+                let call_id = gemini_web_search_call_id(
+                    self.gemini_response_id.as_deref(),
+                    self.next_web_search_index,
+                );
+                self.next_web_search_index += 1;
+                if self.text.added {
+                    self.pending_web_search_queries.push((call_id, query));
+                } else {
+                    events.extend(self.push_web_search_call(&call_id, &query));
+                }
+            }
+        }
+
+        if let Some(parts) = candidate
+            .pointer("/content/parts")
+            .and_then(Value::as_array)
+        {
+            let mut rectified_parts = parts.clone();
+            rectify_tool_call_parts(&mut rectified_parts, self.tool_schema_hints.as_ref());
+            if let Some(signature) = extract_text_thought_signature(parts) {
+                self.text_thought_signature = Some(signature);
+            }
+            merge_tool_call_snapshots(
+                &mut self.tool_call_snapshots,
+                extract_tool_calls(&rectified_parts, self.tool_schema_hints.as_ref()),
+            );
+
+            let visible_text = extract_visible_text(&rectified_parts);
+            if !visible_text.is_empty() {
+                let delta = if visible_text.starts_with(&self.text.text) {
+                    visible_text[self.text.text.len()..].to_string()
+                } else {
+                    visible_text
+                };
+                if !delta.is_empty() {
+                    events.extend(self.push_text_delta(&delta));
+                }
+            }
+        }
+
+        events
+    }
+
+    fn ensure_response_started(&mut self) -> Vec<Bytes> {
+        if self.response_started {
+            return Vec::new();
+        }
+        self.response_started = true;
+        let response = self.base_response("in_progress", Vec::new());
+        vec![
+            sse::response_created(&response),
+            sse::response_in_progress(&response),
+        ]
+    }
+
+    fn push_text_delta(&mut self, delta: &str) -> Vec<Bytes> {
+        let mut events = Vec::new();
+        if !self.text.added {
+            let output_index = self.next_output_index();
+            let item_id = format!("{}_msg_0", self.response_id);
+            self.text.output_index = Some(output_index);
+            self.text.item_id.clone_from(&item_id);
+            self.text.added = true;
+            events.push(sse::message_item_added(output_index, &item_id));
+            events.push(sse::message_content_part_added(output_index, &item_id));
+        }
+        self.text.text.push_str(delta);
+        events.push(sse::output_text_delta(
+            self.text.output_index.unwrap_or(0),
+            &self.text.item_id,
+            delta,
+        ));
+        events
+    }
+
+    fn push_web_search_call(&mut self, call_id: &str, query: &str) -> Vec<Bytes> {
+        let output_index = self.next_output_index();
+        let item_id = format!("ws_{call_id}");
+        let item = gemini_web_search_call_item(&item_id, "completed", query);
+        let mut added = item.clone();
+        added["status"] = json!("in_progress");
+        self.output_items.push((output_index, item.clone()));
+        vec![
+            sse::output_item_added(output_index, &added),
+            sse::output_item_done(output_index, &item),
+        ]
+    }
+
+    fn finish_text(&mut self) -> Vec<Bytes> {
+        if !self.text.added || self.text.done {
+            return Vec::new();
+        }
+        let output_index = self.text.output_index.unwrap_or(0);
+        let (events, item) = sse::message_close(output_index, &self.text.item_id, &self.text.text);
+        self.output_items.push((output_index, item));
+        self.text.done = true;
+        events
+    }
+
+    fn finish_tool_calls(&mut self) -> Vec<Bytes> {
+        let mut events = Vec::new();
+        for call in self.tool_call_snapshots.clone() {
+            let call_id = call
+                .id
+                .as_deref()
+                .filter(|id| !id.is_empty())
+                .map(ToString::to_string)
+                .unwrap_or_else(synthesize_tool_call_id);
+            let arguments = canonical_json_string(&call.args);
+            let item_id =
+                response_tool_call_item_id_from_chat_name(&call_id, &call.name, &self.tool_context);
+            let item = response_tool_call_item_from_chat_name(
+                &item_id,
+                "completed",
+                &call_id,
+                &call.name,
+                &arguments,
+                None,
+                &self.tool_context,
+            );
+            let added = response_tool_call_item_from_chat_name(
+                &item_id,
+                "in_progress",
+                &call_id,
+                &call.name,
+                "",
+                None,
+                &self.tool_context,
+            );
+            let output_index = self.next_output_index();
+            events.push(sse::output_item_added(output_index, &added));
+
+            if self.tool_context.is_custom_tool_chat_name(&call.name) {
+                let input = custom_tool_input_from_chat_arguments(&arguments);
+                if !input.is_empty() {
+                    events.push(sse::custom_tool_call_input_delta(
+                        output_index,
+                        &item_id,
+                        &input,
+                    ));
+                }
+                events.push(sse::custom_tool_call_input_done(
+                    output_index,
+                    &item_id,
+                    &input,
+                ));
+            } else {
+                events.push(sse::function_call_arguments_delta(
+                    output_index,
+                    &item_id,
+                    &arguments,
+                ));
+                events.push(sse::function_call_arguments_done(
+                    output_index,
+                    &item_id,
+                    &arguments,
+                ));
+            }
+            events.push(sse::output_item_done(output_index, &item));
+            self.output_items.push((output_index, item));
+        }
+        events
+    }
+
+    fn finish(&mut self) -> Vec<Bytes> {
+        if self.completed {
+            return Vec::new();
+        }
+        let mut events = self.ensure_response_started();
+        if self.text.text.is_empty() {
+            if let Some(reason) = self.blocked_reason.as_deref() {
+                let text = format!("Request blocked by Gemini safety filters: {reason}");
+                events.extend(self.push_text_delta(&text));
+            }
+        }
+        events.extend(self.finish_text());
+
+        if self.blocked_reason.is_none() {
+            for (call_id, query) in std::mem::take(&mut self.pending_web_search_queries) {
+                events.extend(self.push_web_search_call(&call_id, &query));
+            }
+        }
+
+        let (status, incomplete_reason) = if self.blocked_reason.is_some() {
+            ("incomplete", Some("content_filter"))
+        } else if self.latest_finish_reason.is_none() {
+            ("incomplete", Some("max_output_tokens"))
+        } else {
+            map_gemini_finish_reason(self.latest_finish_reason.as_deref())
+        };
+        if status == "completed" && self.latest_finish_reason.as_deref() == Some("STOP") {
+            self.record_shadow_turn();
+        }
+        if status == "completed" && self.blocked_reason.is_none() {
+            events.extend(self.finish_tool_calls());
+        }
+
+        let mut response = self.base_response(status, self.completed_output_items());
+        if let Some(reason) = incomplete_reason {
+            response["incomplete_details"] = json!({ "reason": reason });
+            events.push(sse::response_incomplete(&response));
+        } else {
+            events.push(sse::response_completed(&response));
+        }
+        self.completed = true;
+        events
+    }
+
+    fn record_shadow_turn(&self) {
+        let (Some(store), Some(provider_id), Some(session_id)) = (
+            self.shadow_store.as_ref(),
+            self.provider_id.as_deref(),
+            self.session_id.as_deref(),
+        ) else {
+            return;
+        };
+        let text = (!self.text.text.is_empty()).then_some(self.text.text.as_str());
+        let shadow_parts = build_shadow_assistant_parts(
+            text,
+            self.text_thought_signature.as_deref(),
+            &self.tool_call_snapshots,
+        );
+        if !shadow_parts.is_empty() {
+            store.record_assistant_turn(
+                provider_id,
+                session_id,
+                json!({ "parts": shadow_parts }),
+                self.tool_call_snapshots.clone(),
+            );
+        }
+    }
+
+    fn completed_output_items(&self) -> Vec<Value> {
+        let mut output_items = self.output_items.clone();
+        output_items.sort_by_key(|(output_index, _)| *output_index);
+        output_items.into_iter().map(|(_, item)| item).collect()
+    }
+
+    fn base_response(&self, status: &str, output: Vec<Value>) -> Value {
+        json!({
+            "id": self.response_id,
+            "object": "response",
+            "created_at": 0,
+            "status": status,
+            "model": self.model,
+            "output": output,
+            "usage": build_responses_usage(self.latest_usage.as_ref())
+        })
+    }
+
+    fn next_output_index(&mut self) -> u32 {
+        let index = self.next_output_index;
+        self.next_output_index += 1;
+        index
+    }
+
+    fn process_sse_block(&mut self, block: &str) -> Vec<Bytes> {
+        let mut data_lines = Vec::new();
+        for line in block.lines() {
+            if let Some(data) = strip_sse_field(line, "data") {
+                data_lines.push(data.to_string());
+            }
+        }
+        if data_lines.is_empty() {
+            return Vec::new();
+        }
+        let data = data_lines.join("\n");
+        if data.trim() == "[DONE]" {
+            self.saw_done_marker = true;
+            return Vec::new();
+        }
+        match serde_json::from_str::<Value>(&data) {
+            Ok(chunk) => self.handle_gemini_chunk(&chunk),
+            Err(_) => Vec::new(),
+        }
+    }
+}
+
+pub(crate) fn create_responses_sse_stream_from_gemini<E: std::error::Error + Send + 'static>(
     stream: impl Stream<Item = Result<Bytes, E>> + Send + 'static,
     shadow_store: Option<Arc<GeminiShadowStore>>,
     provider_id: Option<String>,
     session_id: Option<String>,
-    tool_schema_hints: Option<AnthropicToolSchemaHints>,
+    tool_schema_hints: Option<GeminiToolSchemaHints>,
+    tool_context: CodexToolContext,
+    model_fallback: String,
 ) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send {
     async_stream::stream! {
         let mut buffer = String::new();
         let mut utf8_remainder = Vec::new();
-        let mut message_id: Option<String> = None;
-        let mut current_model: Option<String> = None;
-        let mut has_sent_message_start = false;
-        let mut accumulated_text = String::new();
-        let mut text_block_index: Option<u32> = None;
-        let mut next_content_index: u32 = 0;
-        let mut open_indices: HashSet<u32> = HashSet::new();
-        let mut tool_call_snapshots: Vec<GeminiToolCallMeta> = Vec::new();
-        let mut seen_web_search_queries: HashSet<String> = HashSet::new();
-        let mut pending_web_search_queries: Vec<(String, String)> = Vec::new();
-        let mut next_web_search_index: usize = 0;
-        let mut text_thought_signature: Option<String> = None;
-        let mut latest_usage: Option<Value> = None;
-        let mut latest_finish_reason: Option<String> = None;
-        let mut blocked_text: Option<String> = None;
-        // Gemini relays may omit the final blank line. A delimiter-only tail
-        // lets the same parser consume any residual event at clean EOF.
+        let mut state = GeminiToResponsesState::new(
+            shadow_store,
+            provider_id,
+            session_id,
+            tool_schema_hints,
+            tool_context,
+            model_fallback,
+        );
         let stream = stream.chain(stream::iter([Ok::<Bytes, E>(Bytes::from_static(b"\n\n"))]));
         tokio::pin!(stream);
 
@@ -271,178 +641,16 @@ pub fn create_anthropic_sse_stream_from_gemini<E: std::error::Error + Send + 'st
             match chunk {
                 Ok(bytes) => {
                     append_utf8_safe(&mut buffer, &mut utf8_remainder, &bytes);
-
                     while let Some(block) = take_sse_block(&mut buffer) {
-                        if block.trim().is_empty() {
-                            continue;
+                        for event in state.process_sse_block(&block) {
+                            yield Ok(event);
                         }
-
-                        let mut data_lines: Vec<String> = Vec::new();
-                        for line in block.lines() {
-                            if let Some(data) = strip_sse_field(line, "data") {
-                                data_lines.push(data.to_string());
-                            }
-                        }
-
-                        if data_lines.is_empty() {
-                            continue;
-                        }
-
-                        let data = data_lines.join("\n");
-                        if data.trim() == "[DONE]" {
+                        if state.saw_done_marker {
                             break;
                         }
-
-                        let chunk_json: Value = match serde_json::from_str(&data) {
-                            Ok(value) => value,
-                            Err(_) => continue,
-                        };
-
-                        if message_id.is_none() {
-                            message_id = chunk_json
-                                .get("responseId")
-                                .and_then(|value| value.as_str())
-                                .map(ToString::to_string);
-                        }
-                        if current_model.is_none() {
-                            current_model = chunk_json
-                                .get("modelVersion")
-                                .and_then(|value| value.as_str())
-                                .map(ToString::to_string);
-                        }
-                        if latest_usage.is_none() {
-                            latest_usage = chunk_json.get("usageMetadata").cloned();
-                        }
-
-                        if !has_sent_message_start {
-                            let event = json!({
-                                "type": "message_start",
-                                "message": {
-                                    "id": message_id.clone().unwrap_or_default(),
-                                    "type": "message",
-                                    "role": "assistant",
-                                    "model": current_model.clone().unwrap_or_default(),
-                                    "usage": build_anthropic_usage(chunk_json.get("usageMetadata"))
-                                }
-                            });
-                            yield Ok(encode_sse("message_start", &event));
-                            has_sent_message_start = true;
-                        }
-
-                        if let Some(reason) = chunk_json
-                            .get("promptFeedback")
-                            .and_then(|value| value.get("blockReason"))
-                            .and_then(|value| value.as_str())
-                        {
-                            blocked_text = Some(format!("Request blocked by Gemini safety filters: {reason}"));
-                        }
-
-                        if let Some(candidate) = chunk_json
-                            .get("candidates")
-                            .and_then(|value| value.as_array())
-                            .and_then(|value| value.first())
-                        {
-                            if let Some(reason) = candidate.get("finishReason").and_then(|value| value.as_str()) {
-                                latest_finish_reason = Some(reason.to_string());
-                            }
-                            if let Some(usage) = chunk_json.get("usageMetadata") {
-                                latest_usage = Some(usage.clone());
-                            }
-                            if blocked_text.is_none() {
-                                for query in super::transform_gemini::extract_gemini_web_search_queries(candidate) {
-                                    if !seen_web_search_queries.insert(query.clone()) {
-                                        continue;
-                                    }
-                                    let call_id = super::transform_gemini::gemini_web_search_call_id(
-                                        message_id.as_deref(),
-                                        next_web_search_index,
-                                    );
-                                    next_web_search_index += 1;
-                                    if text_block_index.is_none() {
-                                        let index = next_content_index;
-                                        next_content_index += 1;
-                                        let start_event = json!({
-                                            "type": "content_block_start",
-                                            "index": index,
-                                            "content_block": {
-                                                "type": "server_tool_use",
-                                                "id": call_id,
-                                                "name": "web_search",
-                                                "input": { "query": query }
-                                            }
-                                        });
-                                        yield Ok(encode_sse("content_block_start", &start_event));
-                                        let stop_event = json!({
-                                            "type": "content_block_stop",
-                                            "index": index
-                                        });
-                                        yield Ok(encode_sse("content_block_stop", &stop_event));
-                                    } else {
-                                        pending_web_search_queries.push((call_id, query));
-                                    }
-                                }
-                            }
-                            if let Some(parts) = candidate
-                                .get("content")
-                                .and_then(|value| value.get("parts"))
-                                .and_then(|value| value.as_array())
-                            {
-                                let mut rectified_parts = parts.clone();
-                                rectify_tool_call_parts(&mut rectified_parts, tool_schema_hints.as_ref());
-                                if let Some(signature) = extract_text_thought_signature(parts) {
-                                    text_thought_signature = Some(signature);
-                                }
-                                merge_tool_call_snapshots(
-                                    &mut tool_call_snapshots,
-                                    extract_tool_calls(&rectified_parts, tool_schema_hints.as_ref()),
-                                );
-                                let visible_text = extract_visible_text(&rectified_parts);
-                                if !visible_text.is_empty() {
-                                    let is_cumulative = visible_text.starts_with(&accumulated_text);
-                                    let delta = if is_cumulative {
-                                        visible_text[accumulated_text.len()..].to_string()
-                                    } else {
-                                        visible_text.clone()
-                                    };
-
-                                    if !delta.is_empty() {
-                                        let index = *text_block_index.get_or_insert_with(|| {
-                                            let assigned = next_content_index;
-                                            next_content_index += 1;
-                                            assigned
-                                        });
-
-                                        if !open_indices.contains(&index) {
-                                            let start_event = json!({
-                                                "type": "content_block_start",
-                                                "index": index,
-                                                "content_block": {
-                                                    "type": "text",
-                                                    "text": ""
-                                                }
-                                            });
-                                            yield Ok(encode_sse("content_block_start", &start_event));
-                                            open_indices.insert(index);
-                                        }
-
-                                        let delta_event = json!({
-                                            "type": "content_block_delta",
-                                            "index": index,
-                                            "delta": {
-                                                "type": "text_delta",
-                                                "text": delta
-                                            }
-                                        });
-                                        yield Ok(encode_sse("content_block_delta", &delta_event));
-                                        if is_cumulative {
-                                            accumulated_text = visible_text;
-                                        } else {
-                                            accumulated_text.push_str(&delta);
-                                        }
-                                    }
-                                }
-                            }
-                        }
+                    }
+                    if state.saw_done_marker {
+                        break;
                     }
                 }
                 Err(error) => {
@@ -452,221 +660,233 @@ pub fn create_anthropic_sse_stream_from_gemini<E: std::error::Error + Send + 'st
             }
         }
 
-        if !has_sent_message_start {
-            let event = json!({
-                "type": "message_start",
-                "message": {
-                    "id": message_id.clone().unwrap_or_default(),
-                    "type": "message",
-                    "role": "assistant",
-                    "model": current_model.clone().unwrap_or_default(),
-                    "usage": build_anthropic_usage(latest_usage.as_ref())
-                }
-            });
-            yield Ok(encode_sse("message_start", &event));
+        for event in state.process_sse_block(&buffer) {
+            yield Ok(event);
         }
-
-        if accumulated_text.is_empty() {
-            if let Some(blocked_text) = blocked_text.clone() {
-                let index = *text_block_index.get_or_insert_with(|| {
-                    let assigned = next_content_index;
-                    next_content_index += 1;
-                    assigned
-                });
-
-                if !open_indices.contains(&index) {
-                    let start_event = json!({
-                        "type": "content_block_start",
-                        "index": index,
-                        "content_block": {
-                            "type": "text",
-                            "text": ""
-                        }
-                    });
-                    yield Ok(encode_sse("content_block_start", &start_event));
-                    open_indices.insert(index);
-                }
-
-                let delta_event = json!({
-                    "type": "content_block_delta",
-                    "index": index,
-                    "delta": {
-                        "type": "text_delta",
-                        "text": blocked_text
-                    }
-                });
-                yield Ok(encode_sse("content_block_delta", &delta_event));
-            }
+        for event in state.finish() {
+            yield Ok(event);
         }
-
-        if let Some(index) = text_block_index {
-            if open_indices.remove(&index) {
-                let stop_event = json!({
-                    "type": "content_block_stop",
-                    "index": index
-                });
-                yield Ok(encode_sse("content_block_stop", &stop_event));
-            }
-        }
-
-        if blocked_text.is_none() {
-            for (call_id, query) in pending_web_search_queries {
-                let index = next_content_index;
-                next_content_index += 1;
-                let start_event = json!({
-                    "type": "content_block_start",
-                    "index": index,
-                    "content_block": {
-                        "type": "server_tool_use",
-                        "id": call_id,
-                        "name": "web_search",
-                        "input": { "query": query }
-                    }
-                });
-                yield Ok(encode_sse("content_block_start", &start_event));
-                let stop_event = json!({
-                    "type": "content_block_stop",
-                    "index": index
-                });
-                yield Ok(encode_sse("content_block_stop", &stop_event));
-            }
-        }
-
-        let complete_candidate = latest_finish_reason.as_deref() == Some("STOP");
-        let complete_tool_calls = if complete_candidate && blocked_text.is_none() {
-            tool_call_snapshots.clone()
-        } else {
-            Vec::new()
-        };
-
-        if complete_candidate {
-            if let (Some(store), Some(provider_id), Some(session_id)) = (
-            shadow_store.as_ref(),
-            provider_id.as_deref(),
-            session_id.as_deref(),
-            ) {
-                let shadow_text = if accumulated_text.is_empty() {
-                    blocked_text.as_deref()
-                } else {
-                    Some(accumulated_text.as_str())
-                };
-                let shadow_parts = build_shadow_assistant_parts(
-                    shadow_text,
-                    text_thought_signature.as_deref(),
-                    &tool_call_snapshots,
-                );
-                if !shadow_parts.is_empty() {
-                    store.record_assistant_turn(
-                        provider_id,
-                        session_id,
-                        json!({ "parts": shadow_parts }),
-                        tool_call_snapshots.clone(),
-                    );
-                }
-            }
-        }
-
-        // ------------------------------------------------------------------
-        // Known trade-off: tool-call ordering vs. interleaved text.
-        //
-        // We emit all `tool_use` blocks *after* the final text
-        // `content_block_stop` above. If Gemini returns parts interleaved
-        // like `[text_a, functionCall_1, text_b, functionCall_2]`, the
-        // Anthropic-facing stream reorders them into `[text(a+b),
-        // tool_use_1, tool_use_2]`, whereas `gemini_to_anthropic_with_shadow_and_hints`
-        // (non-streaming) preserves the original part order.
-        //
-        // This is intentional given the current design:
-        //   1. Gemini `streamGenerateContent?alt=sse` delivers each chunk as
-        //      a *cumulative* snapshot of `content.parts`. Emitting a
-        //      `tool_use` content block on first observation would require
-        //      closing the still-accumulating text block, then re-opening a
-        //      new text block when more text arrives — producing many
-        //      fragmented content blocks per message.
-        //   2. Anthropic clients we target (claude-code and similar) consume
-        //      a message's tool calls by scanning for `tool_use` blocks and
-        //      do not depend on strict text ↔ tool interleaving for
-        //      correctness of tool execution or result routing.
-        //
-        // If a future client requires strict part-order fidelity in the
-        // streaming path, the fix is to track each part's original index,
-        // segment the accumulated text into multiple content blocks at
-        // tool-call boundaries, and flush in original order.
-        // ------------------------------------------------------------------
-        let tool_calls = complete_tool_calls;
-        for tool_call in &tool_calls {
-            let index = next_content_index;
-            next_content_index += 1;
-
-            let start_event = json!({
-                "type": "content_block_start",
-                "index": index,
-                "content_block": {
-                    "type": "tool_use",
-                    "id": tool_call.id.clone().unwrap_or_default(),
-                    "name": tool_call.name
-                }
-            });
-            yield Ok(encode_sse("content_block_start", &start_event));
-
-            let delta_event = json!({
-                "type": "content_block_delta",
-                "index": index,
-                "delta": {
-                    "type": "input_json_delta",
-                    "partial_json": serde_json::to_string(&tool_call.args).unwrap_or_else(|_| "{}".to_string())
-                }
-            });
-            yield Ok(encode_sse("content_block_delta", &delta_event));
-
-            let stop_event = json!({
-                "type": "content_block_stop",
-                "index": index
-            });
-            yield Ok(encode_sse("content_block_stop", &stop_event));
-        }
-
-        let stop_reason = if latest_finish_reason.is_some() || blocked_text.is_some() {
-            map_finish_reason(
-                latest_finish_reason.as_deref(),
-                !tool_calls.is_empty(),
-                blocked_text.is_some(),
-            )
-        } else {
-            // A clean EOF without a Gemini terminal reason is a truncated turn.
-            "max_tokens"
-        };
-        let usage = build_anthropic_usage(latest_usage.as_ref());
-        let message_delta = json!({
-            "type": "message_delta",
-            "delta": {
-                "stop_reason": stop_reason,
-                "stop_sequence": Value::Null
-            },
-            "usage": usage
-        });
-        yield Ok(encode_sse("message_delta", &message_delta));
-
-        let message_stop = json!({ "type": "message_stop" });
-        yield Ok(encode_sse("message_stop", &message_stop));
     }
+}
+
+pub(crate) fn responses_sse_events_from_gemini_response(
+    response: &Value,
+    tool_context: &CodexToolContext,
+) -> Vec<Bytes> {
+    let mut events = Vec::new();
+    let response_id = response
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap_or("resp_ccswitch");
+    let mut in_progress = response.clone();
+    in_progress["status"] = json!("in_progress");
+    in_progress["output"] = json!([]);
+    events.push(sse::response_created(&in_progress));
+    events.push(sse::response_in_progress(&in_progress));
+
+    if let Some(output) = response.get("output").and_then(Value::as_array) {
+        for (output_index, item) in output.iter().enumerate() {
+            let output_index = output_index as u32;
+            let item_type = item.get("type").and_then(Value::as_str).unwrap_or("");
+            match item_type {
+                "message" => {
+                    let item_id = item
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .unwrap_or(response_id);
+                    let mut added = item.clone();
+                    added["status"] = json!("in_progress");
+                    added["content"] = json!([]);
+                    events.push(sse::output_item_added(output_index, &added));
+                    if let Some(parts) = item.get("content").and_then(Value::as_array) {
+                        for (content_index, part) in parts.iter().enumerate() {
+                            let content_index = content_index as u32;
+                            let part_type = part.get("type").and_then(Value::as_str).unwrap_or("");
+                            if part_type != "output_text" {
+                                continue;
+                            }
+                            let text = part.get("text").and_then(Value::as_str).unwrap_or("");
+                            let mut empty_part = part.clone();
+                            empty_part["text"] = json!("");
+                            events.push(sse::sse_event(
+                                "response.content_part.added",
+                                json!({
+                                    "type": "response.content_part.added",
+                                    "item_id": item_id,
+                                    "output_index": output_index,
+                                    "content_index": content_index,
+                                    "part": empty_part
+                                }),
+                            ));
+                            events.push(sse::sse_event(
+                                "response.output_text.delta",
+                                json!({
+                                    "type": "response.output_text.delta",
+                                    "item_id": item_id,
+                                    "output_index": output_index,
+                                    "content_index": content_index,
+                                    "delta": text
+                                }),
+                            ));
+                            events.push(sse::sse_event(
+                                "response.output_text.done",
+                                json!({
+                                    "type": "response.output_text.done",
+                                    "item_id": item_id,
+                                    "output_index": output_index,
+                                    "content_index": content_index,
+                                    "text": text
+                                }),
+                            ));
+                            events.push(sse::sse_event(
+                                "response.content_part.done",
+                                json!({
+                                    "type": "response.content_part.done",
+                                    "item_id": item_id,
+                                    "output_index": output_index,
+                                    "content_index": content_index,
+                                    "part": part
+                                }),
+                            ));
+                        }
+                    }
+                    events.push(sse::output_item_done(output_index, item));
+                }
+                "function_call" | "custom_tool_call" | "tool_search_call" => {
+                    let mut added = item.clone();
+                    added["status"] = json!("in_progress");
+                    match item_type {
+                        "function_call" => added["arguments"] = json!(""),
+                        "custom_tool_call" => added["input"] = json!(""),
+                        "tool_search_call" => added["arguments"] = json!({}),
+                        _ => {}
+                    }
+                    events.push(sse::output_item_added(output_index, &added));
+                    if item_type == "custom_tool_call" {
+                        let input = item.get("input").and_then(Value::as_str).unwrap_or("");
+                        let item_id = item.get("id").and_then(Value::as_str).unwrap_or("");
+                        if !input.is_empty() {
+                            events.push(sse::custom_tool_call_input_delta(
+                                output_index,
+                                item_id,
+                                input,
+                            ));
+                        }
+                        events.push(sse::custom_tool_call_input_done(
+                            output_index,
+                            item_id,
+                            input,
+                        ));
+                    } else {
+                        let call_id = item.get("call_id").and_then(Value::as_str).unwrap_or("");
+                        let item_id = item
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .map(ToString::to_string)
+                            .unwrap_or_else(|| {
+                                if item_type == "tool_search_call" {
+                                    response_tool_call_item_id_from_chat_name(
+                                        call_id,
+                                        "tool_search",
+                                        tool_context,
+                                    )
+                                } else {
+                                    String::new()
+                                }
+                            });
+                        let arguments = item
+                            .get("arguments")
+                            .and_then(Value::as_str)
+                            .unwrap_or("{}");
+                        events.push(sse::function_call_arguments_delta(
+                            output_index,
+                            &item_id,
+                            arguments,
+                        ));
+                        events.push(sse::function_call_arguments_done(
+                            output_index,
+                            &item_id,
+                            arguments,
+                        ));
+                    }
+                    events.push(sse::output_item_done(output_index, item));
+                }
+                _ => {
+                    let mut added = item.clone();
+                    added["status"] = json!("in_progress");
+                    events.push(sse::output_item_added(output_index, &added));
+                    events.push(sse::output_item_done(output_index, item));
+                }
+            }
+        }
+    }
+
+    match response.get("status").and_then(Value::as_str) {
+        Some("incomplete") => events.push(sse::response_incomplete(response)),
+        Some("failed") => events.push(sse::response_failed(response)),
+        _ => events.push(sse::response_completed(response)),
+    }
+    events
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::proxy::providers::gemini_shadow::GeminiShadowStore;
-    use crate::proxy::providers::transform_gemini::anthropic_to_gemini_with_shadow;
-    use std::sync::Arc;
+    use crate::compat::request::GeminiThinking;
+    use crate::proxy::providers::transform_codex_chat::build_codex_tool_context_from_request_with_web_search;
+    use crate::proxy::providers::transform_gemini::{
+        extract_gemini_tool_schema_hints, responses_to_gemini,
+    };
+    use futures::{stream, StreamExt};
 
-    fn collect_stream_output(chunks: Vec<&str>) -> String {
-        let owned_chunks: Vec<String> = chunks.into_iter().map(ToString::to_string).collect();
+    fn tool_context(body: &Value) -> CodexToolContext {
+        build_codex_tool_context_from_request_with_web_search(
+            body,
+            true,
+            Some("provider".to_string()),
+        )
+    }
+
+    fn parse_events(output: &str) -> Vec<Value> {
+        output
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .filter_map(|data| serde_json::from_str(data).ok())
+            .collect()
+    }
+
+    fn output_items(events: &[Value], item_type: &str) -> Vec<Value> {
+        events
+            .iter()
+            .filter(|event| event["type"] == "response.output_item.added")
+            .filter_map(|event| event.get("item"))
+            .filter(|item| item["type"] == item_type)
+            .cloned()
+            .collect()
+    }
+
+    fn collect_stream(
+        chunks: Vec<String>,
+        shadow_store: Option<Arc<GeminiShadowStore>>,
+        provider_id: Option<String>,
+        session_id: Option<String>,
+        hints: Option<GeminiToolSchemaHints>,
+        context: CodexToolContext,
+    ) -> String {
         let stream = futures::stream::iter(
-            owned_chunks
+            chunks
                 .into_iter()
                 .map(|chunk| Ok::<Bytes, std::io::Error>(Bytes::from(chunk))),
         );
-        let converted = create_anthropic_sse_stream_from_gemini(stream, None, None, None, None);
+        let converted = create_responses_sse_stream_from_gemini(
+            stream,
+            shadow_store,
+            provider_id,
+            session_id,
+            hints,
+            context,
+            "gemini-test".to_string(),
+        );
         futures::executor::block_on(async move {
             converted
                 .collect::<Vec<_>>()
@@ -678,17 +898,15 @@ mod tests {
         })
     }
 
-    async fn collect_chunked_output(payload: &[u8], chunk_size: usize) -> String {
-        let chunks = payload
-            .chunks(chunk_size)
-            .map(|chunk| Ok::<Bytes, std::io::Error>(Bytes::copy_from_slice(chunk)))
-            .collect::<Vec<_>>();
-        create_anthropic_sse_stream_from_gemini(stream::iter(chunks), None, None, None, None)
-            .collect::<Vec<_>>()
-            .await
-            .into_iter()
-            .map(|chunk| String::from_utf8(chunk.unwrap().to_vec()).unwrap())
-            .collect()
+    fn collect_stream_output(chunks: Vec<&str>) -> String {
+        collect_stream(
+            chunks.into_iter().map(ToString::to_string).collect(),
+            None,
+            None,
+            None,
+            None,
+            CodexToolContext::default(),
+        )
     }
 
     fn collect_stream_output_with_shadow(
@@ -697,95 +915,133 @@ mod tests {
         provider_id: &str,
         session_id: &str,
     ) -> String {
-        let owned_chunks: Vec<String> = chunks.into_iter().map(ToString::to_string).collect();
-        let stream = futures::stream::iter(
-            owned_chunks
-                .into_iter()
-                .map(|chunk| Ok::<Bytes, std::io::Error>(Bytes::from(chunk))),
-        );
-        let converted = create_anthropic_sse_stream_from_gemini(
-            stream,
+        collect_stream(
+            chunks.into_iter().map(ToString::to_string).collect(),
             Some(store),
             Some(provider_id.to_string()),
             Some(session_id.to_string()),
             None,
-        );
-        futures::executor::block_on(async move {
-            converted
-                .collect::<Vec<_>>()
-                .await
-                .into_iter()
-                .map(|item| String::from_utf8(item.unwrap().to_vec()).unwrap())
-                .collect::<Vec<_>>()
-                .join("")
-        })
+            CodexToolContext::default(),
+        )
+    }
+
+    async fn collect_chunked_output(payload: &[u8], chunk_size: usize) -> String {
+        let chunks = payload
+            .chunks(chunk_size)
+            .map(|chunk| Ok::<Bytes, std::io::Error>(Bytes::copy_from_slice(chunk)))
+            .collect::<Vec<_>>();
+        create_responses_sse_stream_from_gemini(
+            stream::iter(chunks),
+            None,
+            None,
+            None,
+            None,
+            CodexToolContext::default(),
+            "gemini-test".to_string(),
+        )
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .map(|chunk| String::from_utf8(chunk.unwrap().to_vec()).unwrap())
+        .collect()
     }
 
     #[test]
-    fn converts_text_stream_to_anthropic_sse() {
+    fn converts_cumulative_text_to_responses_deltas_once() {
         let output = collect_stream_output(vec![
             "data: {\"responseId\":\"resp_1\",\"modelVersion\":\"gemini-2.5-pro\",\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"Hel\"}]}}],\"usageMetadata\":{\"promptTokenCount\":10,\"totalTokenCount\":13}}\n\n",
             "data: {\"responseId\":\"resp_1\",\"modelVersion\":\"gemini-2.5-pro\",\"candidates\":[{\"finishReason\":\"STOP\",\"content\":{\"parts\":[{\"text\":\"Hello\"}]}}],\"usageMetadata\":{\"promptTokenCount\":10,\"totalTokenCount\":15}}\n\n",
         ]);
+        let events = parse_events(&output);
+        let deltas = events
+            .iter()
+            .filter(|event| event["type"] == "response.output_text.delta")
+            .filter_map(|event| event["delta"].as_str())
+            .collect::<Vec<_>>();
 
-        assert!(output.contains("event: message_start"));
-        assert!(output.contains("\"type\":\"text_delta\""));
-        assert!(output.contains("\"text\":\"Hel\""));
-        assert!(output.contains("\"text\":\"lo\""));
-        assert!(output.contains("\"stop_reason\":\"end_turn\""));
-        assert!(output.contains("event: message_stop"));
+        assert!(output.contains("event: response.created"));
+        assert!(output.contains("event: response.in_progress"));
+        assert_eq!(deltas, vec!["Hel", "lo"]);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["type"] == "response.completed")
+                .count(),
+            1
+        );
+        assert!(!output.contains("event: response.incomplete"));
+        assert_eq!(
+            events.last().unwrap()["response"]["output"][0]["content"][0]["text"],
+            "Hello"
+        );
     }
 
     #[test]
-    fn converts_function_call_stream_to_tool_use_events() {
+    fn converts_function_calls_to_responses_items_and_arguments() {
         let output = collect_stream_output(vec![
             "data: {\"responseId\":\"resp_2\",\"modelVersion\":\"gemini-2.5-pro\",\"candidates\":[{\"finishReason\":\"STOP\",\"content\":{\"parts\":[{\"functionCall\":{\"id\":\"call_1\",\"name\":\"get_weather\",\"args\":{\"city\":\"Tokyo\"}},\"thoughtSignature\":\"sig-1\"}]}}],\"usageMetadata\":{\"promptTokenCount\":5,\"totalTokenCount\":8}}\n\n",
         ]);
+        let events = parse_events(&output);
+        let calls = output_items(&events, "function_call");
+        let argument_deltas = events
+            .iter()
+            .filter(|event| event["type"] == "response.function_call_arguments.delta")
+            .filter_map(|event| event["delta"].as_str())
+            .collect::<Vec<_>>();
 
-        assert!(output.contains("\"type\":\"tool_use\""));
-        assert!(output.contains("\"name\":\"get_weather\""));
-        assert!(output.contains("\"type\":\"input_json_delta\""));
-        assert!(output.contains("\"stop_reason\":\"tool_use\""));
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["name"], "get_weather");
+        assert_eq!(calls[0]["call_id"], "call_1");
+        assert_eq!(calls[0]["arguments"], "");
+        assert_eq!(argument_deltas, vec![r#"{"city":"Tokyo"}"#]);
+        assert!(output.contains("event: response.function_call_arguments.done"));
+        assert_eq!(events.last().unwrap()["type"], "response.completed");
     }
 
     #[test]
-    fn converts_crlf_delimited_stream_to_anthropic_sse() {
+    fn parses_crlf_delimited_cumulative_text_stream() {
         let output = collect_stream_output(vec![
             "data: {\"responseId\":\"resp_3\",\"modelVersion\":\"gemini-2.5-pro\",\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"Hi\"}]}}],\"usageMetadata\":{\"promptTokenCount\":4,\"totalTokenCount\":6}}\r\n\r\n",
             "data: {\"responseId\":\"resp_3\",\"modelVersion\":\"gemini-2.5-pro\",\"candidates\":[{\"finishReason\":\"STOP\",\"content\":{\"parts\":[{\"text\":\"Hi there\"}]}}],\"usageMetadata\":{\"promptTokenCount\":4,\"totalTokenCount\":9}}\r\n\r\n",
         ]);
+        let events = parse_events(&output);
+        let deltas = events
+            .iter()
+            .filter(|event| event["type"] == "response.output_text.delta")
+            .filter_map(|event| event["delta"].as_str())
+            .collect::<Vec<_>>();
 
-        assert!(output.contains("event: message_start"));
-        assert!(output.contains("\"type\":\"text_delta\""));
-        assert!(output.contains("\"text\":\"Hi\""));
-        assert!(output.contains("\"text\":\" there\""));
-        assert!(output.contains("event: message_stop"));
+        assert_eq!(deltas, vec!["Hi", " there"]);
+        assert_eq!(events.last().unwrap()["type"], "response.completed");
     }
 
     #[test]
-    fn preserves_utf8_boundaries_when_json_payload_spans_chunks() {
+    fn preserves_utf8_when_json_payload_spans_transport_chunks() {
         let payload = json!({
             "responseId": "resp_utf8",
             "modelVersion": "gemini-2.5-pro",
             "candidates": [{
                 "finishReason": "STOP",
-                "content": {
-                    "parts": [{ "text": "你好，Gemini" }]
-                }
+                "content": {"parts": [{ "text": "你好，Gemini" }]}
             }],
-            "usageMetadata": {
-                "promptTokenCount": 4,
-                "totalTokenCount": 8
-            }
+            "usageMetadata": {"promptTokenCount": 4, "totalTokenCount": 8}
         });
         let chunk = format!("data: {}\n\n", serde_json::to_string(&payload).unwrap());
         let split_at = chunk.find("你好").unwrap() + 1;
         let chunk_bytes = chunk.into_bytes();
-        let stream = futures::stream::iter([
+        let source = futures::stream::iter([
             Ok::<Bytes, std::io::Error>(Bytes::from(chunk_bytes[..split_at].to_vec())),
             Ok::<Bytes, std::io::Error>(Bytes::from(chunk_bytes[split_at..].to_vec())),
         ]);
-        let converted = create_anthropic_sse_stream_from_gemini(stream, None, None, None, None);
+        let converted = create_responses_sse_stream_from_gemini(
+            source,
+            None,
+            None,
+            None,
+            None,
+            CodexToolContext::default(),
+            "gemini-test".to_string(),
+        );
         let output = futures::executor::block_on(async move {
             converted
                 .collect::<Vec<_>>()
@@ -798,12 +1054,13 @@ mod tests {
 
         assert!(output.contains("你好，Gemini"));
         assert!(!output.contains('\u{fffd}'));
+        assert!(output.contains("event: response.completed"));
     }
 
     #[test]
-    fn stores_full_text_for_shadow_replay_across_delta_chunks() {
+    fn stores_complete_assistant_shadow_and_replays_its_signature() {
         let store = Arc::new(GeminiShadowStore::with_limits(8, 4));
-        let output = collect_stream_output_with_shadow(
+        collect_stream_output_with_shadow(
             vec![
                 "data: {\"responseId\":\"resp_4\",\"modelVersion\":\"gemini-2.5-pro\",\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"Hel\"}]}}],\"usageMetadata\":{\"promptTokenCount\":4,\"totalTokenCount\":6}}\n\n",
                 "data: {\"responseId\":\"resp_4\",\"modelVersion\":\"gemini-2.5-pro\",\"candidates\":[{\"finishReason\":\"STOP\",\"content\":{\"parts\":[{\"text\":\"lo\"},{\"text\":\"\",\"thoughtSignature\":\"sig-1\"}]}}],\"usageMetadata\":{\"promptTokenCount\":4,\"totalTokenCount\":8}}\n\n",
@@ -813,26 +1070,29 @@ mod tests {
             "session-1",
         );
 
-        assert!(output.contains("\"text\":\"Hel\""));
-        assert!(output.contains("\"text\":\"lo\""));
-
         let shadow = store
             .latest_assistant_content("provider-a", "session-1")
             .unwrap();
         assert_eq!(shadow["parts"][0]["text"], "Hello");
         assert_eq!(shadow["parts"][0]["thoughtSignature"], "sig-1");
 
-        let second_turn = anthropic_to_gemini_with_shadow(
-            json!({
-                "messages": [
-                    { "role": "user", "content": "Hi" },
-                    { "role": "assistant", "content": [{ "type": "text", "text": "Hello" }] },
-                    { "role": "user", "content": "Continue" }
-                ]
-            }),
+        let input = json!({
+            "model": "gemini-2.5-pro",
+            "input": [
+                {"role": "user", "content": "Hi"},
+                {"role": "assistant", "content": [{"type": "output_text", "text": "Hello"}]},
+                {"role": "user", "content": "Continue"}
+            ]
+        });
+        let context = tool_context(&input);
+        let (second_turn, _) = responses_to_gemini(
+            &input,
             Some(store.as_ref()),
             Some("provider-a"),
             Some("session-1"),
+            &context,
+            true,
+            GeminiThinking::Auto,
         )
         .unwrap();
 
@@ -845,28 +1105,25 @@ mod tests {
     }
 
     #[test]
-    fn stores_tool_shadow_before_tool_use_events_are_fully_drained() {
+    fn records_tool_shadow_before_yielding_tool_output_item() {
         let store = Arc::new(GeminiShadowStore::with_limits(8, 4));
-        let chunks = vec![
-            "data: {\"responseId\":\"resp_tool_shadow\",\"modelVersion\":\"gemini-2.5-pro\",\"candidates\":[{\"finishReason\":\"STOP\",\"content\":{\"parts\":[{\"functionCall\":{\"id\":\"call_1\",\"name\":\"Bash\",\"args\":{\"command\":\"ls -R\"}},\"thoughtSignature\":\"sig-tool-1\"}]}}],\"usageMetadata\":{\"promptTokenCount\":5,\"totalTokenCount\":8}}\n\n".to_string(),
-        ];
-        let stream = futures::stream::iter(
-            chunks
-                .into_iter()
-                .map(|chunk| Ok::<Bytes, std::io::Error>(Bytes::from(chunk))),
-        );
-        let mut converted = Box::pin(create_anthropic_sse_stream_from_gemini(
-            stream,
+        let source = stream::iter([Ok::<Bytes, std::io::Error>(Bytes::from_static(
+            b"data: {\"responseId\":\"resp_tool_shadow\",\"modelVersion\":\"gemini-2.5-pro\",\"candidates\":[{\"finishReason\":\"STOP\",\"content\":{\"parts\":[{\"functionCall\":{\"id\":\"call_1\",\"name\":\"Bash\",\"args\":{\"command\":\"ls -R\"}},\"thoughtSignature\":\"sig-tool-1\"}]}}],\"usageMetadata\":{\"promptTokenCount\":5,\"totalTokenCount\":8}}\n\n",
+        ))]);
+        let mut converted = Box::pin(create_responses_sse_stream_from_gemini(
+            source,
             Some(store.clone()),
             Some("provider-a".to_string()),
             Some("session-1".to_string()),
             None,
+            CodexToolContext::default(),
+            "gemini-test".to_string(),
         ));
 
         futures::executor::block_on(async {
             while let Some(item) = converted.next().await {
                 let event = String::from_utf8(item.unwrap().to_vec()).unwrap();
-                if event.contains("\"type\":\"tool_use\"") {
+                if event.contains(r#""type":"function_call""#) {
                     break;
                 }
             }
@@ -880,253 +1137,192 @@ mod tests {
     }
 
     #[test]
-    fn rectifies_streamed_tool_call_args_from_tool_schema_hints() {
-        let owned_chunks = vec![
-            "data: {\"responseId\":\"resp_5\",\"modelVersion\":\"gemini-2.5-pro\",\"candidates\":[{\"finishReason\":\"STOP\",\"content\":{\"parts\":[{\"functionCall\":{\"id\":\"call_1\",\"name\":\"Bash\",\"args\":{\"args\":\"git status\"}}}]}}],\"usageMetadata\":{\"promptTokenCount\":5,\"totalTokenCount\":8}}\n\n".to_string(),
-        ];
-        let stream = futures::stream::iter(
-            owned_chunks
-                .into_iter()
-                .map(|chunk| Ok::<Bytes, std::io::Error>(Bytes::from(chunk))),
-        );
-        let hints = super::super::transform_gemini::extract_anthropic_tool_schema_hints(&json!({
+    fn repairs_tool_arguments_using_responses_schema_hints() {
+        let request = json!({
             "tools": [{
+                "type": "function",
                 "name": "Bash",
-                "input_schema": {
+                "parameters": {
                     "type": "object",
                     "properties": {
-                        "command": { "type": "string" },
-                        "timeout": { "type": "number" }
+                        "command": {"type": "string"},
+                        "timeout": {"type": "number"}
                     },
                     "required": ["command"]
                 }
-            }]
-        }));
-        let converted =
-            create_anthropic_sse_stream_from_gemini(stream, None, None, None, Some(hints));
-        let output = futures::executor::block_on(async move {
-            converted
-                .collect::<Vec<_>>()
-                .await
-                .into_iter()
-                .map(|item| String::from_utf8(item.unwrap().to_vec()).unwrap())
-                .collect::<Vec<_>>()
-                .join("")
+            }],
+            "input": "run"
         });
-
-        assert!(output.contains("\"partial_json\":\"{\\\"command\\\":\\\"git status\\\"}\""));
+        let context = tool_context(&request);
+        let hints = extract_gemini_tool_schema_hints(&context);
+        let output = collect_stream(vec![
+            "data: {\"responseId\":\"resp_5\",\"modelVersion\":\"gemini-2.5-pro\",\"candidates\":[{\"finishReason\":\"STOP\",\"content\":{\"parts\":[{\"functionCall\":{\"id\":\"call_1\",\"name\":\"Bash\",\"args\":{\"args\":\"git status\"}}}]}}],\"usageMetadata\":{\"promptTokenCount\":5,\"totalTokenCount\":8}}\n\n"
+                .to_string(),
+        ], None, None, None, Some(hints), context);
+        let events = parse_events(&output);
+        let args = events
+            .iter()
+            .find(|event| event["type"] == "response.function_call_arguments.done")
+            .unwrap()["arguments"]
+            .as_str()
+            .unwrap();
+        assert_eq!(args, r#"{"command":"git status"}"#);
     }
 
     #[test]
-    fn rectifies_streamed_skill_args_from_nested_parameters() {
+    fn repairs_nested_skill_arguments_from_responses_schema_hints() {
+        let request = json!({
+            "tools": [{
+                "type": "function",
+                "name": "Skill",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"skill": {"type": "string"}, "args": {"type": "string"}},
+                    "required": ["skill"]
+                }
+            }],
+            "input": "run"
+        });
+        let context = tool_context(&request);
+        let hints = extract_gemini_tool_schema_hints(&context);
         let payload = json!({
             "responseId": "resp_6",
             "modelVersion": "gemini-2.5-pro",
             "candidates": [{
                 "finishReason": "STOP",
-                "content": {
-                    "parts": [{
-                        "functionCall": {
-                            "id": "call_1",
-                            "name": "Skill",
-                            "args": {
-                                "name": "git-commit",
-                                "parameters": {
-                                    "args": ["详细分析内容 编写提交信息 分多次提交代码"]
-                                }
-                            }
+                "content": {"parts": [{
+                    "functionCall": {
+                        "id": "call_1",
+                        "name": "Skill",
+                        "args": {
+                            "name": "git-commit",
+                            "parameters": {"args": ["详细分析内容 编写提交信息 分多次提交代码"]}
                         }
-                    }]
-                }
+                    }
+                }]}
             }],
-            "usageMetadata": {
-                "promptTokenCount": 5,
-                "totalTokenCount": 8
-            }
+            "usageMetadata": {"promptTokenCount": 5, "totalTokenCount": 8}
         });
-        let owned_chunks = vec![format!(
-            "data: {}\n\n",
-            serde_json::to_string(&payload).unwrap()
-        )];
-        let stream = futures::stream::iter(
-            owned_chunks
-                .into_iter()
-                .map(|chunk| Ok::<Bytes, std::io::Error>(Bytes::from(chunk))),
+        let output = collect_stream(
+            vec![format!(
+                "data: {}\n\n",
+                serde_json::to_string(&payload).unwrap()
+            )],
+            None,
+            None,
+            None,
+            Some(hints),
+            context,
         );
-        let hints = super::super::transform_gemini::extract_anthropic_tool_schema_hints(&json!({
-            "tools": [{
-                "name": "Skill",
-                "input_schema": {
-                    "type": "object",
-                    "properties": {
-                        "skill": { "type": "string" },
-                        "args": { "type": "string" }
-                    },
-                    "required": ["skill"]
-                }
-            }]
-        }));
-        let converted =
-            create_anthropic_sse_stream_from_gemini(stream, None, None, None, Some(hints));
-        let output = futures::executor::block_on(async move {
-            converted
-                .collect::<Vec<_>>()
-                .await
-                .into_iter()
-                .map(|item| String::from_utf8(item.unwrap().to_vec()).unwrap())
-                .collect::<Vec<_>>()
-                .join("")
-        });
-
-        assert!(output.contains("git-commit"));
-        assert!(output.contains("详细分析内容 编写提交信息 分多次提交代码"));
-        assert!(!output.contains("\\\"parameters\\\""));
+        let events = parse_events(&output);
+        let response = events
+            .iter()
+            .find(|event| event["type"] == "response.completed")
+            .unwrap();
+        let call = response["response"]["output"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["type"] == "function_call")
+            .unwrap();
+        assert!(call["arguments"].as_str().unwrap().contains("git-commit"));
+        assert!(call["arguments"]
+            .as_str()
+            .unwrap()
+            .contains("详细分析内容 编写提交信息 分多次提交代码"));
+        assert!(!call["arguments"].as_str().unwrap().contains("parameters"));
     }
 
-    /// Regression for the P1 finding: when Gemini emits two parallel calls to
-    /// the same function without providing ids, both must be surfaced to the
-    /// Anthropic client with distinct synthesized ids. The previous
-    /// name-based fallback in `merge_tool_call_snapshots` collapsed them into
-    /// a single entry, causing silent data loss for the first call.
     #[test]
-    fn parallel_same_name_no_id_calls_preserve_both() {
+    fn preserves_parallel_no_id_calls_with_distinct_synthesized_ids() {
         let output = collect_stream_output(vec![
             "data: {\"responseId\":\"r1\",\"modelVersion\":\"gemini-2.5-pro\",\"candidates\":[{\"finishReason\":\"STOP\",\"content\":{\"parts\":[{\"functionCall\":{\"name\":\"get_weather\",\"args\":{\"city\":\"Tokyo\"}}},{\"functionCall\":{\"name\":\"get_weather\",\"args\":{\"city\":\"Osaka\"}}}]}}],\"usageMetadata\":{\"promptTokenCount\":5,\"totalTokenCount\":8}}\n\n",
         ]);
+        let events = parse_events(&output);
+        let calls = output_items(&events, "function_call");
 
-        let tool_use_start_count = output.matches("\"type\":\"tool_use\"").count();
-        assert_eq!(
-            tool_use_start_count, 2,
-            "both parallel calls must survive merge_tool_call_snapshots"
-        );
-        // `input_json_delta.partial_json` is a string, so the city keys appear
-        // JSON-escaped inside the outer SSE `data:` payload. Match against
-        // the raw escape sequences rather than the canonical JSON form.
-        assert!(output.contains("Tokyo"));
-        assert!(output.contains("Osaka"));
-        // Each tool_use must carry a non-empty synthesized id so Claude Code
-        // can disambiguate the two tool_result round-trips.
-        let synth_count = output.matches("\"id\":\"gemini_synth_").count();
-        assert_eq!(synth_count, 2);
+        assert_eq!(calls.len(), 2);
+        assert_ne!(calls[0]["call_id"], calls[1]["call_id"]);
+        assert!(calls.iter().all(|item| item["call_id"]
+            .as_str()
+            .unwrap()
+            .starts_with("gemini_synth_")));
+        let completed = events
+            .iter()
+            .find(|event| event["type"] == "response.completed")
+            .unwrap();
+        let arguments = completed["response"]["output"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|item| item["type"] == "function_call")
+            .filter_map(|item| item["arguments"].as_str())
+            .collect::<Vec<_>>();
+        assert!(arguments.iter().any(|args| args.contains("Tokyo")));
+        assert!(arguments.iter().any(|args| args.contains("Osaka")));
     }
 
-    /// When Gemini keeps sending the same no-id functionCall across cumulative
-    /// chunks, the synthesized id must stay stable so the Anthropic client
-    /// sees a single tool_use block with consistent args updates rather than
-    /// duplicates.
     #[test]
-    fn no_id_tool_call_reuses_synthesized_id_across_cumulative_chunks() {
+    fn merges_cumulative_no_id_tool_call_snapshots() {
         let output = collect_stream_output(vec![
             "data: {\"responseId\":\"r2\",\"modelVersion\":\"gemini-2.5-pro\",\"candidates\":[{\"content\":{\"parts\":[{\"functionCall\":{\"name\":\"get_weather\",\"args\":{\"city\":\"Tokyo\"}}}]}}],\"usageMetadata\":{\"promptTokenCount\":4,\"totalTokenCount\":6}}\n\n",
             "data: {\"responseId\":\"r2\",\"modelVersion\":\"gemini-2.5-pro\",\"candidates\":[{\"finishReason\":\"STOP\",\"content\":{\"parts\":[{\"functionCall\":{\"name\":\"get_weather\",\"args\":{\"city\":\"Tokyo\",\"units\":\"c\"}}}]}}],\"usageMetadata\":{\"promptTokenCount\":4,\"totalTokenCount\":9}}\n\n",
         ]);
+        let events = parse_events(&output);
+        let calls = output_items(&events, "function_call");
+        let completed = events
+            .iter()
+            .find(|event| event["type"] == "response.completed")
+            .unwrap();
 
-        assert_eq!(output.matches("\"type\":\"tool_use\"").count(), 1);
-        assert!(output.contains("\"units\\\":\\\"c\\\""));
+        assert_eq!(calls.len(), 1);
+        assert!(completed["response"]["output"][0]["arguments"]
+            .as_str()
+            .unwrap()
+            .contains("units"));
     }
 
-    /// Regression for the follow-up Codex P1: some Gemini relays serialize
-    /// an absent functionCall id as `"id": ""` rather than omitting the
-    /// field. Without a filter, `Some("")` would reach
-    /// `merge_tool_call_snapshots`, two parallel no-id calls would match
-    /// each other on the empty-string id, and the second would overwrite
-    /// the first — silently losing a call. Also the emitted Anthropic
-    /// `tool_use.id` would be the empty string, so tool_result
-    /// correlation from the Claude client would break.
     #[test]
-    fn parallel_empty_string_id_calls_are_treated_as_missing_and_preserved() {
+    fn treats_empty_tool_call_ids_as_missing() {
         let output = collect_stream_output(vec![
             "data: {\"responseId\":\"r3\",\"modelVersion\":\"gemini-2.5-pro\",\"candidates\":[{\"finishReason\":\"STOP\",\"content\":{\"parts\":[{\"functionCall\":{\"id\":\"\",\"name\":\"get_weather\",\"args\":{\"city\":\"Tokyo\"}}},{\"functionCall\":{\"id\":\"\",\"name\":\"get_weather\",\"args\":{\"city\":\"Osaka\"}}}]}}],\"usageMetadata\":{\"promptTokenCount\":5,\"totalTokenCount\":8}}\n\n",
         ]);
+        let events = parse_events(&output);
+        let calls = output_items(&events, "function_call");
 
-        let tool_use_count = output.matches("\"type\":\"tool_use\"").count();
-        assert_eq!(
-            tool_use_count, 2,
-            "both parallel calls must survive even when ids are explicit empty strings"
-        );
-        assert!(output.contains("Tokyo"));
-        assert!(output.contains("Osaka"));
-        // No tool_use may emit an empty id — each must get its own
-        // synthesized id so tool_result correlation works.
-        assert!(
-            !output.contains("\"id\":\"\""),
-            "empty tool_use id leaked through: {output}"
-        );
-        let synth_count = output.matches("\"id\":\"gemini_synth_").count();
-        assert_eq!(synth_count, 2);
+        assert_eq!(calls.len(), 2);
+        assert!(calls.iter().all(|item| {
+            item["call_id"]
+                .as_str()
+                .is_some_and(|id| id.starts_with("gemini_synth_"))
+        }));
     }
 
-    /// Companion regression: a single-chunk stream whose sole functionCall
-    /// carries `"id": ""` must still emit exactly one tool_use with a
-    /// synthesized id, not an empty one. This covers the non-parallel
-    /// degraded-relay case that the parallel test above subsumes.
     #[test]
-    fn single_empty_string_id_tool_call_gets_synthesized_id() {
+    fn upgrades_a_synthesized_id_when_a_later_snapshot_has_a_real_id() {
         let output = collect_stream_output(vec![
-            "data: {\"responseId\":\"r4\",\"modelVersion\":\"gemini-2.5-pro\",\"candidates\":[{\"finishReason\":\"STOP\",\"content\":{\"parts\":[{\"functionCall\":{\"id\":\"\",\"name\":\"get_weather\",\"args\":{\"city\":\"Tokyo\"}}}]}}],\"usageMetadata\":{\"promptTokenCount\":3,\"totalTokenCount\":5}}\n\n",
-        ]);
-
-        assert_eq!(output.matches("\"type\":\"tool_use\"").count(), 1);
-        assert!(!output.contains("\"id\":\"\""));
-        assert_eq!(output.matches("\"id\":\"gemini_synth_").count(), 1);
-    }
-
-    /// Regression for Codex P1: Gemini's cumulative stream may deliver a
-    /// `functionCall` without an id (we synthesize one) and then upgrade
-    /// to a genuine id on a later chunk. Without a positional fallback in
-    /// the `Some(incoming_id)` branch of `merge_tool_call_snapshots`, the
-    /// real id would fail to match the existing synthesized snapshot and
-    /// push a second entry — yielding duplicate `tool_use` blocks at
-    /// stream end (one synthesized, one real) and breaking tool_result
-    /// correlation.
-    #[test]
-    fn upgraded_real_id_merges_into_existing_synthesized_snapshot() {
-        let output = collect_stream_output(vec![
-            // Chunk 1: no id -> a `gemini_synth_*` id is assigned.
             "data: {\"responseId\":\"rupg\",\"modelVersion\":\"gemini-2.5-pro\",\"candidates\":[{\"content\":{\"parts\":[{\"functionCall\":{\"name\":\"get_weather\",\"args\":{\"city\":\"Tokyo\"}}}]}}],\"usageMetadata\":{\"promptTokenCount\":4,\"totalTokenCount\":6}}\n\n",
-            // Chunk 2: cumulative snapshot upgrades the same call to a
-            // real Gemini id. Must merge into the existing slot, not
-            // spawn a second snapshot.
             "data: {\"responseId\":\"rupg\",\"modelVersion\":\"gemini-2.5-pro\",\"candidates\":[{\"finishReason\":\"STOP\",\"content\":{\"parts\":[{\"functionCall\":{\"id\":\"real_id_abc\",\"name\":\"get_weather\",\"args\":{\"city\":\"Tokyo\",\"units\":\"c\"}}}]}}],\"usageMetadata\":{\"promptTokenCount\":4,\"totalTokenCount\":9}}\n\n",
         ]);
+        let events = parse_events(&output);
+        let calls = output_items(&events, "function_call");
+        let response = events
+            .iter()
+            .find(|event| event["type"] == "response.completed")
+            .unwrap();
 
-        // Exactly one tool_use block (not two).
-        assert_eq!(
-            output.matches("\"type\":\"tool_use\"").count(),
-            1,
-            "id upgrade must merge into the synthesized snapshot, not duplicate it: {output}"
-        );
-        // The emitted tool_use id is the real Gemini id, not the synthesized one.
-        assert!(
-            output.contains("\"id\":\"real_id_abc\""),
-            "expected real id to win after upgrade: {output}"
-        );
-        assert!(
-            !output.contains("\"id\":\"gemini_synth_"),
-            "synthesized id must be dropped when a real id arrives: {output}"
-        );
-        // Args from the final cumulative snapshot are emitted.
-        assert!(output.contains("units"));
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["call_id"], "real_id_abc");
+        assert_eq!(response["response"]["output"][0]["call_id"], "real_id_abc");
+        assert!(!response.to_string().contains("gemini_synth_"));
     }
 
-    /// Regression for Codex P2: Gemini's cumulative stream may include
-    /// `thoughtSignature` on one chunk and omit it on a later cumulative
-    /// snapshot of the same call. A blind `tool_call_snapshots[index] =
-    /// tool_call` overwrite would drop the signature, so the shadow turn
-    /// recorded (and later replayed to Gemini) would miss
-    /// `thoughtSignature` and the upstream would reject the follow-up.
-    /// `merge_tool_call_snapshots` must retain the prior signature when
-    /// the incoming chunk does not carry one.
     #[test]
-    fn thought_signature_preserved_when_later_chunk_omits_it() {
+    fn retains_tool_signature_when_a_later_snapshot_omits_it() {
         let store = Arc::new(GeminiShadowStore::with_limits(8, 4));
         collect_stream_output_with_shadow(
             vec![
-                // Chunk 1: carries thoughtSignature "sig-keep".
                 "data: {\"responseId\":\"rsig\",\"modelVersion\":\"gemini-2.5-pro\",\"candidates\":[{\"content\":{\"parts\":[{\"functionCall\":{\"id\":\"call_1\",\"name\":\"get_weather\",\"args\":{\"city\":\"Tokyo\"}},\"thoughtSignature\":\"sig-keep\"}]}}],\"usageMetadata\":{\"promptTokenCount\":4,\"totalTokenCount\":6}}\n\n",
-                // Chunk 2: cumulative update for the same call, but
-                // thoughtSignature is omitted — common for Gemini's
-                // one-shot signature fields.
                 "data: {\"responseId\":\"rsig\",\"modelVersion\":\"gemini-2.5-pro\",\"candidates\":[{\"finishReason\":\"STOP\",\"content\":{\"parts\":[{\"functionCall\":{\"id\":\"call_1\",\"name\":\"get_weather\",\"args\":{\"city\":\"Tokyo\",\"units\":\"c\"}}}]}}],\"usageMetadata\":{\"promptTokenCount\":4,\"totalTokenCount\":9}}\n\n",
             ],
             store.clone(),
@@ -1138,10 +1334,7 @@ mod tests {
             .latest_assistant_content("provider-sig", "session-sig")
             .expect("shadow turn must be recorded");
         assert_eq!(shadow["parts"][0]["functionCall"]["id"], "call_1");
-        assert_eq!(
-            shadow["parts"][0]["thoughtSignature"], "sig-keep",
-            "prior thoughtSignature must survive a later chunk that omits it: {shadow}"
-        );
+        assert_eq!(shadow["parts"][0]["thoughtSignature"], "sig-keep");
     }
 
     #[tokio::test]
@@ -1150,16 +1343,22 @@ mod tests {
 
         for chunk_size in [1, 7, 4096] {
             let output = collect_chunked_output(payload, chunk_size).await;
+            let events = parse_events(&output);
             assert!(
                 output.contains("\"text\":\"complete\""),
                 "chunk_size={chunk_size}"
             );
-            assert!(
-                output.contains("\"stop_reason\":\"end_turn\""),
+            assert_eq!(
+                events.last().unwrap()["type"],
+                "response.completed",
                 "chunk_size={chunk_size}"
             );
-            assert!(
-                output.contains("event: message_stop"),
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| event["type"] == "response.completed")
+                    .count(),
+                1,
                 "chunk_size={chunk_size}"
             );
         }
@@ -1176,12 +1375,131 @@ mod tests {
             "provider-incomplete",
             "session-incomplete",
         );
+        let events = parse_events(&output);
+        let incomplete = events
+            .iter()
+            .find(|event| event["type"] == "response.incomplete")
+            .unwrap();
 
-        assert!(!output.contains("\"type\":\"tool_use\""));
-        assert!(output.contains("\"stop_reason\":\"max_tokens\""));
+        assert_eq!(
+            incomplete["response"]["incomplete_details"]["reason"],
+            "max_output_tokens"
+        );
+        assert!(output_items(&events, "function_call").is_empty());
         assert!(store
             .get_session("provider-incomplete", "session-incomplete")
             .is_none());
+    }
+
+    #[test]
+    fn safety_finish_reason_is_incomplete_and_does_not_commit_tools() {
+        let output = collect_stream_output(vec![
+            "data: {\"responseId\":\"safety-1\",\"modelVersion\":\"gemini-3-pro\",\"candidates\":[{\"finishReason\":\"SAFETY\",\"content\":{\"parts\":[{\"functionCall\":{\"name\":\"lookup\",\"args\":{\"query\":\"restricted\"}}}]}}],\"usageMetadata\":{\"promptTokenCount\":3,\"totalTokenCount\":7}}\n\n",
+        ]);
+        let events = parse_events(&output);
+        let incomplete = events
+            .iter()
+            .find(|event| event["type"] == "response.incomplete")
+            .unwrap();
+
+        assert_eq!(
+            incomplete["response"]["incomplete_details"]["reason"],
+            "content_filter"
+        );
+        assert!(output_items(&events, "function_call").is_empty());
+    }
+
+    #[test]
+    fn maps_grounding_queries_to_responses_search_calls_once() {
+        let context = tool_context(&json!({ "tools": [{ "type": "web_search" }] }));
+        let output = collect_stream(
+            vec![
+                "data: {\"responseId\":\"search-1\",\"modelVersion\":\"gemini-3-pro\",\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"Finding.\"}]},\"groundingMetadata\":{\"webSearchQueries\":[\"weather\",\"weather\"]}}]}\n\n"
+                    .to_string(),
+                "data: {\"responseId\":\"search-1\",\"modelVersion\":\"gemini-3-pro\",\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"Finding the weather.\"}]},\"finishReason\":\"STOP\",\"groundingMetadata\":{\"webSearchQueries\":[\"weather\"]}}]}\n\n"
+                    .to_string(),
+            ],
+            None,
+            None,
+            None,
+            None,
+            context,
+        );
+        let events = parse_events(&output);
+        let search = output_items(&events, "web_search_call");
+        assert_eq!(search.len(), 1);
+        assert_eq!(search[0]["id"], "ws_search-1_search_0");
+        assert_eq!(search[0]["action"]["query"], "weather");
+        assert_eq!(events.last().unwrap()["type"], "response.completed");
+    }
+
+    #[test]
+    fn maps_namespace_custom_and_tool_search_calls_to_responses_items() {
+        let request = json!({
+            "tools": [
+                {
+                    "type": "namespace",
+                    "name": "repo",
+                    "tools": [
+                        {"type": "function", "name": "read", "parameters": {"type": "object"}},
+                        {"type": "custom", "name": "shell"}
+                    ]
+                },
+                {"type": "tool_search"}
+            ],
+            "input": "run"
+        });
+        let context = tool_context(&request);
+        let output = collect_stream(
+            vec![
+                "data: {\"responseId\":\"calls-1\",\"modelVersion\":\"gemini-3-pro\",\"candidates\":[{\"finishReason\":\"STOP\",\"content\":{\"parts\":[{\"functionCall\":{\"name\":\"repo__read\",\"args\":{\"path\":\"/tmp/a\"}}},{\"functionCall\":{\"name\":\"repo__shell\",\"args\":{\"input\":\"echo ok\"}}},{\"functionCall\":{\"name\":\"tool_search\",\"args\":{\"query\":\"filesystem\"}}}]}}]}\n\n"
+                    .to_string(),
+            ],
+            None,
+            None,
+            None,
+            None,
+            context,
+        );
+        let events = parse_events(&output);
+        let calls = events
+            .iter()
+            .find(|event| event["type"] == "response.completed")
+            .unwrap()["response"]["output"]
+            .as_array()
+            .unwrap();
+        assert_eq!(calls[0]["type"], "function_call");
+        assert_eq!(calls[0]["name"], "read");
+        assert_eq!(calls[0]["namespace"], "repo");
+        assert_eq!(calls[1]["type"], "custom_tool_call");
+        assert_eq!(calls[1]["name"], "shell");
+        assert_eq!(calls[1]["namespace"], "repo");
+        assert_eq!(calls[1]["input"], "echo ok");
+        assert_eq!(calls[2]["type"], "tool_search_call");
+        assert_eq!(calls[2]["arguments"]["query"], "filesystem");
+        assert!(events
+            .iter()
+            .any(|event| event["type"] == "response.custom_tool_call_input.done"));
+    }
+
+    #[test]
+    fn done_marker_without_finish_reason_remains_incomplete() {
+        let output = collect_stream_output(vec![
+            "data: {\"responseId\":\"done-only\",\"modelVersion\":\"gemini-2.5-pro\",\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"partial\"}]}}]}\n\n",
+            "data: [DONE]\n\n",
+        ]);
+        let events = parse_events(&output);
+        let incomplete = events
+            .iter()
+            .find(|event| event["type"] == "response.incomplete")
+            .unwrap();
+
+        assert_eq!(
+            incomplete["response"]["incomplete_details"]["reason"],
+            "max_output_tokens"
+        );
+        assert!(!output.contains("[DONE]"));
+        assert!(!output.contains("event: response.completed"));
     }
 
     #[tokio::test]
@@ -1193,12 +1511,14 @@ mod tests {
             )),
             Err(std::io::Error::other("connection interrupted")),
         ]);
-        let converted = create_anthropic_sse_stream_from_gemini(
+        let converted = create_responses_sse_stream_from_gemini(
             source,
             Some(store.clone()),
             Some("provider-interrupted".to_string()),
             Some("session-interrupted".to_string()),
             None,
+            CodexToolContext::default(),
+            "gemini-test".to_string(),
         );
         let chunks = converted.collect::<Vec<_>>().await;
 

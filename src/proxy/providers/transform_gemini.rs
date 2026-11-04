@@ -1,15 +1,16 @@
-//! Gemini Native format conversion module.
-//!
-//! Converts Anthropic Messages requests to Gemini `generateContent` requests,
-//! and Gemini `GenerateContentResponse` payloads back to Anthropic Messages
-//! responses for Claude-compatible clients.
+//! Direct conversion between OpenAI Responses and Gemini Native payloads.
 
-// Derived from cc-switch@214e75ba7f625c679dd4e61df166ec4463245fe7.
-// Copyright (c) 2025 Jason Young. MIT; see providers/LICENSE-cc-switch.
-
-use super::gemini_schema::build_gemini_function_declaration;
+use super::codex_compaction;
+use super::gemini_schema::{build_gemini_function_declaration, normalize_gemini_function_schema};
 use super::gemini_shadow::{GeminiAssistantTurn, GeminiShadowStore, GeminiToolCallMeta};
+use super::transform_codex_chat::{
+    response_tool_call_item_from_chat_name, response_tool_call_item_id_from_chat_name,
+    responses_text_format, CodexToolContext,
+};
+use crate::compat::request::GeminiThinking;
 use crate::proxy::error::ProxyError;
+use crate::proxy::json_canonical::{canonical_json_string, canonicalize_tool_arguments};
+use crate::proxy::providers::transform_responses::TOOL_RESULT_ERROR_MARKER;
 use crate::proxy::tool_media::{
     strip_and_clamp_media_from_tool_value, ToolMediaScope, TOOL_RESULT_MEDIA_ATTACHED_MARKER,
 };
@@ -17,569 +18,1130 @@ use serde_json::{json, Map, Value};
 use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct AnthropicToolSchemaHint {
+pub struct GeminiToolSchemaHint {
     expected_keys: Vec<String>,
     required_keys: Vec<String>,
 }
 
-pub type AnthropicToolSchemaHints = HashMap<String, AnthropicToolSchemaHint>;
-
-/// Prefix used for Anthropic-visible tool call ids that we synthesize when
-/// Gemini's `functionCall` omits the `id` field (Gemini 2.x parallel calls
-/// often do). The prefix is how downstream request-path code recognizes that
-/// the id is not a real Gemini id and must be stripped before forwarding back
-/// to Gemini as `functionResponse.id`.
+pub type GeminiToolSchemaHints = HashMap<String, GeminiToolSchemaHint>;
 pub(crate) const SYNTHESIZED_ID_PREFIX: &str = "gemini_synth_";
+const GEMINI_SKIP_THOUGHT_SIGNATURE: &str = "skip_thought_signature_validator";
 
-/// Generate a unique tool-call id that is safe to expose to Anthropic clients
-/// but must not be sent upstream to Gemini. Uses UUID v4 simple encoding
-/// (32 lowercase hex chars) so that any number of parallel calls in the same
-/// response remain distinguishable.
 pub(crate) fn synthesize_tool_call_id() -> String {
     format!("{SYNTHESIZED_ID_PREFIX}{}", uuid::Uuid::new_v4().simple())
 }
 
-/// Returns true if `id` was produced by [`synthesize_tool_call_id`] and
-/// therefore must be stripped when building Gemini request bodies.
 pub(crate) fn is_synthesized_tool_call_id(id: &str) -> bool {
     id.starts_with(SYNTHESIZED_ID_PREFIX)
 }
 
-/// Anthropic 请求 → Gemini 原生请求。
-#[allow(dead_code)]
-pub fn anthropic_to_gemini(body: Value) -> Result<Value, ProxyError> {
-    anthropic_to_gemini_with_shadow(body, None, None, None)
+pub fn supports_gemini_thinking_level(model: &str) -> bool {
+    let model = crate::proxy::gemini_url::normalize_gemini_model_id(model);
+    let model = model
+        .rsplit('/')
+        .next()
+        .unwrap_or(model)
+        .trim()
+        .to_ascii_lowercase();
+    let Some(version) = model.strip_prefix("gemini-") else {
+        return false;
+    };
+    version
+        .split(|character: char| !character.is_ascii_digit())
+        .next()
+        .and_then(|major| major.parse::<u32>().ok())
+        .is_some_and(|major| major >= 3)
 }
 
-pub fn anthropic_to_gemini_with_shadow(
-    body: Value,
+fn is_gemini_3_series(model: &str) -> bool {
+    let normalized = model.trim().to_ascii_lowercase();
+    normalized.starts_with("gemini-3")
+        || normalized
+            .rsplit('/')
+            .next()
+            .is_some_and(|tail| tail.starts_with("gemini-3"))
+}
+
+pub(crate) fn responses_to_gemini(
+    body: &Value,
     shadow_store: Option<&GeminiShadowStore>,
     provider_id: Option<&str>,
     session_id: Option<&str>,
-) -> Result<Value, ProxyError> {
-    anthropic_to_gemini_with_shadow_and_options(body, shadow_store, provider_id, session_id, true)
-}
-
-pub fn anthropic_to_gemini_with_shadow_and_options(
-    body: Value,
-    shadow_store: Option<&GeminiShadowStore>,
-    provider_id: Option<&str>,
-    session_id: Option<&str>,
+    tool_context: &CodexToolContext,
     replay_thought_signatures: bool,
-) -> Result<Value, ProxyError> {
-    let mut result = json!({});
+    thinking: GeminiThinking,
+) -> Result<(Value, GeminiToolSchemaHints), ProxyError> {
+    let model = body.get("model").and_then(Value::as_str).unwrap_or("");
     let shadow_turns = shadow_store
         .zip(provider_id)
         .zip(session_id)
         .and_then(|((store, provider_id), session_id)| store.get_session(provider_id, session_id))
         .map(|snapshot| snapshot.turns)
         .unwrap_or_default();
-    let supports_multimodal_function_response = body
-        .get("model")
-        .and_then(Value::as_str)
-        .is_some_and(is_gemini_3_series);
-    let requires_thought_signatures = body
-        .get("model")
-        .and_then(Value::as_str)
-        .is_some_and(requires_gemini_3_or_later_thought_signatures);
 
-    let messages = body.get("messages").and_then(|value| value.as_array());
-
-    let system_instruction = build_system_instruction(
-        body.get("system"),
-        messages.map(|messages| messages.as_slice()),
-    )?;
-    if let Some(system) = system_instruction {
+    let mut result = json!({});
+    if let Some(system) = build_responses_system_instruction(body) {
         result["systemInstruction"] = system;
     }
-
-    if let Some(messages) = messages {
-        result["contents"] = json!(convert_messages_to_contents(
-            messages,
-            &shadow_turns,
-            supports_multimodal_function_response,
-            replay_thought_signatures,
-            requires_thought_signatures,
-        )?);
+    let requires_thought_signatures = supports_gemini_thinking_level(model);
+    let supports_multimodal_function_response = is_gemini_3_series(model);
+    let contents = convert_responses_input_to_contents(
+        body,
+        &shadow_turns,
+        tool_context,
+        replay_thought_signatures,
+        requires_thought_signatures,
+        supports_multimodal_function_response,
+    )?;
+    if !contents.is_empty() {
+        result["contents"] = json!(contents
+            .iter()
+            .map(|message| json!({
+                "role": if message.role == "model" { "model" } else { "user" },
+                "parts": message.parts
+            }))
+            .collect::<Vec<_>>());
     }
 
-    if let Some(generation_config) = build_generation_config(&body)? {
-        result["generationConfig"] = generation_config;
+    let mut generation_config =
+        build_responses_generation_config(body, !tool_context.is_compaction_request())?;
+    apply_thinking_level(
+        &mut generation_config,
+        model,
+        body.pointer("/reasoning/effort").and_then(Value::as_str),
+        thinking,
+    )?;
+    if !generation_config.is_empty() {
+        result["generationConfig"] = Value::Object(generation_config);
     }
 
-    let mut has_function_declarations = false;
-    let mut has_web_search = false;
-    if let Some(tools) = body.get("tools").and_then(|value| value.as_array()) {
-        let mut function_declarations = Vec::new();
-        for tool in tools {
-            if tool.get("type").and_then(Value::as_str) == Some("BatchTool") {
-                continue;
-            }
-            if is_anthropic_web_search_tool(tool) {
-                has_web_search = true;
-                continue;
-            }
-            function_declarations.push(build_gemini_function_declaration(
-                tool.get("name")
-                    .and_then(|value| value.as_str())
-                    .unwrap_or(""),
-                tool.get("description").and_then(|value| value.as_str()),
-                tool.get("input_schema")
-                    .cloned()
-                    .unwrap_or_else(|| json!({})),
-            ));
-        }
-
-        has_function_declarations = !function_declarations.is_empty();
-        let mut gemini_tools = Vec::new();
-        if !function_declarations.is_empty() {
-            gemini_tools.push(json!({ "functionDeclarations": function_declarations }));
-        }
-        if has_web_search {
-            gemini_tools.push(json!({ "googleSearch": {} }));
-        }
-        if !gemini_tools.is_empty() {
-            result["tools"] = Value::Array(gemini_tools);
+    let declarations = if tool_context.is_compaction_request() {
+        Vec::new()
+    } else {
+        tool_context
+            .chat_tools()
+            .iter()
+            .filter_map(|tool| {
+                let function = tool.get("function")?;
+                Some(build_gemini_function_declaration(
+                    function.get("name").and_then(Value::as_str).unwrap_or(""),
+                    function.get("description").and_then(Value::as_str),
+                    function
+                        .get("parameters")
+                        .cloned()
+                        .unwrap_or_else(|| json!({})),
+                ))
+            })
+            .collect::<Vec<_>>()
+    };
+    let has_function_declarations = !declarations.is_empty();
+    let has_web_search =
+        !tool_context.is_compaction_request() && tool_context.hosted_web_search().is_some();
+    let mut tools = Vec::new();
+    if has_function_declarations {
+        tools.push(json!({ "functionDeclarations": declarations }));
+    }
+    if has_web_search {
+        tools.push(json!({ "googleSearch": {} }));
+    }
+    if !tools.is_empty() {
+        result["tools"] = Value::Array(tools);
+    }
+    if has_function_declarations {
+        if let Some(config) = map_responses_tool_choice(body.get("tool_choice"), tool_context)? {
+            result["toolConfig"] = config;
+        } else if body.get("parallel_tool_calls").and_then(Value::as_bool) == Some(false)
+            && body.get("tool_choice").is_none()
+        {
+            result["toolConfig"] = json!({ "functionCallingConfig": { "mode": "AUTO" } });
         }
     }
 
-    if !has_web_search || has_function_declarations {
-        if let Some(tool_config) = map_tool_choice(body.get("tool_choice"))? {
-            result["toolConfig"] = tool_config;
-        }
-    }
-
-    Ok(result)
+    Ok((result, extract_gemini_tool_schema_hints(tool_context)))
 }
 
-/// Convenience wrapper over [`gemini_to_anthropic_with_shadow_and_hints`]
-/// with no shadow store or schema hints. Used by the shared
-/// `ProviderAdapter::transform_response` path and by tests.
-#[allow(dead_code)] // kept as public API for non-streaming transform paths
-pub fn gemini_to_anthropic(body: Value) -> Result<Value, ProxyError> {
-    gemini_to_anthropic_with_shadow(body, None, None, None)
-}
-
-/// Convenience wrapper for callers that have a shadow store but no tool
-/// schema hints. Production call sites funnel through
-/// [`gemini_to_anthropic_with_shadow_and_hints`] directly; this helper exists
-/// for test ergonomics and future external callers.
-#[allow(dead_code)] // kept as public API for shadow-only transform paths
-pub fn gemini_to_anthropic_with_shadow(
-    body: Value,
-    shadow_store: Option<&GeminiShadowStore>,
-    provider_id: Option<&str>,
-    session_id: Option<&str>,
-) -> Result<Value, ProxyError> {
-    gemini_to_anthropic_with_shadow_and_hints(body, shadow_store, provider_id, session_id, None)
-}
-
-pub fn gemini_to_anthropic_with_shadow_and_hints(
-    body: Value,
-    shadow_store: Option<&GeminiShadowStore>,
-    provider_id: Option<&str>,
-    session_id: Option<&str>,
-    tool_schema_hints: Option<&AnthropicToolSchemaHints>,
-) -> Result<Value, ProxyError> {
-    if let Some(block_reason) = body
-        .get("promptFeedback")
-        .and_then(|value| value.get("blockReason"))
-        .and_then(|value| value.as_str())
-    {
-        let text = format!("Request blocked by Gemini safety filters: {block_reason}");
-        return Ok(json!({
-            "id": body.get("responseId").and_then(|value| value.as_str()).unwrap_or(""),
-            "type": "message",
-            "role": "assistant",
-            "content": [{ "type": "text", "text": text }],
-            "model": body.get("modelVersion").and_then(|value| value.as_str()).unwrap_or(""),
-            "stop_reason": "refusal",
-            "stop_sequence": Value::Null,
-            "usage": build_anthropic_usage(body.get("usageMetadata"))
-        }));
-    }
-
-    let candidate = body
-        .get("candidates")
-        .and_then(|value| value.as_array())
-        .and_then(|value| value.first())
-        .ok_or_else(|| {
-            ProxyError::TransformError("No candidates in Gemini response".to_string())
-        })?;
-
-    let parts = candidate
-        .get("content")
-        .and_then(|value| value.get("parts"))
-        .and_then(|value| value.as_array())
-        .cloned()
-        .unwrap_or_default();
-
-    let mut rectified_parts = parts.clone();
-    rectify_tool_call_parts(&mut rectified_parts, tool_schema_hints);
-
-    // Pre-pass: for every `functionCall` that lacks an id (or carries an
-    // empty-string id), synthesize one and write it back into
-    // `rectified_parts`. Three independent readers — the
-    // Anthropic-visible `content[tool_use]` block below, the shadow
-    // store's `assistant_content` (cloned from `rectified_parts` further
-    // down), and `extract_tool_call_meta(&rectified_parts)` that populates
-    // `shadow_turn.tool_calls` — must all see the same id. Otherwise the
-    // client would receive id A while the shadow stored id B, and the
-    // next round's `tool_result(tool_use_id=A)` would fail to resolve
-    // through `tool_name_by_id` (which is built from the shadow), raising
-    // `Unable to resolve Gemini functionResponse.name`. Streaming path
-    // already has this single-source-of-truth property via
-    // `tool_call_snapshots`.
-    for part in rectified_parts.iter_mut() {
-        let Some(function_call) = part.get_mut("functionCall").and_then(|v| v.as_object_mut())
-        else {
-            continue;
-        };
-        let needs_synth = function_call
-            .get("id")
-            .and_then(|v| v.as_str())
-            .map(|s| s.is_empty())
-            .unwrap_or(true);
-        if needs_synth {
-            function_call.insert("id".to_string(), json!(synthesize_tool_call_id()));
-        }
-    }
-
-    let response_id = body.get("responseId").and_then(Value::as_str);
-    let mut content = Vec::new();
-    let mut has_tool_use = false;
-
-    for (index, query) in extract_gemini_web_search_queries(candidate)
-        .into_iter()
-        .enumerate()
-    {
-        content.push(json!({
-            "type": "server_tool_use",
-            "id": gemini_web_search_call_id(response_id, index),
-            "name": "web_search",
-            "input": { "query": query }
-        }));
-    }
-
-    for part in &rectified_parts {
-        if part.get("thought").and_then(|value| value.as_bool()) == Some(true) {
-            continue;
-        }
-
-        if let Some(text) = part.get("text").and_then(|value| value.as_str()) {
-            if !text.is_empty() {
-                content.push(json!({
-                    "type": "text",
-                    "text": text
-                }));
-            }
-            continue;
-        }
-
-        if let Some(function_call) = part.get("functionCall") {
-            has_tool_use = true;
-            let id = function_call
-                .get("id")
-                .and_then(|value| value.as_str())
-                .filter(|s| !s.is_empty())
-                .map(ToString::to_string)
-                .unwrap_or_else(synthesize_tool_call_id);
-            content.push(json!({
-                "type": "tool_use",
-                "id": id,
-                "name": function_call.get("name").and_then(|value| value.as_str()).unwrap_or(""),
-                "input": function_call.get("args").cloned().unwrap_or_else(|| json!({}))
-            }));
-        }
-    }
-
-    let stop_reason = map_finish_reason(
-        candidate
-            .get("finishReason")
-            .and_then(|value| value.as_str()),
-        has_tool_use,
-    );
-
-    let anthropic_response = json!({
-        "id": body.get("responseId").and_then(|value| value.as_str()).unwrap_or(""),
-        "type": "message",
-        "role": "assistant",
-        "content": content,
-        "model": body.get("modelVersion").and_then(|value| value.as_str()).unwrap_or(""),
-        "stop_reason": stop_reason,
-        "stop_sequence": Value::Null,
-        "usage": build_anthropic_usage(body.get("usageMetadata"))
-    });
-
-    let complete_candidate = candidate.get("finishReason").and_then(Value::as_str) == Some("STOP");
-    if complete_candidate {
-        if let (Some(store), Some(provider_id), Some(session_id), Some(content)) = (
-            shadow_store,
-            provider_id,
-            session_id,
-            candidate.get("content"),
-        ) {
-            let mut shadow_content = content.clone();
-            if let Some(parts_value) = shadow_content.get_mut("parts") {
-                *parts_value = json!(rectified_parts.clone());
-            }
-            store.record_assistant_turn(
-                provider_id,
-                session_id,
-                shadow_content,
-                extract_tool_call_meta(&rectified_parts),
-            );
-        }
-    }
-
-    Ok(anthropic_response)
-}
-
-pub fn extract_gemini_model(body: &Value) -> Option<&str> {
-    body.get("model").and_then(|value| value.as_str())
-}
-
-fn build_system_instruction(
-    system: Option<&Value>,
-    messages: Option<&[Value]>,
-) -> Result<Option<Value>, ProxyError> {
+fn build_responses_system_instruction(body: &Value) -> Option<Value> {
     let mut texts = Vec::new();
-
-    if let Some(system) = system {
-        collect_system_texts(system, &mut texts)?;
+    if let Some(instructions) = body.get("instructions").and_then(Value::as_str) {
+        if !instructions.trim().is_empty() {
+            texts.push(instructions.trim().to_string());
+        }
     }
-
-    if let Some(messages) = messages {
-        for message in messages {
-            if message.get("role").and_then(|value| value.as_str()) != Some("system") {
-                continue;
-            }
-            if let Some(content) = message.get("content") {
-                collect_system_texts(content, &mut texts)?;
+    if let Some(items) = body.get("input").and_then(Value::as_array) {
+        for item in items {
+            if matches!(
+                item.get("role").and_then(Value::as_str),
+                Some("system" | "developer")
+            ) {
+                texts.extend(responses_system_text(item));
             }
         }
     }
-
-    if texts.is_empty() {
-        return Ok(None);
-    }
-
-    Ok(Some(json!({
-        "parts": [{ "text": texts.join("\n\n") }]
-    })))
+    (!texts.is_empty()).then(|| json!({ "parts": [{ "text": texts.join("\n\n") }] }))
 }
 
-fn collect_system_texts(value: &Value, texts: &mut Vec<String>) -> Result<(), ProxyError> {
-    if let Some(text) = value.as_str() {
-        if !text.is_empty() {
-            texts.push(text.to_string());
+fn responses_system_text(item: &Value) -> Vec<String> {
+    let meaningful = |text: &str| !text.trim().is_empty();
+    match item.get("content") {
+        Some(Value::String(text)) if meaningful(text) => vec![text.trim().to_string()],
+        Some(Value::Array(parts)) => parts
+            .iter()
+            .filter_map(|part| {
+                matches!(
+                    part.get("type").and_then(Value::as_str),
+                    Some("input_text" | "output_text" | "text")
+                )
+                .then(|| part.get("text").and_then(Value::as_str))
+                .flatten()
+                .filter(|text| meaningful(text))
+                .map(|text| text.trim().to_string())
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn build_responses_generation_config(
+    body: &Value,
+    include_text_format: bool,
+) -> Result<Map<String, Value>, ProxyError> {
+    let mut config = Map::new();
+    if let Some(value) = body
+        .get("max_output_tokens")
+        .filter(|value| value.as_u64().is_some_and(|value| value > 0))
+    {
+        config.insert("maxOutputTokens".to_string(), value.clone());
+    }
+    for (source, target) in [("temperature", "temperature"), ("top_p", "topP")] {
+        if let Some(value) = body.get(source) {
+            config.insert(target.to_string(), value.clone());
         }
+    }
+    if include_text_format {
+        if let Some(format) = responses_text_format(body)? {
+            match format.get("type").and_then(Value::as_str) {
+                Some("json_schema") => {
+                    let schema = format
+                        .get("schema")
+                        .filter(|schema| schema.is_object())
+                        .ok_or_else(|| {
+                            ProxyError::InvalidRequest(
+                                "Gemini Native structured output requires an object schema"
+                                    .to_string(),
+                            )
+                        })?;
+                    config.insert("responseMimeType".to_string(), json!("application/json"));
+                    config.insert("responseJsonSchema".to_string(), schema.clone());
+                }
+                Some("json_object") => {
+                    return Err(ProxyError::InvalidRequest(
+                        "Gemini Native requires a JSON schema for structured output".to_string(),
+                    ));
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(config)
+}
+
+fn apply_thinking_level(
+    config: &mut Map<String, Value>,
+    model: &str,
+    effort: Option<&str>,
+    thinking: GeminiThinking,
+) -> Result<(), ProxyError> {
+    if thinking != GeminiThinking::Auto || !supports_gemini_thinking_level(model) {
         return Ok(());
     }
-
-    let Some(blocks) = value.as_array() else {
-        return Err(ProxyError::TransformError(
-            "Anthropic system must be a string or an array".to_string(),
-        ));
+    let Some(effort) = effort.map(str::trim).filter(|effort| !effort.is_empty()) else {
+        return Ok(());
     };
-
-    texts.extend(
-        blocks
-            .iter()
-            .filter_map(|block| block.get("text").and_then(|value| value.as_str()))
-            .filter(|text| !text.is_empty())
-            .map(ToString::to_string),
+    let level = match effort.to_ascii_lowercase().as_str() {
+        "minimal" => "MINIMAL",
+        "low" => "LOW",
+        "medium" => "MEDIUM",
+        "high" | "xhigh" | "max" | "ultra" => "HIGH",
+        "none" | "off" | "disabled" => return Ok(()),
+        _ => {
+            return Err(ProxyError::InvalidRequest(format!(
+                "Unsupported reasoning.effort for Gemini: {effort}"
+            )))
+        }
+    };
+    config.insert(
+        "thinkingConfig".to_string(),
+        json!({ "thinkingLevel": level }),
     );
-
     Ok(())
 }
 
-fn build_generation_config(body: &Value) -> Result<Option<Value>, ProxyError> {
-    let mut config = Map::new();
-
-    if let Some(value) = body.get("max_tokens") {
-        config.insert("maxOutputTokens".to_string(), value.clone());
-    }
-    if let Some(value) = body.get("temperature") {
-        config.insert("temperature".to_string(), value.clone());
-    }
-    if let Some(value) = body.get("top_p") {
-        config.insert("topP".to_string(), value.clone());
-    }
-    if let Some(value) = body.get("stop_sequences") {
-        config.insert("stopSequences".to_string(), value.clone());
-    }
-
-    if let Some(format) = body.pointer("/output_config/format") {
-        if format.get("type").and_then(Value::as_str) != Some("json_schema") {
-            return Err(ProxyError::InvalidRequest(
-                "Gemini Native requires a JSON schema for structured output".to_string(),
-            ));
-        }
-        let schema = format
-            .get("schema")
-            .filter(|schema| schema.is_object())
-            .ok_or_else(|| {
-                ProxyError::InvalidRequest(
-                    "Gemini Native structured output requires an object schema".to_string(),
-                )
-            })?;
-        config.insert("responseMimeType".to_string(), json!("application/json"));
-        config.insert("responseJsonSchema".to_string(), schema.clone());
-    }
-
-    if config.is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(Value::Object(config)))
-    }
+#[derive(Debug, Clone, Default)]
+struct GeminiContentMessage {
+    role: String,
+    parts: Vec<Value>,
+    function_calls: Vec<(String, String)>,
+    function_responses: Vec<String>,
 }
 
-fn convert_messages_to_contents(
-    messages: &[Value],
+fn convert_responses_input_to_contents(
+    body: &Value,
     shadow_turns: &[GeminiAssistantTurn],
-    supports_multimodal_function_response: bool,
+    tool_context: &CodexToolContext,
     replay_thought_signatures: bool,
     requires_thought_signatures: bool,
-) -> Result<Vec<Value>, ProxyError> {
-    let mut contents = Vec::new();
-    let mut used_shadow_indices = HashSet::new();
-    let total_assistant_messages = messages
+    supports_multimodal_function_response: bool,
+) -> Result<Vec<GeminiContentMessage>, ProxyError> {
+    let mut messages = Vec::new();
+    let input = match body.get("input") {
+        Some(Value::Array(items)) => items.as_slice(),
+        Some(Value::String(text)) if !text.trim().is_empty() => {
+            let message = GeminiContentMessage {
+                role: "user".to_string(),
+                parts: vec![json!({ "text": text })],
+                ..GeminiContentMessage::default()
+            };
+            messages.push(message);
+            return finish_responses_input_messages(
+                messages,
+                shadow_turns,
+                replay_thought_signatures,
+                requires_thought_signatures,
+            );
+        }
+        _ => &[],
+    };
+
+    let mut tool_name_by_id = build_tool_name_map_from_shadow_turns(shadow_turns);
+    for item in input {
+        let item_type = item.get("type").and_then(Value::as_str).unwrap_or("");
+        let flat_name = match item_type {
+            "function_call" | "custom_tool_call" => tool_context.chat_name_for_response_function(
+                item.get("name").and_then(Value::as_str).unwrap_or(""),
+                item.get("namespace").and_then(Value::as_str),
+            ),
+            "tool_search_call" => "tool_search".to_string(),
+            _ => continue,
+        };
+        let id = response_call_id(item);
+        if !id.is_empty() && !flat_name.is_empty() {
+            tool_name_by_id.entry(id.to_string()).or_insert(flat_name);
+        }
+    }
+
+    for item in input {
+        let item_type = item.get("type").and_then(Value::as_str).unwrap_or("");
+        if item.get("status").and_then(Value::as_str) == Some("incomplete")
+            && matches!(
+                item_type,
+                "function_call" | "custom_tool_call" | "tool_search_call" | "web_search_call"
+            )
+        {
+            continue;
+        }
+        match item_type {
+            "function_call" => {
+                let id = response_call_id(item).to_string();
+                let name = item.get("name").and_then(Value::as_str).unwrap_or("");
+                let flat_name = tool_context.chat_name_for_response_function(
+                    name,
+                    item.get("namespace").and_then(Value::as_str),
+                );
+                let arguments = canonicalize_tool_arguments(item.get("arguments"));
+                let mut args = if arguments.trim().is_empty() {
+                    json!({})
+                } else {
+                    serde_json::from_str::<Value>(&arguments).map_err(|error| {
+                        ProxyError::InvalidRequest(format!(
+                            "Invalid function_call arguments for '{name}': {error}"
+                        ))
+                    })?
+                };
+                if !args.is_object() {
+                    return Err(ProxyError::InvalidRequest(format!(
+                        "Function call arguments for '{name}' must be a JSON object"
+                    )));
+                }
+                args =
+                    crate::proxy::providers::transform_responses::sanitize_anthropic_tool_use_input(
+                        name, args,
+                    );
+                let mut function_call = json!({ "name": flat_name, "args": args });
+                if !id.is_empty() && !is_synthesized_tool_call_id(&id) {
+                    function_call["id"] = json!(id);
+                }
+                append_function_call(&mut messages, &id, &flat_name, function_call);
+            }
+            "custom_tool_call" => {
+                let id = response_call_id(item).to_string();
+                let name = item.get("name").and_then(Value::as_str).unwrap_or("");
+                let name = tool_context.chat_name_for_response_function(
+                    name,
+                    item.get("namespace").and_then(Value::as_str),
+                );
+                let mut call = json!({
+                    "name": name,
+                    "args": { "input": item.get("input").cloned().unwrap_or_else(|| json!("")) }
+                });
+                if !id.is_empty() && !is_synthesized_tool_call_id(&id) {
+                    call["id"] = json!(id);
+                }
+                append_function_call(&mut messages, &id, &name, call);
+            }
+            "tool_search_call" => {
+                let id = response_call_id(item).to_string();
+                let args = item
+                    .get("arguments")
+                    .filter(|value| value.is_object())
+                    .cloned()
+                    .unwrap_or_else(|| json!({}));
+                let mut call = json!({ "name": "tool_search", "args": args });
+                if !id.is_empty() && !is_synthesized_tool_call_id(&id) {
+                    call["id"] = json!(id);
+                }
+                append_function_call(&mut messages, &id, "tool_search", call);
+            }
+            "function_call_output" | "custom_tool_call_output" | "tool_search_output" => {
+                let id = response_call_id(item).to_string();
+                let Some(name) = tool_name_by_id.get(&id).cloned() else {
+                    continue;
+                };
+                let (response, media_parts) = plan_responses_tool_result(item);
+                let gemini_media_parts = media_parts
+                    .iter()
+                    .filter_map(gemini_part_from_chat_image)
+                    .collect::<Vec<_>>();
+                let mut function_response = json!({ "name": name, "response": response });
+                if !id.is_empty() && !is_synthesized_tool_call_id(&id) {
+                    function_response["id"] = json!(id);
+                }
+                if supports_multimodal_function_response && !gemini_media_parts.is_empty() {
+                    function_response["parts"] = json!(gemini_media_parts);
+                }
+                let message = append_gemini_message(&mut messages, "user");
+                message
+                    .parts
+                    .push(json!({ "functionResponse": function_response }));
+                message.function_responses.push(id.clone());
+                if !supports_multimodal_function_response {
+                    for media in &gemini_media_parts {
+                        message.parts.push(json!({ "text": format!("[cc-switch: media output of tool call {id}]") }));
+                        message.parts.push(media.clone());
+                    }
+                }
+            }
+            "web_search_call" => { /* Gemini grounding history cannot be replayed. */ }
+            "input_text" => {
+                if let Some(text) = item
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .filter(|text| !text.trim().is_empty())
+                {
+                    append_gemini_message(&mut messages, "user")
+                        .parts
+                        .push(json!({ "text": text }));
+                }
+            }
+            "input_image" => {
+                if let Some(part) = responses_image_part(item)? {
+                    append_gemini_message(&mut messages, "user")
+                        .parts
+                        .push(part);
+                }
+            }
+            "input_file" => {
+                if let Some(part) = responses_file_part(item)? {
+                    append_gemini_message(&mut messages, "user")
+                        .parts
+                        .push(part);
+                }
+            }
+            "compaction_trigger" => append_gemini_message(&mut messages, "user")
+                .parts
+                .push(json!({ "text": codex_compaction::COMPACT_PROMPT })),
+            "compaction" | "compaction_summary" | "context_compaction" => {
+                if let Some(text) = codex_compaction::compaction_item_replay_text(item) {
+                    append_gemini_message(&mut messages, "user")
+                        .parts
+                        .push(json!({ "text": text }));
+                }
+            }
+            _ => {
+                let role = item.get("role").and_then(Value::as_str).unwrap_or("user");
+                if matches!(role, "system" | "developer") {
+                    continue;
+                }
+                let role = if role == "assistant" { "model" } else { "user" };
+                match item.get("content") {
+                    Some(Value::String(text)) if !text.trim().is_empty() => {
+                        append_gemini_message(&mut messages, role)
+                            .parts
+                            .push(json!({ "text": text }))
+                    }
+                    Some(Value::Array(parts)) => {
+                        for part in parts {
+                            if let Some(converted) = responses_content_part(part)? {
+                                append_gemini_message(&mut messages, role)
+                                    .parts
+                                    .push(converted);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    finish_responses_input_messages(
+        messages,
+        shadow_turns,
+        replay_thought_signatures,
+        requires_thought_signatures,
+    )
+}
+
+fn finish_responses_input_messages(
+    mut messages: Vec<GeminiContentMessage>,
+    shadow_turns: &[GeminiAssistantTurn],
+    replay_thought_signatures: bool,
+    requires_thought_signatures: bool,
+) -> Result<Vec<GeminiContentMessage>, ProxyError> {
+    drop_incomplete_tool_turns(&mut messages);
+    drop_empty_gemini_messages(&mut messages);
+    if !messages.is_empty() && messages[0].role != "user" {
+        messages.insert(
+            0,
+            GeminiContentMessage {
+                role: "user".to_string(),
+                parts: vec![json!({ "text": "(continuing the conversation)" })],
+                ..GeminiContentMessage::default()
+            },
+        );
+    }
+    drop_empty_gemini_messages(&mut messages);
+    trim_trailing_assistant_text(&mut messages);
+    drop_empty_gemini_messages(&mut messages);
+    if messages.is_empty() {
+        return Err(ProxyError::InvalidRequest(
+            "cannot convert Codex request: empty messages".to_string(),
+        ));
+    }
+
+    let total_assistant = messages
         .iter()
-        .filter(|message| message.get("role").and_then(|value| value.as_str()) == Some("assistant"))
+        .filter(|message| message.role == "model")
         .count();
-    let effective_shadow_turns = if shadow_turns.len() > total_assistant_messages {
-        &shadow_turns[shadow_turns.len() - total_assistant_messages..]
+    let effective = if shadow_turns.len() > total_assistant {
+        &shadow_turns[shadow_turns.len() - total_assistant..]
     } else {
         shadow_turns
     };
-
-    // Build tool name and thought_signature maps from shadow store.
-    // These are used to resolve tool_result→functionResponse names and to
-    // attach thought signatures when replaying tool_use→functionCall.
-    let mut tool_name_by_id = build_tool_name_map_from_shadow_turns(shadow_turns);
-    let mut thought_signature_by_id = if replay_thought_signatures {
+    let start = total_assistant.saturating_sub(effective.len());
+    let mut assistant_seen = 0usize;
+    let mut used = HashSet::new();
+    let mut names = build_tool_name_map_from_shadow_turns(shadow_turns);
+    let mut signatures = if replay_thought_signatures {
         build_thought_signature_map_from_shadow_turns(shadow_turns)
     } else {
         HashMap::new()
     };
-
-    // Pre-scan all assistant messages in the request body to seed
-    // tool_name_by_id with every tool_use id mentioned in the conversation
-    // history.  This ensures tool_result blocks can always resolve their
-    // function name even when the shadow store has aged out the relevant
-    // turn (e.g. long conversations, session restarts, or concurrent
-    // session churn).
-    for message in messages {
-        if message.get("role").and_then(|v| v.as_str()) != Some("assistant") {
+    for message in &mut messages {
+        if message.role != "model" {
             continue;
         }
-        if let Some(blocks) = message.get("content").and_then(|c| c.as_array()) {
-            for block in blocks {
-                if block.get("type").and_then(|v| v.as_str()) != Some("tool_use") {
-                    continue;
-                }
-                let id = block.get("id").and_then(|v| v.as_str()).unwrap_or("");
-                let name = block.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                if !id.is_empty() && !name.is_empty() {
-                    tool_name_by_id
-                        .entry(id.to_string())
-                        .or_insert_with(|| name.to_string());
-                }
+        let positional = assistant_seen
+            .checked_sub(start)
+            .filter(|index| *index < effective.len())
+            .filter(|index| !used.contains(index));
+        let matching =
+            find_matching_shadow_turn(message, effective).filter(|index| !used.contains(index));
+        assistant_seen += 1;
+        if let Some(index) = matching.or(positional) {
+            used.insert(index);
+            let turn = &effective[index];
+            merge_tool_names_from_shadow(turn, &mut names);
+            if replay_thought_signatures {
+                merge_thought_signatures_from_shadow(turn, &mut signatures);
             }
-        }
-    }
-
-    let shadow_start_index = total_assistant_messages.saturating_sub(effective_shadow_turns.len());
-    let mut assistant_seen_index = 0usize;
-
-    for message in messages {
-        let role = message
-            .get("role")
-            .and_then(|value| value.as_str())
-            .unwrap_or("user");
-        if role == "system" {
-            continue;
-        }
-
-        let gemini_role = if role == "assistant" { "model" } else { "user" };
-
-        let mut parts = if role == "assistant" {
-            let positional_shadow_index = assistant_seen_index
-                .checked_sub(shadow_start_index)
-                .filter(|index| *index < effective_shadow_turns.len())
-                .filter(|index| !used_shadow_indices.contains(index));
-            let tool_use_match_index = find_matching_shadow_turn_for_assistant_message(
-                message.get("content"),
-                effective_shadow_turns,
-            )
-            .filter(|index| !used_shadow_indices.contains(index));
-            assistant_seen_index += 1;
-            let shadow_index = tool_use_match_index.or(positional_shadow_index);
-
-            if let Some(index) = shadow_index {
-                used_shadow_indices.insert(index);
-                let shadow_turn = &effective_shadow_turns[index];
-                merge_tool_names_from_shadow(shadow_turn, &mut tool_name_by_id);
-                if replay_thought_signatures {
-                    merge_thought_signatures_from_shadow(shadow_turn, &mut thought_signature_by_id);
-                }
-                if let Some(parts) = shadow_parts(&shadow_turn.assistant_content) {
-                    if replay_thought_signatures {
-                        parts
-                    } else {
-                        strip_thought_signatures(parts)
-                    }
+            if let Some(parts) = shadow_parts(&turn.assistant_content) {
+                message.parts = if replay_thought_signatures {
+                    parts
                 } else {
-                    convert_message_content_to_parts(
-                        message.get("content"),
-                        role,
-                        &mut tool_name_by_id,
-                        &thought_signature_by_id,
-                        supports_multimodal_function_response,
-                    )?
-                }
-            } else {
-                convert_message_content_to_parts(
-                    message.get("content"),
-                    role,
-                    &mut tool_name_by_id,
-                    &thought_signature_by_id,
-                    supports_multimodal_function_response,
-                )?
-            }
-        } else {
-            convert_message_content_to_parts(
-                message.get("content"),
-                role,
-                &mut tool_name_by_id,
-                &thought_signature_by_id,
-                supports_multimodal_function_response,
-            )?
-        };
-
-        if role == "assistant" && requires_thought_signatures {
-            for part in &mut parts {
-                if part.get("functionCall").is_some() && !has_thought_signature(part) {
-                    part["thoughtSignature"] = json!(GEMINI_SKIP_THOUGHT_SIGNATURE);
-                }
+                    strip_thought_signatures(parts)
+                };
             }
         }
-
-        if role == "assistant" {
-            merge_tool_names_from_parts(&parts, &mut tool_name_by_id);
+        for part in &mut message.parts {
+            let Some(call) = part.get("functionCall") else {
+                continue;
+            };
+            let id = call.get("id").and_then(Value::as_str).unwrap_or("");
+            if replay_thought_signatures {
+                if let Some(signature) = signatures.get(id) {
+                    part["thoughtSignature"] = json!(signature);
+                }
+            }
+            if requires_thought_signatures && !has_thought_signature(part) {
+                part["thoughtSignature"] = json!(GEMINI_SKIP_THOUGHT_SIGNATURE);
+            }
         }
-
-        contents.push(json!({
-            "role": gemini_role,
-            "parts": parts
-        }));
     }
-
-    Ok(contents)
+    Ok(messages)
 }
 
-const GEMINI_SKIP_THOUGHT_SIGNATURE: &str = "skip_thought_signature_validator";
+fn append_gemini_message<'a>(
+    messages: &'a mut Vec<GeminiContentMessage>,
+    role: &str,
+) -> &'a mut GeminiContentMessage {
+    if messages.last().is_none_or(|message| message.role != role) {
+        messages.push(GeminiContentMessage {
+            role: role.to_string(),
+            ..GeminiContentMessage::default()
+        });
+    }
+    messages.last_mut().expect("Gemini message appended")
+}
+
+fn append_function_call(
+    messages: &mut Vec<GeminiContentMessage>,
+    id: &str,
+    name: &str,
+    call: Value,
+) {
+    let message = append_gemini_message(messages, "model");
+    message.parts.push(json!({ "functionCall": call }));
+    message
+        .function_calls
+        .push((id.to_string(), name.to_string()));
+}
+
+fn response_call_id(item: &Value) -> &str {
+    item.get("call_id")
+        .or_else(|| item.get("id"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+}
+
+fn responses_content_part(part: &Value) -> Result<Option<Value>, ProxyError> {
+    match part.get("type").and_then(Value::as_str).unwrap_or("") {
+        "input_text" | "output_text" | "text" => Ok(part
+            .get("text")
+            .and_then(Value::as_str)
+            .filter(|text| !text.trim().is_empty())
+            .map(|text| json!({ "text": text }))),
+        "refusal" => Ok(part
+            .get("refusal")
+            .and_then(Value::as_str)
+            .filter(|text| !text.trim().is_empty())
+            .map(|text| json!({ "text": text }))),
+        "input_image" => responses_image_part(part),
+        "input_file" => responses_file_part(part),
+        _ => Ok(None),
+    }
+}
+
+fn responses_image_part(part: &Value) -> Result<Option<Value>, ProxyError> {
+    let url = part
+        .get("image_url")
+        .and_then(|value| {
+            value
+                .as_str()
+                .or_else(|| value.get("url").and_then(Value::as_str))
+        })
+        .unwrap_or("");
+    if url
+        .get(..7)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("http://"))
+        || url
+            .get(..8)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("https://"))
+    {
+        return Err(ProxyError::TransformError(
+            "Gemini Native only supports base64 image sources, got `url`".to_string(),
+        ));
+    }
+    let Some(rest) = url.strip_prefix("data:") else {
+        return Ok(None);
+    };
+    let Some((metadata, data)) = rest.split_once(',') else {
+        return Ok(None);
+    };
+    let mime_type = metadata
+        .split(';')
+        .next()
+        .filter(|value| !value.is_empty())
+        .unwrap_or("image/png");
+    Ok(Some(
+        json!({ "inlineData": { "mimeType": mime_type, "data": data } }),
+    ))
+}
+
+fn responses_file_part(part: &Value) -> Result<Option<Value>, ProxyError> {
+    if part
+        .get("file_url")
+        .and_then(Value::as_str)
+        .is_some_and(|url| {
+            url.get(..7)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("http://"))
+                || url
+                    .get(..8)
+                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case("https://"))
+        })
+    {
+        return Err(ProxyError::TransformError(
+            "Gemini Native only supports base64 document sources, got `url`".to_string(),
+        ));
+    }
+    let Some(rest) = part
+        .get("file_data")
+        .and_then(Value::as_str)
+        .and_then(|data| data.strip_prefix("data:"))
+    else {
+        return Ok(None);
+    };
+    let Some((metadata, data)) = rest.split_once(',') else {
+        return Ok(None);
+    };
+    if data.is_empty() {
+        return Ok(None);
+    }
+    let mime_type = metadata
+        .split(';')
+        .next()
+        .filter(|value| !value.is_empty())
+        .unwrap_or("application/pdf");
+    Ok(Some(
+        json!({ "inlineData": { "mimeType": mime_type, "data": data } }),
+    ))
+}
+
+fn plan_responses_tool_result(item: &Value) -> (Value, Vec<Value>) {
+    let mut cleaned = match item.get("output") {
+        Some(Value::Array(parts)) => Value::Array(
+            parts
+                .iter()
+                .filter_map(responses_tool_result_part)
+                .collect(),
+        ),
+        Some(output) => output.clone(),
+        None => json!(canonical_json_string(item)),
+    };
+    let replacement = json!({ "type": "text", "text": TOOL_RESULT_MEDIA_ATTACHED_MARKER });
+    let mut media = Vec::new();
+    let replaced = strip_and_clamp_media_from_tool_value(
+        &mut cleaned,
+        &mut media,
+        ToolMediaScope::InlineImagesOnly,
+        &replacement,
+        TOOL_RESULT_MEDIA_ATTACHED_MARKER,
+    );
+    if replaced > 0 { /* extracted inline media is reattached in the native request */ }
+    let content = match &cleaned {
+        Value::String(text) => json!(text),
+        Value::Array(parts) => {
+            let texts = parts
+                .iter()
+                .filter(|part| part.get("type").and_then(Value::as_str) == Some("text"))
+                .filter_map(|part| part.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>();
+            if texts.is_empty() {
+                Value::Array(parts.clone())
+            } else {
+                json!(texts.join("\n"))
+            }
+        }
+        value => json!(canonical_json_string(value)),
+    };
+    (json!({ "content": content }), media)
+}
+
+fn responses_tool_result_part(part: &Value) -> Option<Value> {
+    let item_type = part.get("type").and_then(Value::as_str).unwrap_or("");
+    match item_type {
+        "input_text" | "output_text" => {
+            let text = part.get("text").and_then(Value::as_str)?;
+            (text != TOOL_RESULT_ERROR_MARKER).then(|| json!({ "type": "text", "text": text }))
+        }
+        "input_image" => Some(
+            responses_tool_result_image(part)
+                .unwrap_or_else(|| json!({ "type": "text", "text": canonical_json_string(part) })),
+        ),
+        "input_file" => Some(
+            responses_tool_result_file(part)
+                .unwrap_or_else(|| json!({ "type": "text", "text": canonical_json_string(part) })),
+        ),
+        _ => Some(json!({
+            "type": "text",
+            "text": canonical_json_string(part)
+        })),
+    }
+}
+
+fn responses_tool_result_image(part: &Value) -> Option<Value> {
+    let url = part.get("image_url").and_then(|value| {
+        value
+            .as_str()
+            .or_else(|| value.get("url").and_then(Value::as_str))
+    })?;
+    if url
+        .get(..5)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("data:"))
+    {
+        let rest = &url[5..];
+        let (metadata, data) = rest.split_once(',')?;
+        return Some(json!({
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": metadata.split(';').next().unwrap_or("image/png"),
+                "data": data
+            }
+        }));
+    }
+    if url
+        .get(..7)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("http://"))
+        || url
+            .get(..8)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("https://"))
+    {
+        return Some(json!({
+            "type": "image",
+            "source": { "type": "url", "url": url }
+        }));
+    }
+    None
+}
+
+fn responses_tool_result_file(part: &Value) -> Option<Value> {
+    let filename = part
+        .get("filename")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty());
+    let mut document = if let Some(url) = part
+        .get("file_url")
+        .and_then(Value::as_str)
+        .filter(|url| url.starts_with("http://") || url.starts_with("https://"))
+    {
+        json!({ "type": "document", "source": { "type": "url", "url": url } })
+    } else {
+        let rest = part
+            .get("file_data")
+            .and_then(Value::as_str)?
+            .strip_prefix("data:")?;
+        let (metadata, data) = rest.split_once(',')?;
+        if data.is_empty() {
+            return None;
+        }
+        json!({
+            "type": "document",
+            "source": {
+                "type": "base64",
+                "media_type": metadata.split(';').next().unwrap_or("application/pdf"),
+                "data": data
+            }
+        })
+    };
+    if let Some(filename) = filename {
+        document["title"] = json!(filename);
+    }
+    Some(document)
+}
+
+fn gemini_part_from_chat_image(part: &Value) -> Option<Value> {
+    let url = part.pointer("/image_url/url").and_then(Value::as_str)?;
+    let (metadata, data) = url.strip_prefix("data:")?.split_once(',')?;
+    if data.is_empty() || !metadata.to_ascii_lowercase().contains(";base64") {
+        return None;
+    }
+    Some(
+        json!({ "inlineData": { "mimeType": metadata.split(';').next().unwrap_or("image/png"), "data": data } }),
+    )
+}
+
+fn drop_incomplete_tool_turns(messages: &mut Vec<GeminiContentMessage>) {
+    let original = std::mem::take(messages);
+    let mut output = Vec::new();
+    let mut index = 0;
+    while index < original.len() {
+        let message = &original[index];
+        if message.role == "model" && !message.function_calls.is_empty() {
+            let paired = original.get(index + 1).filter(|next| next.role == "user");
+            let ids = message
+                .function_calls
+                .iter()
+                .map(|(id, _)| id.as_str())
+                .collect::<HashSet<_>>();
+            let result_ids = paired
+                .map(|next| {
+                    next.function_responses
+                        .iter()
+                        .map(String::as_str)
+                        .collect::<HashSet<_>>()
+                })
+                .unwrap_or_default();
+            let count_ids = message
+                .function_calls
+                .iter()
+                .map(|(id, _)| id.as_str())
+                .collect::<Vec<_>>();
+            let result_values = paired
+                .map(|next| {
+                    next.function_responses
+                        .iter()
+                        .map(String::as_str)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let complete = count_ids.iter().all(|id| !id.is_empty())
+                && result_values.iter().all(|id| !id.is_empty())
+                && ids.len() == count_ids.len()
+                && result_ids.len() == result_values.len()
+                && ids == result_ids;
+            if complete {
+                output.push(message.clone());
+                output.push(paired.expect("complete pair has a user message").clone());
+            } else if let Some(user) = paired {
+                let mut user = user.clone();
+                user.parts
+                    .retain(|part| part.get("functionResponse").is_none());
+                user.function_responses.clear();
+                if !user.parts.is_empty() {
+                    output.push(user);
+                }
+            }
+            index += if paired.is_some() { 2 } else { 1 };
+            continue;
+        }
+        let mut message = message.clone();
+        if message.role == "user" {
+            message
+                .parts
+                .retain(|part| part.get("functionResponse").is_none());
+            message.function_responses.clear();
+        }
+        if !message.parts.is_empty() {
+            output.push(message);
+        }
+        index += 1;
+    }
+    *messages = output;
+}
+
+fn trim_trailing_assistant_text(messages: &mut [GeminiContentMessage]) {
+    let Some(last) = messages
+        .last_mut()
+        .filter(|message| message.role == "model")
+    else {
+        return;
+    };
+    let Some(part) = last.parts.last_mut() else {
+        return;
+    };
+    let Some(text) = part.get("text").and_then(Value::as_str) else {
+        return;
+    };
+    let trimmed = text.trim_end();
+    if trimmed.is_empty() {
+        last.parts.pop();
+    } else if trimmed.len() != text.len() {
+        part["text"] = json!(trimmed);
+    }
+}
+
+fn map_responses_tool_choice(
+    choice: Option<&Value>,
+    tool_context: &CodexToolContext,
+) -> Result<Option<Value>, ProxyError> {
+    let Some(choice) = choice else {
+        return Ok(None);
+    };
+    let config = match choice {
+        Value::String(choice) => match choice.as_str() {
+            "auto" => json!({ "mode": "AUTO" }),
+            "none" => json!({ "mode": "NONE" }),
+            "required" => json!({ "mode": "ANY" }),
+            _ => json!({ "mode": "AUTO" }),
+        },
+        Value::Object(choice) => match choice.get("type").and_then(Value::as_str) {
+            Some("auto") => json!({ "mode": "AUTO" }),
+            Some("none") => json!({ "mode": "NONE" }),
+            Some("function" | "custom" | "tool_search") => {
+                let name = if choice.get("type").and_then(Value::as_str) == Some("tool_search") {
+                    "tool_search".to_string()
+                } else {
+                    tool_context.chat_name_for_response_function(
+                        choice.get("name").and_then(Value::as_str).unwrap_or(""),
+                        choice.get("namespace").and_then(Value::as_str),
+                    )
+                };
+                json!({ "mode": "ANY", "allowedFunctionNames": [name] })
+            }
+            _ => json!({ "mode": "AUTO" }),
+        },
+        _ => return Ok(None),
+    };
+    Ok(Some(json!({ "functionCallingConfig": config })))
+}
+
+pub(crate) fn extract_gemini_tool_schema_hints(
+    tool_context: &CodexToolContext,
+) -> GeminiToolSchemaHints {
+    if tool_context.is_compaction_request() {
+        return GeminiToolSchemaHints::default();
+    }
+    tool_context
+        .chat_tools()
+        .iter()
+        .filter_map(|tool| {
+            let function = tool.get("function")?;
+            let name = function.get("name").and_then(Value::as_str)?;
+            let schema = normalize_gemini_function_schema(
+                function
+                    .get("parameters")
+                    .cloned()
+                    .unwrap_or_else(|| json!({})),
+            );
+            let properties = schema.get("properties").and_then(Value::as_object)?;
+            if properties.is_empty() {
+                return None;
+            }
+            let expected_keys = properties.keys().cloned().collect();
+            let required_keys = schema
+                .get("required")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(ToString::to_string)
+                .collect();
+            Some((
+                name.to_string(),
+                GeminiToolSchemaHint {
+                    expected_keys,
+                    required_keys,
+                },
+            ))
+        })
+        .collect()
+}
+
+pub(crate) fn rectify_tool_call_parts(parts: &mut [Value], hints: Option<&GeminiToolSchemaHints>) {
+    for part in parts {
+        let Some(call) = part.get_mut("functionCall").and_then(Value::as_object_mut) else {
+            continue;
+        };
+        let Some(name) = call
+            .get("name")
+            .and_then(Value::as_str)
+            .map(ToString::to_string)
+        else {
+            continue;
+        };
+        let Some(args) = call.get_mut("args") else {
+            continue;
+        };
+        if rectify_tool_call_args(&name, args, hints) {
+            log::info!("[Codex/Gemini] Rectified tool args for {name}");
+        }
+    }
+}
+
+pub(crate) fn rectify_tool_call_args(
+    name: &str,
+    args: &mut Value,
+    hints: Option<&GeminiToolSchemaHints>,
+) -> bool {
+    let Some(hint) = hints.and_then(|hints| hints.get(name)) else {
+        return false;
+    };
+    let Some(args) = args.as_object_mut() else {
+        return false;
+    };
+    if args.is_empty() || hint.expected_keys.is_empty() {
+        return false;
+    }
+    let mut changed = false;
+    if hint.expected_keys.iter().any(|key| key == "skill") && !args.contains_key("skill") {
+        if let Some(value) = args.remove("name") {
+            args.insert("skill".into(), value);
+            changed = true;
+        }
+    }
+    if !hint.expected_keys.iter().any(|key| key == "parameters") {
+        let lifted = args
+            .get("parameters")
+            .and_then(Value::as_object)
+            .map(|parameters| {
+                hint.expected_keys
+                    .iter()
+                    .filter(|key| !args.contains_key(key.as_str()))
+                    .filter_map(|key| {
+                        parameters.get(key).map(|value| {
+                            (
+                                key.clone(),
+                                if let Value::Array(values) = value {
+                                    if values.len() == 1 {
+                                        values[0].clone()
+                                    } else {
+                                        value.clone()
+                                    }
+                                } else {
+                                    value.clone()
+                                },
+                            )
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if !lifted.is_empty() {
+            for (key, value) in lifted {
+                args.insert(key, value);
+            }
+            args.remove("parameters");
+            changed = true;
+        }
+    }
+    if hint
+        .required_keys
+        .iter()
+        .all(|key| args.contains_key(key.as_str()))
+    {
+        return changed;
+    }
+    let expected = hint
+        .expected_keys
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    let unexpected = args
+        .keys()
+        .filter(|key| !expected.contains(key.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    if unexpected.len() != 1 {
+        return changed;
+    }
+    let target = hint
+        .required_keys
+        .iter()
+        .find(|key| !args.contains_key(key.as_str()))
+        .cloned()
+        .or_else(|| {
+            (hint.expected_keys.len() == 1 && args.len() == 1)
+                .then(|| hint.expected_keys[0].clone())
+        });
+    let Some(target) = target.filter(|target| !args.contains_key(target)) else {
+        return changed;
+    };
+    if let Some(value) = args.remove(&unexpected[0]) {
+        args.insert(target, value);
+        true
+    } else {
+        changed
+    }
+}
 
 fn has_thought_signature(part: &Value) -> bool {
     [
@@ -603,339 +1165,182 @@ fn strip_thought_signatures(mut parts: Vec<Value>) -> Vec<Value> {
             object.remove("thoughtSignature");
             object.remove("thought_signature");
         }
-        if let Some(function_call) = part.get_mut("functionCall").and_then(Value::as_object_mut) {
-            function_call.remove("thoughtSignature");
-            function_call.remove("thought_signature");
+        if let Some(call) = part.get_mut("functionCall").and_then(Value::as_object_mut) {
+            call.remove("thoughtSignature");
+            call.remove("thought_signature");
         }
     }
     parts
 }
 
-fn find_matching_shadow_turn_for_assistant_message(
-    content: Option<&Value>,
-    shadow_turns: &[GeminiAssistantTurn],
-) -> Option<usize> {
-    let (tool_use_ids, tool_use_names) = extract_assistant_tool_use_keys(content);
-    if tool_use_ids.is_empty() && tool_use_names.is_empty() {
-        return None;
+fn shadow_parts(content: &Value) -> Option<Vec<Value>> {
+    let mut parts = content
+        .get("parts")
+        .and_then(Value::as_array)
+        .cloned()
+        .or_else(|| content.as_array().cloned())?;
+    for part in &mut parts {
+        let Some(call) = part.get_mut("functionCall").and_then(Value::as_object_mut) else {
+            continue;
+        };
+        if call
+            .get("id")
+            .and_then(Value::as_str)
+            .is_none_or(|id| id.is_empty() || is_synthesized_tool_call_id(id))
+        {
+            call.remove("id");
+        }
     }
+    Some(parts)
+}
 
-    // Prefer exact tool-call id match. With identical tool suffixes across
-    // servers (e.g. `server_a:search` and `server_b:search`) the
-    // normalized-name clause below would otherwise match an earlier shadow
-    // turn whose id is actually wrong for this message, mis-routing replay
-    // state (functionCall id / thoughtSignature) for later tool_result
-    // resolution. Only fall back to name matching when id-based lookup fails
-    // or when the incoming message carries no ids at all.
-    if !tool_use_ids.is_empty() {
-        if let Some(index) = shadow_turns.iter().position(|turn| {
-            turn.tool_calls.iter().any(|tool_call| {
-                tool_call
-                    .id
-                    .as_deref()
-                    .is_some_and(|id| tool_use_ids.contains(id))
-            })
+fn find_matching_shadow_turn(
+    message: &GeminiContentMessage,
+    turns: &[GeminiAssistantTurn],
+) -> Option<usize> {
+    let ids = message
+        .function_calls
+        .iter()
+        .filter(|(id, _)| !id.is_empty())
+        .map(|(id, _)| id.as_str())
+        .collect::<HashSet<_>>();
+    let names = message
+        .function_calls
+        .iter()
+        .filter(|(_, name)| !name.is_empty())
+        .map(|(_, name)| name.as_str())
+        .collect::<HashSet<_>>();
+    if !ids.is_empty() {
+        if let Some(index) = turns.iter().position(|turn| {
+            turn.tool_calls
+                .iter()
+                .any(|call| call.id.as_deref().is_some_and(|id| ids.contains(id)))
         }) {
             return Some(index);
         }
     }
-
-    shadow_turns.iter().enumerate().find_map(|(index, turn)| {
+    turns.iter().enumerate().find_map(|(index, turn)| {
         turn.tool_calls
             .iter()
-            .any(|tool_call| {
-                tool_use_names.contains(tool_call.name.as_str())
-                    || tool_use_names.contains(normalize_tool_name(&tool_call.name))
-            })
+            .any(|call| names.contains(call.name.as_str()))
             .then_some(index)
     })
 }
 
-fn extract_assistant_tool_use_keys(content: Option<&Value>) -> (HashSet<String>, HashSet<String>) {
-    let mut tool_use_ids = HashSet::new();
-    let mut tool_use_names = HashSet::new();
-    let Some(blocks) = content.and_then(|value| value.as_array()) else {
-        return (tool_use_ids, tool_use_names);
-    };
-
-    for block in blocks {
-        if block.get("type").and_then(|value| value.as_str()) != Some("tool_use") {
-            continue;
-        }
-
-        if let Some(id) = block
-            .get("id")
-            .and_then(|value| value.as_str())
-            .filter(|id| !id.is_empty())
-        {
-            tool_use_ids.insert(id.to_string());
-        }
-
-        if let Some(name) = block
-            .get("name")
-            .and_then(|value| value.as_str())
-            .filter(|name| !name.is_empty())
-        {
-            tool_use_names.insert(name.to_string());
-            tool_use_names.insert(normalize_tool_name(name).to_string());
-        }
+fn build_tool_name_map_from_shadow_turns(turns: &[GeminiAssistantTurn]) -> HashMap<String, String> {
+    let mut names = HashMap::new();
+    for turn in turns {
+        merge_tool_names_from_shadow(turn, &mut names);
     }
-
-    (tool_use_ids, tool_use_names)
+    names
 }
 
-fn normalize_tool_name(name: &str) -> &str {
-    name.rsplit(':').next().unwrap_or(name)
+fn drop_empty_gemini_messages(messages: &mut Vec<GeminiContentMessage>) {
+    messages.retain(|message| !message.parts.is_empty());
 }
 
-fn convert_message_content_to_parts(
-    content: Option<&Value>,
-    role: &str,
-    tool_name_by_id: &mut std::collections::HashMap<String, String>,
-    thought_signature_by_id: &std::collections::HashMap<String, String>,
-    supports_multimodal_function_response: bool,
-) -> Result<Vec<Value>, ProxyError> {
-    let Some(content) = content else {
-        return Ok(Vec::new());
-    };
-
-    if let Some(text) = content.as_str() {
-        return Ok(vec![json!({ "text": text })]);
+fn merge_tool_names_from_shadow(turn: &GeminiAssistantTurn, names: &mut HashMap<String, String>) {
+    for call in &turn.tool_calls {
+        if let Some(id) = &call.id {
+            names.insert(id.clone(), call.name.clone());
+        }
     }
-
-    let Some(blocks) = content.as_array() else {
-        return Err(ProxyError::TransformError(
-            "Anthropic message content must be a string or array".to_string(),
-        ));
-    };
-
-    let mut parts = Vec::new();
-
-    for block in blocks {
-        let block_type = block
-            .get("type")
-            .and_then(|value| value.as_str())
-            .unwrap_or("");
-
-        match block_type {
-            "text" => {
-                if let Some(text) = block.get("text").and_then(|value| value.as_str()) {
-                    parts.push(json!({ "text": text }));
-                }
-            }
-            "image" => {
-                let source = block.get("source").ok_or_else(|| {
-                    ProxyError::TransformError("Gemini image block missing source".to_string())
-                })?;
-
-                let source_type = source
-                    .get("type")
-                    .and_then(|value| value.as_str())
-                    .unwrap_or("");
-
-                if source_type != "base64" {
-                    return Err(ProxyError::TransformError(format!(
-                        "Gemini Native only supports base64 image sources, got `{source_type}`"
-                    )));
-                }
-
-                parts.push(json!({
-                    "inlineData": {
-                        "mimeType": source.get("media_type").and_then(|value| value.as_str()).unwrap_or("image/png"),
-                        "data": source.get("data").and_then(|value| value.as_str()).unwrap_or("")
-                    }
-                }));
-            }
-            "document" => {
-                let source = block.get("source").ok_or_else(|| {
-                    ProxyError::TransformError("Gemini document block missing source".to_string())
-                })?;
-
-                let source_type = source
-                    .get("type")
-                    .and_then(|value| value.as_str())
-                    .unwrap_or("");
-
-                if source_type != "base64" {
-                    return Err(ProxyError::TransformError(format!(
-                        "Gemini Native only supports base64 document sources, got `{source_type}`"
-                    )));
-                }
-
-                parts.push(json!({
-                    "inlineData": {
-                        "mimeType": source.get("media_type").and_then(|value| value.as_str()).unwrap_or("application/pdf"),
-                        "data": source.get("data").and_then(|value| value.as_str()).unwrap_or("")
-                    }
-                }));
-            }
-            "tool_use" => {
-                if role != "assistant" {
-                    return Err(ProxyError::TransformError(
-                        "tool_use blocks are only valid in assistant messages".to_string(),
-                    ));
-                }
-
-                let id = block
-                    .get("id")
-                    .and_then(|value| value.as_str())
-                    .unwrap_or("");
-                let name = block
-                    .get("name")
-                    .and_then(|value| value.as_str())
-                    .unwrap_or("");
-                if !id.is_empty() && !name.is_empty() {
-                    tool_name_by_id.insert(id.to_string(), name.to_string());
-                }
-
-                // A synthesized id is an internal proxy identifier — never
-                // forward it to Gemini. Gemini will disambiguate the missing
-                // id by call order, matching its own earlier response shape.
-                let mut function_call = json!({
-                    "name": name,
-                    "args": block.get("input").cloned().unwrap_or_else(|| json!({}))
-                });
-                if !id.is_empty() && !is_synthesized_tool_call_id(id) {
-                    function_call["id"] = json!(id);
-                }
-
-                // Re-attach the thought_signature that Gemini originally
-                // associated with this functionCall.  The Anthropic format
-                // strips it from the tool_use block, but Gemini requires it
-                // on every functionCall in a multi-turn tool-use exchange.
-                // Without replaying the stored signature the upstream may
-                // reject with "missing a `thought_signature`".
-                if let Some(sig) = thought_signature_by_id.get(id) {
-                    function_call["thoughtSignature"] = json!(sig);
-                }
-
-                parts.push(json!({ "functionCall": function_call }));
-            }
-            "tool_result" => {
-                let tool_use_id = block
-                    .get("tool_use_id")
-                    .and_then(|value| value.as_str())
-                    .unwrap_or("");
-                let name = tool_name_by_id
-                    .get(tool_use_id)
-                    .cloned()
-                    .or_else(|| {
-                        // Last-resort fallback: scan every block in this content
-                        // array for a tool_use whose id matches.  This catches
-                        // edge cases where the tool_use lives in a different
-                        // content block of the same message (non-standard client
-                        // behaviour) or in a re-ordered message array.
-                        blocks.iter().find_map(|b| {
-                            let t = b.get("type").and_then(|v| v.as_str())?;
-                            if t != "tool_use" { return None; }
-                            let id = b.get("id").and_then(|v| v.as_str())?;
-                            if id != tool_use_id { return None; }
-                            b.get("name").and_then(|v| v.as_str()).map(|n| n.to_string())
-                        })
-                    })
-                    .ok_or_else(|| {
-                        ProxyError::TransformError(format!(
-                            "Unable to resolve Gemini functionResponse.name for tool_use_id `{tool_use_id}`"
-                        ))
-                    })?;
-
-                let (response, media_parts) = plan_gemini_tool_result(block.get("content"));
-
-                // See `tool_use` above: synthesized ids must not leak upstream.
-                let mut function_response = json!({
-                    "name": name,
-                    "response": response
-                });
-                if !tool_use_id.is_empty() && !is_synthesized_tool_call_id(tool_use_id) {
-                    function_response["id"] = json!(tool_use_id);
-                }
-
-                if supports_multimodal_function_response && !media_parts.is_empty() {
-                    function_response["parts"] = Value::Array(media_parts);
-                    parts.push(json!({ "functionResponse": function_response }));
-                } else {
-                    parts.push(json!({ "functionResponse": function_response }));
-                    if !media_parts.is_empty() {
-                        parts.push(json!({
-                            "text": format!(
-                                "[cc-switch: media output of tool call {tool_use_id}]"
-                            )
-                        }));
-                        parts.extend(media_parts);
+    if let Some(parts) = shadow_parts(&turn.assistant_content) {
+        for part in parts {
+            if let Some(call) = part.get("functionCall") {
+                if let (Some(id), Some(name)) = (
+                    call.get("id").and_then(Value::as_str),
+                    call.get("name").and_then(Value::as_str),
+                ) {
+                    if !id.is_empty() && !name.is_empty() {
+                        names.insert(id.into(), name.into());
                     }
                 }
             }
-            "thinking" | "redacted_thinking" => {}
-            _ => {}
         }
     }
-
-    Ok(parts)
 }
 
-fn normalize_tool_result_response(content: Option<&Value>) -> Value {
-    match content {
-        Some(Value::String(text)) => json!({ "content": text }),
-        Some(Value::Array(blocks)) => {
-            let texts: Vec<&str> = blocks
-                .iter()
-                .filter(|block| block.get("type").and_then(|value| value.as_str()) == Some("text"))
-                .filter_map(|block| block.get("text").and_then(|value| value.as_str()))
-                .collect();
-
-            if texts.is_empty() {
-                json!({ "content": Value::Array(blocks.clone()) })
-            } else {
-                json!({ "content": texts.join("\n") })
+fn build_thought_signature_map_from_shadow_turns(
+    turns: &[GeminiAssistantTurn],
+) -> HashMap<String, String> {
+    let mut signatures = HashMap::new();
+    for turn in turns {
+        for call in &turn.tool_calls {
+            if let (Some(id), Some(sig)) = (&call.id, &call.thought_signature) {
+                signatures.insert(id.clone(), sig.clone());
             }
         }
-        Some(value) => json!({ "content": value.clone() }),
-        None => json!({ "content": "" }),
+    }
+    signatures
+}
+
+fn merge_thought_signatures_from_shadow(
+    turn: &GeminiAssistantTurn,
+    signatures: &mut HashMap<String, String>,
+) {
+    for call in &turn.tool_calls {
+        if let (Some(id), Some(sig)) = (&call.id, &call.thought_signature) {
+            signatures.insert(id.clone(), sig.clone());
+        }
     }
 }
 
-fn plan_gemini_tool_result(content: Option<&Value>) -> (Value, Vec<Value>) {
-    let Some(content) = content else {
-        return (normalize_tool_result_response(None), Vec::new());
+fn extract_tool_call_meta(parts: &[Value]) -> Vec<GeminiToolCallMeta> {
+    parts
+        .iter()
+        .filter_map(|part| {
+            let call = part.get("functionCall")?;
+            Some(GeminiToolCallMeta::new(
+                Some(
+                    call.get("id")
+                        .and_then(Value::as_str)
+                        .filter(|id| !id.is_empty())
+                        .map(ToString::to_string)
+                        .unwrap_or_else(synthesize_tool_call_id),
+                ),
+                call.get("name").and_then(Value::as_str).unwrap_or(""),
+                call.get("args").cloned().unwrap_or_else(|| json!({})),
+                part.get("thoughtSignature")
+                    .or_else(|| part.get("thought_signature"))
+                    .and_then(Value::as_str),
+            ))
+        })
+        .collect()
+}
+
+pub(crate) fn response_id(id: Option<&str>) -> String {
+    match id.filter(|id| !id.is_empty()) {
+        Some(id) if id.starts_with("resp_") => id.to_string(),
+        Some(id) => format!("resp_{id}"),
+        None => "resp_ccswitch".into(),
+    }
+}
+
+pub(crate) fn build_responses_usage(usage: Option<&Value>) -> Value {
+    let Some(usage) = usage else {
+        return json!({ "input_tokens": 0, "output_tokens": 0, "total_tokens": 0, "input_tokens_details": { "cached_tokens": 0 }, "output_tokens_details": { "reasoning_tokens": 0 } });
     };
-
-    let mut cleaned = content.clone();
-    let replacement_block = json!({
-        "type":"text",
-        "text":TOOL_RESULT_MEDIA_ATTACHED_MARKER
-    });
-    let mut chat_media_parts = Vec::new();
-    let replaced = strip_and_clamp_media_from_tool_value(
-        &mut cleaned,
-        &mut chat_media_parts,
-        ToolMediaScope::InlineImagesOnly,
-        &replacement_block,
-        TOOL_RESULT_MEDIA_ATTACHED_MARKER,
-    );
-    if replaced == 0 {
-        return (normalize_tool_result_response(Some(content)), Vec::new());
-    }
-
-    let mut gemini_parts = Vec::new();
-    gemini_parts.extend(
-        chat_media_parts
-            .iter()
-            .filter_map(gemini_part_from_chat_image),
-    );
-
-    (normalize_tool_result_response(Some(&cleaned)), gemini_parts)
-}
-
-fn is_anthropic_web_search_tool(tool: &Value) -> bool {
-    tool.get("type")
-        .and_then(Value::as_str)
-        .is_some_and(|tool_type| tool_type == "web_search" || tool_type.starts_with("web_search_"))
+    let input = usage
+        .get("promptTokenCount")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let total = usage.get("totalTokenCount").and_then(Value::as_u64);
+    let output = usage
+        .get("candidatesTokenCount")
+        .and_then(Value::as_u64)
+        .or_else(|| total.map(|total| total.saturating_sub(input)))
+        .unwrap_or(0);
+    let cached = usage
+        .get("cachedContentTokenCount")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    json!({ "input_tokens": input, "output_tokens": output, "total_tokens": total.unwrap_or_else(|| input.saturating_add(output)), "input_tokens_details": { "cached_tokens": cached }, "output_tokens_details": { "reasoning_tokens": 0 } })
 }
 
 pub(crate) fn extract_gemini_web_search_queries(candidate: &Value) -> Vec<String> {
     candidate
-        .get("groundingMetadata")
-        .and_then(|metadata| metadata.get("webSearchQueries"))
+        .pointer("/groundingMetadata/webSearchQueries")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
@@ -953,2115 +1358,407 @@ pub(crate) fn gemini_web_search_call_id(response_id: Option<&str>, index: usize)
     }
 }
 
-fn is_gemini_3_series(model: &str) -> bool {
-    let normalized = model.trim().to_ascii_lowercase();
-    normalized.starts_with("gemini-3")
-        || normalized
-            .rsplit('/')
-            .next()
-            .is_some_and(|tail| tail.starts_with("gemini-3"))
-}
-
-fn requires_gemini_3_or_later_thought_signatures(model: &str) -> bool {
-    let model = crate::proxy::gemini_url::normalize_gemini_model_id(model);
-    let model = model.rsplit('/').next().unwrap_or(model);
-    let model = model.trim().to_ascii_lowercase();
-    let Some(version) = model.strip_prefix("gemini-") else {
-        return false;
-    };
-    version
-        .split(|character: char| !character.is_ascii_digit())
-        .next()
-        .and_then(|major| major.parse::<u32>().ok())
-        .is_some_and(|major| major >= 3)
-}
-
-pub fn supports_gemini_thinking_level(model: &str) -> bool {
-    requires_gemini_3_or_later_thought_signatures(model)
-}
-
-fn gemini_part_from_chat_image(part: &Value) -> Option<Value> {
-    let image_url = part
-        .pointer("/image_url/url")
-        .and_then(Value::as_str)
-        .filter(|url| !url.trim().is_empty())?;
-
-    if image_url
-        .get(..5)
-        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("data:"))
-    {
-        let rest = &image_url[5..];
-        let (meta, data) = rest.split_once(',')?;
-        if data.is_empty() || !meta.to_ascii_lowercase().contains(";base64") {
-            return None;
+pub(crate) fn map_gemini_finish_reason(
+    reason: Option<&str>,
+) -> (&'static str, Option<&'static str>) {
+    match reason {
+        Some("MAX_TOKENS") => ("incomplete", Some("max_output_tokens")),
+        Some("SAFETY" | "RECITATION" | "SPII" | "BLOCKLIST" | "PROHIBITED_CONTENT") => {
+            ("incomplete", Some("content_filter"))
         }
-        let mime_type = meta.split(';').next().unwrap_or("image/png");
-        return Some(json!({
-            "inlineData": {
-                "mimeType": mime_type,
-                "data": data
-            }
-        }));
+        _ => ("completed", None),
     }
-
-    None
 }
 
-fn shadow_parts(content: &Value) -> Option<Vec<Value>> {
-    let mut parts = content
-        .get("parts")
-        .and_then(|value| value.as_array())
+fn gemini_candidate_parts(
+    candidate: &Value,
+    hints: Option<&GeminiToolSchemaHints>,
+    synthesize_ids: bool,
+) -> Vec<Value> {
+    let mut parts = candidate
+        .pointer("/content/parts")
+        .and_then(Value::as_array)
         .cloned()
-        .or_else(|| content.as_array().cloned())?;
-    // Strip synthesized ids before these parts are replayed into a Gemini
-    // request body. The shadow store records the Anthropic-facing id so that
-    // a tool_result round-trip can find the tool's name, but sending the
-    // synthetic value as `functionCall.id` upstream would leak an internal
-    // identifier.
-    for part in &mut parts {
-        let Some(function_call) = part.get_mut("functionCall").and_then(|v| v.as_object_mut())
-        else {
-            continue;
-        };
-        let drop_id = function_call
-            .get("id")
-            .and_then(|v| v.as_str())
-            .map(|id| id.is_empty() || is_synthesized_tool_call_id(id))
-            .unwrap_or(true);
-        if drop_id {
-            function_call.remove("id");
-        }
-    }
-    Some(parts)
-}
-
-pub fn extract_anthropic_tool_schema_hints(body: &Value) -> AnthropicToolSchemaHints {
-    body.get("tools")
-        .and_then(|value| value.as_array())
-        .into_iter()
-        .flatten()
-        .filter_map(|tool| {
-            let name = tool.get("name").and_then(|value| value.as_str())?;
-            let input_schema = tool
-                .get("input_schema")
-                .and_then(|value| value.as_object())?;
-            let properties = input_schema
-                .get("properties")
-                .and_then(|value| value.as_object())?;
-            if properties.is_empty() {
-                return None;
+        .unwrap_or_default();
+    rectify_tool_call_parts(&mut parts, hints);
+    if synthesize_ids {
+        for part in &mut parts {
+            if let Some(call) = part.get_mut("functionCall").and_then(Value::as_object_mut) {
+                if call
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .is_none_or(str::is_empty)
+                {
+                    call.insert("id".into(), json!(synthesize_tool_call_id()));
+                }
             }
-
-            let expected_keys = properties.keys().cloned().collect::<Vec<_>>();
-            let required_keys = input_schema
-                .get("required")
-                .and_then(|value| value.as_array())
-                .map(|values| {
-                    values
-                        .iter()
-                        .filter_map(|value| value.as_str().map(ToString::to_string))
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
-
-            Some((
-                name.to_string(),
-                AnthropicToolSchemaHint {
-                    expected_keys,
-                    required_keys,
-                },
-            ))
-        })
-        .collect()
-}
-
-pub fn rectify_tool_call_parts(
-    parts: &mut [Value],
-    tool_schema_hints: Option<&AnthropicToolSchemaHints>,
-) {
-    for part in parts {
-        let Some(function_call) = part
-            .get_mut("functionCall")
-            .and_then(|value| value.as_object_mut())
-        else {
-            continue;
-        };
-        let Some(name) = function_call
-            .get("name")
-            .and_then(|value| value.as_str())
-            .map(ToString::to_string)
-        else {
-            continue;
-        };
-        let Some(args) = function_call.get_mut("args") else {
-            continue;
-        };
-
-        if rectify_tool_call_args(&name, args, tool_schema_hints) {
-            log::info!("[Claude/Gemini] Rectified tool args for `{name}`");
         }
     }
-}
-
-pub fn rectify_tool_call_args(
-    tool_name: &str,
-    args: &mut Value,
-    tool_schema_hints: Option<&AnthropicToolSchemaHints>,
-) -> bool {
-    let Some(tool_schema_hints) = tool_schema_hints else {
-        return false;
-    };
-    let Some(hint) = tool_schema_hints.get(tool_name) else {
-        return false;
-    };
-    let Some(args_object) = args.as_object_mut() else {
-        return false;
-    };
-    if args_object.is_empty() || hint.expected_keys.is_empty() {
-        return false;
-    }
-    let mut changed = false;
-
-    if hint.expected_keys.iter().any(|key| key == "skill") && !args_object.contains_key("skill") {
-        if let Some(value) = args_object.remove("name") {
-            args_object.insert("skill".to_string(), value);
-            changed = true;
-        }
-    }
-
-    let expects_parameters_key = hint.expected_keys.iter().any(|key| key == "parameters");
-    if !expects_parameters_key {
-        let extracted_parameters = args_object
-            .get("parameters")
-            .and_then(|value| value.as_object())
-            .map(|parameters_object| {
-                hint.expected_keys
-                    .iter()
-                    .filter_map(|expected_key| {
-                        if args_object.contains_key(expected_key) {
-                            return None;
-                        }
-                        let value = parameters_object.get(expected_key)?;
-                        let normalized_value = match value {
-                            Value::Array(values) if values.len() == 1 => values[0].clone(),
-                            _ => value.clone(),
-                        };
-                        Some((expected_key.clone(), normalized_value))
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-
-        if !extracted_parameters.is_empty() {
-            for (expected_key, normalized_value) in extracted_parameters {
-                args_object.insert(expected_key, normalized_value);
-            }
-            args_object.remove("parameters");
-            changed = true;
-        }
-    }
-
-    if hint
-        .required_keys
-        .iter()
-        .all(|key| args_object.contains_key(key.as_str()))
-    {
-        return changed;
-    }
-
-    let expected_key_set = hint
-        .expected_keys
-        .iter()
-        .map(String::as_str)
-        .collect::<HashSet<_>>();
-    let unexpected_keys = args_object
-        .keys()
-        .filter(|key| !expected_key_set.contains(key.as_str()))
-        .cloned()
-        .collect::<Vec<_>>();
-    if unexpected_keys.len() != 1 {
-        return false;
-    }
-
-    let target_key = hint
-        .required_keys
-        .iter()
-        .find(|key| !args_object.contains_key(key.as_str()))
-        .cloned()
-        .or_else(|| {
-            if hint.expected_keys.len() == 1 && args_object.len() == 1 {
-                hint.expected_keys.first().cloned()
-            } else {
-                None
-            }
-        });
-    let Some(target_key) = target_key else {
-        return false;
-    };
-    if args_object.contains_key(&target_key) {
-        return false;
-    }
-
-    let source_key = &unexpected_keys[0];
-    let Some(value) = args_object.remove(source_key) else {
-        return false;
-    };
-    args_object.insert(target_key, value);
-    true
-}
-
-fn merge_tool_names_from_shadow(
-    turn: &GeminiAssistantTurn,
-    tool_name_by_id: &mut HashMap<String, String>,
-) {
-    for tool_call in &turn.tool_calls {
-        if let Some(id) = &tool_call.id {
-            tool_name_by_id.insert(id.clone(), tool_call.name.clone());
-        }
-    }
-
-    if let Some(parts) = shadow_parts(&turn.assistant_content) {
-        merge_tool_names_from_parts(&parts, tool_name_by_id);
-    }
-}
-
-fn build_tool_name_map_from_shadow_turns(
-    shadow_turns: &[GeminiAssistantTurn],
-) -> HashMap<String, String> {
-    let mut tool_name_by_id = HashMap::new();
-    for turn in shadow_turns {
-        merge_tool_names_from_shadow(turn, &mut tool_name_by_id);
-    }
-    tool_name_by_id
-}
-
-fn build_thought_signature_map_from_shadow_turns(
-    shadow_turns: &[GeminiAssistantTurn],
-) -> HashMap<String, String> {
-    let mut thought_signature_by_id = HashMap::new();
-    for turn in shadow_turns {
-        merge_thought_signatures_from_shadow(turn, &mut thought_signature_by_id);
-    }
-    thought_signature_by_id
-}
-
-fn merge_thought_signatures_from_shadow(
-    turn: &GeminiAssistantTurn,
-    thought_signature_by_id: &mut HashMap<String, String>,
-) {
-    for tool_call in &turn.tool_calls {
-        if let (Some(id), Some(sig)) = (&tool_call.id, &tool_call.thought_signature) {
-            thought_signature_by_id.insert(id.clone(), sig.clone());
-        }
-    }
-}
-
-fn merge_tool_names_from_parts(parts: &[Value], tool_name_by_id: &mut HashMap<String, String>) {
-    for part in parts {
-        let Some(function_call) = part.get("functionCall") else {
-            continue;
-        };
-        let Some(id) = function_call.get("id").and_then(|value| value.as_str()) else {
-            continue;
-        };
-        let Some(name) = function_call.get("name").and_then(|value| value.as_str()) else {
-            continue;
-        };
-        if !id.is_empty() && !name.is_empty() {
-            tool_name_by_id.insert(id.to_string(), name.to_string());
-        }
-    }
-}
-
-fn extract_tool_call_meta(parts: &[Value]) -> Vec<GeminiToolCallMeta> {
     parts
-        .iter()
-        .filter_map(|part| {
-            let function_call = part.get("functionCall")?;
-            // Ensure every surfaced tool call carries a distinguishing id.
-            // Gemini 2.x may omit `id` on parallel calls; synthesizing a
-            // unique replacement prevents downstream merge/replay logic from
-            // collapsing distinct calls onto a single empty-string key.
-            let id = function_call
-                .get("id")
-                .and_then(|value| value.as_str())
-                .filter(|s| !s.is_empty())
-                .map(ToString::to_string)
-                .unwrap_or_else(synthesize_tool_call_id);
-            Some(GeminiToolCallMeta::new(
-                Some(id),
-                function_call
-                    .get("name")
-                    .and_then(|value| value.as_str())
-                    .unwrap_or(""),
-                function_call
-                    .get("args")
-                    .cloned()
-                    .unwrap_or_else(|| json!({})),
-                part.get("thoughtSignature")
-                    .or_else(|| part.get("thought_signature"))
-                    .and_then(|value| value.as_str()),
-            ))
-        })
-        .collect()
 }
 
-fn map_tool_choice(tool_choice: Option<&Value>) -> Result<Option<Value>, ProxyError> {
-    let Some(tool_choice) = tool_choice else {
-        return Ok(None);
+fn gemini_candidate_to_responses_output(
+    body: &Value,
+    candidate: &Value,
+    parts: &[Value],
+    context: &CodexToolContext,
+    allow_calls: bool,
+) -> Vec<Value> {
+    let id = response_id(body.get("responseId").and_then(Value::as_str));
+    let mut output = Vec::new();
+    if context.hosted_web_search().is_some() {
+        for (index, query) in extract_gemini_web_search_queries(candidate)
+            .into_iter()
+            .enumerate()
+        {
+            let call =
+                gemini_web_search_call_id(body.get("responseId").and_then(Value::as_str), index);
+            output.push(gemini_web_search_call_item(
+                &format!("ws_{call}"),
+                "completed",
+                &query,
+            ));
+        }
+    }
+    let mut text_parts = Vec::new();
+    let flush_text = |output: &mut Vec<Value>, text_parts: &mut Vec<Value>| {
+        if !text_parts.is_empty() {
+            let item_index = output.len();
+            output.push(json!({
+                "id": format!("{id}_msg_{item_index}"),
+                "type": "message",
+                "status": "completed",
+                "role": "assistant",
+                "content": std::mem::take(text_parts)
+            }));
+        }
     };
-
-    match tool_choice {
-        Value::String(choice) => Ok(match choice.as_str() {
-            "auto" => Some(json!({
-                "functionCallingConfig": { "mode": "AUTO" }
-            })),
-            "none" => Some(json!({
-                "functionCallingConfig": { "mode": "NONE" }
-            })),
-            other => {
-                return Err(ProxyError::TransformError(format!(
-                    "Unsupported Gemini tool_choice string: {other}"
-                )));
+    for part in parts {
+        if part.get("thought").and_then(Value::as_bool) == Some(true) {
+            continue;
+        }
+        if let Some(text) = part.get("text").and_then(Value::as_str) {
+            if !text.is_empty() {
+                text_parts.push(json!({ "type": "output_text", "text": text, "annotations": [] }));
             }
-        }),
-        Value::Object(object) => {
-            let Some(choice_type) = object.get("type").and_then(|value| value.as_str()) else {
-                return Ok(None);
-            };
-
-            let config = match choice_type {
-                "auto" => json!({ "mode": "AUTO" }),
-                "none" => json!({ "mode": "NONE" }),
-                "any" => json!({ "mode": "ANY" }),
-                "tool" => {
-                    let name = object
-                        .get("name")
-                        .and_then(|value| value.as_str())
-                        .unwrap_or("");
-                    json!({
-                        "mode": "ANY",
-                        "allowedFunctionNames": [name]
-                    })
-                }
-                other => {
-                    return Err(ProxyError::TransformError(format!(
-                        "Unsupported Gemini tool_choice type: {other}"
-                    )));
-                }
-            };
-
-            Ok(Some(json!({ "functionCallingConfig": config })))
+            continue;
         }
-        _ => Ok(None),
+        if !allow_calls {
+            continue;
+        }
+        let Some(call) = part.get("functionCall") else {
+            continue;
+        };
+        flush_text(&mut output, &mut text_parts);
+        let call_id = call.get("id").and_then(Value::as_str).unwrap_or("");
+        let name = call.get("name").and_then(Value::as_str).unwrap_or("");
+        let args = canonical_json_string(&call.get("args").cloned().unwrap_or_else(|| json!({})));
+        let item_id = response_tool_call_item_id_from_chat_name(call_id, name, context);
+        output.push(response_tool_call_item_from_chat_name(
+            &item_id,
+            "completed",
+            call_id,
+            name,
+            &args,
+            None,
+            context,
+        ));
     }
+    flush_text(&mut output, &mut text_parts);
+    output
 }
 
-/// Convert a Gemini `usageMetadata` object into an Anthropic-style `usage`
-/// object. Used by both the streaming SSE converter and the non-streaming
-/// transform path so the two emit identical shapes.
-pub(crate) fn build_anthropic_usage(usage: Option<&Value>) -> Value {
-    let Some(usage) = usage else {
-        return json!({
-            "input_tokens": 0,
-            "output_tokens": 0
-        });
-    };
-
-    let prompt_tokens = usage
-        .get("promptTokenCount")
-        .and_then(|value| value.as_u64())
-        .unwrap_or(0);
-    let total_tokens = usage
-        .get("totalTokenCount")
-        .and_then(|value| value.as_u64())
-        .unwrap_or(0);
-    let cached_tokens = usage
-        .get("cachedContentTokenCount")
-        .and_then(|value| value.as_u64())
-        .unwrap_or(0);
-    // Gemini 的 promptTokenCount 含缓存命中（cachedContentTokenCount）；而 Anthropic
-    // 语义下 input_tokens 必须是不含 cache 的 fresh input、cache_read 单列。本路径转成
-    // Anthropic 后以 app_type=claude 记账，calculator 对 claude 设 input_includes_cache_read
-    // =false 不再从 input 扣 cache，因此这里必须先扣减，否则缓存 token 会被双重计费
-    // （一次按完整 input 价、一次按 cache_read 价）。output 仍按 total-prompt 计算
-    // （prompt 是总输入，扣减只作用于 input/cache 的拆分，不影响 output）。
-    let input_tokens = prompt_tokens.saturating_sub(cached_tokens);
-    let output_tokens = total_tokens.saturating_sub(prompt_tokens);
-
-    let mut result = json!({
-        "input_tokens": input_tokens,
-        "output_tokens": output_tokens
-    });
-
-    if cached_tokens > 0 {
-        result["cache_read_input_tokens"] = json!(cached_tokens);
-    }
-
-    result
+pub(crate) fn gemini_web_search_call_item(id: &str, status: &str, query: &str) -> Value {
+    json!({
+        "id": id,
+        "type": "web_search_call",
+        "status": status,
+        "action": { "type": "search", "query": query }
+    })
 }
 
-fn map_finish_reason(reason: Option<&str>, has_tool_use: bool) -> Value {
-    let mapped = match reason {
-        Some("MAX_TOKENS") => Some("max_tokens"),
-        Some("STOP") | Some("FINISH_REASON_UNSPECIFIED") | None => {
-            if has_tool_use {
-                Some("tool_use")
-            } else {
-                Some("end_turn")
-            }
-        }
-        Some("SAFETY")
-        | Some("RECITATION")
-        | Some("SPII")
-        | Some("BLOCKLIST")
-        | Some("PROHIBITED_CONTENT") => Some("refusal"),
-        Some(other) => {
-            log::warn!("[Claude/Gemini] Unknown Gemini finishReason `{other}`, using end_turn");
-            Some("end_turn")
-        }
+pub(crate) fn gemini_to_responses(
+    body: Value,
+    shadow_store: Option<&GeminiShadowStore>,
+    provider_id: Option<&str>,
+    session_id: Option<&str>,
+    tool_context: &CodexToolContext,
+    hints: Option<&GeminiToolSchemaHints>,
+) -> Result<Value, ProxyError> {
+    let usage = build_responses_usage(body.get("usageMetadata"));
+    let model = body
+        .get("modelVersion")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let blocked = body
+        .pointer("/promptFeedback/blockReason")
+        .and_then(Value::as_str);
+    let candidate = body
+        .get("candidates")
+        .and_then(Value::as_array)
+        .and_then(|items| items.first());
+    let (status, reason) = if blocked.is_some() {
+        ("incomplete", Some("content_filter"))
+    } else {
+        map_gemini_finish_reason(
+            candidate
+                .and_then(|candidate| candidate.get("finishReason"))
+                .and_then(Value::as_str),
+        )
     };
-
-    match mapped {
-        Some(value) => json!(value),
-        None => Value::Null,
+    let candidate_parts =
+        candidate.map(|candidate| gemini_candidate_parts(candidate, hints, status == "completed"));
+    let id = response_id(body.get("responseId").and_then(Value::as_str));
+    let mut output = if let Some(blocked) = blocked {
+        vec![
+            json!({ "id": format!("{id}_msg_0"), "type": "message", "status": "completed", "role": "assistant", "content": [{ "type": "output_text", "text": format!("Request blocked by Gemini safety filters: {blocked}"), "annotations": [] }] }),
+        ]
+    } else {
+        let candidate = candidate
+            .ok_or_else(|| ProxyError::TransformError("No candidates in Gemini response".into()))?;
+        gemini_candidate_to_responses_output(
+            &body,
+            candidate,
+            candidate_parts.as_deref().unwrap_or_default(),
+            tool_context,
+            status == "completed",
+        )
+    };
+    if status != "completed" {
+        output.retain(|item| item.get("type").and_then(Value::as_str) != Some("function_call"));
     }
+    if let (Some(store), Some(provider_id), Some(session_id), Some(candidate)) =
+        (shadow_store, provider_id, session_id, candidate)
+    {
+        if status == "completed"
+            && candidate.get("finishReason").and_then(Value::as_str) == Some("STOP")
+        {
+            let parts = candidate_parts.as_deref().unwrap_or_default();
+            store.record_assistant_turn(
+                provider_id,
+                session_id,
+                json!({ "parts": parts }),
+                extract_tool_call_meta(parts),
+            );
+        }
+    }
+    let mut response = json!({ "id": id, "object": "response", "created_at": 0, "status": status, "model": model, "output": output, "usage": usage });
+    if let Some(reason) = reason {
+        response["incomplete_details"] = json!({ "reason": reason });
+    }
+    Ok(response)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn context(body: Value) -> CodexToolContext {
+        super::super::transform_codex_chat::build_codex_tool_context_from_request_with_web_search(
+            &body,
+            true,
+            Some("provider".into()),
+        )
+    }
+
     #[test]
-    fn anthropic_to_gemini_maps_system_and_messages() {
+    fn direct_responses_request_maps_system_media_tools_and_generation_options() {
         let input = json!({
-            "model": "gemini-2.5-pro",
-            "max_tokens": 128,
-            "system": "You are helpful.",
-            "messages": [
-                { "role": "user", "content": "Hello" }
+            "model": "gemini-3-pro", "instructions": "Rules", "temperature": 0.2, "top_p": 0.7,
+            "max_output_tokens": 512, "reasoning": {"effort":"high"},
+            "text": {"format": {"type":"json_schema", "schema":{"type":"object"}}},
+            "tools": [{"type":"function","name":"lookup","parameters":{"type":"object","properties":{"city":{"type":"string"}}}}],
+            "tool_choice": {"type":"function","name":"lookup"},
+            "input": [
+                {"role":"developer","content":[{"type":"input_text","text":"Be brief."}]},
+                {"role":"user","content":[{"type":"input_text","text":"Weather?"},{"type":"input_image","image_url":"data:image/png;base64,abc"}]}
             ]
         });
-
-        let result = anthropic_to_gemini(input).unwrap();
+        let tools = context(input.clone());
+        let (result, _) =
+            responses_to_gemini(&input, None, None, None, &tools, true, GeminiThinking::Auto)
+                .unwrap();
         assert_eq!(
             result["systemInstruction"]["parts"][0]["text"],
-            "You are helpful."
+            "Rules\n\nBe brief."
         );
         assert_eq!(result["contents"][0]["role"], "user");
-        assert_eq!(result["contents"][0]["parts"][0]["text"], "Hello");
-        assert_eq!(result["generationConfig"]["maxOutputTokens"], 128);
-    }
-
-    #[test]
-    fn anthropic_to_gemini_merges_system_messages_into_system_instruction() {
-        let input = json!({
-            "model": "gemini-3-pro",
-            "system": [{ "type": "text", "text": "Top level system." }],
-            "messages": [
-                { "role": "system", "content": "Message system." },
-                {
-                    "role": "system",
-                    "content": [{ "type": "text", "text": "Block system." }]
-                },
-                { "role": "user", "content": "Hello" }
-            ]
-        });
-
-        let result = anthropic_to_gemini(input).unwrap();
-
         assert_eq!(
-            result["systemInstruction"]["parts"][0]["text"],
-            "Top level system.\n\nMessage system.\n\nBlock system."
+            result["contents"][0]["parts"][1]["inlineData"]["mimeType"],
+            "image/png"
         );
-        assert_eq!(result["contents"].as_array().unwrap().len(), 1);
-        assert_eq!(result["contents"][0]["role"], "user");
-        assert_eq!(result["contents"][0]["parts"][0]["text"], "Hello");
-    }
-
-    #[test]
-    fn anthropic_to_gemini_maps_tools_and_tool_results() {
-        let input = json!({
-            "messages": [
-                {
-                    "role": "assistant",
-                    "content": [
-                        { "type": "tool_use", "id": "call_1", "name": "get_weather", "input": { "city": "Tokyo" } }
-                    ]
-                },
-                {
-                    "role": "user",
-                    "content": [
-                        { "type": "tool_result", "tool_use_id": "call_1", "content": "Sunny" }
-                    ]
-                }
-            ],
-            "tools": [
-                {
-                    "name": "get_weather",
-                    "description": "Weather lookup",
-                    "input_schema": { "type": "object", "properties": { "city": { "type": "string" } } }
-                }
-            ],
-            "tool_choice": { "type": "tool", "name": "get_weather" }
-        });
-
-        let result = anthropic_to_gemini(input).unwrap();
+        assert_eq!(result["generationConfig"]["maxOutputTokens"], 512);
         assert_eq!(
-            result["tools"][0]["functionDeclarations"][0]["name"],
-            "get_weather"
-        );
-        assert!(result["tools"][0]["functionDeclarations"][0]
-            .get("parameters")
-            .is_some());
-        assert_eq!(
-            result["contents"][0]["parts"][0]["functionCall"]["name"],
-            "get_weather"
+            result["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+            "HIGH"
         );
         assert_eq!(
-            result["contents"][1]["parts"][0]["functionResponse"]["name"],
-            "get_weather"
-        );
-        assert_eq!(
-            result["toolConfig"]["functionCallingConfig"]["allowedFunctionNames"][0],
-            "get_weather"
+            result["toolConfig"]["functionCallingConfig"]["allowedFunctionNames"],
+            json!(["lookup"])
         );
     }
 
     #[test]
-    fn anthropic_to_gemini_moves_mixed_tool_result_image_to_native_part() {
-        let input = json!({
-            "messages": [
-                {
-                    "role": "assistant",
-                    "content": [{
-                        "type": "tool_use",
-                        "id": "call_image",
-                        "name": "inspect",
-                        "input": {}
-                    }]
-                },
-                {
-                    "role": "user",
-                    "content": [{
-                        "type": "tool_result",
-                        "tool_use_id": "call_image",
-                        "content": [
-                            {"type": "text", "text": "caption"},
-                            {
-                                "type": "image",
-                                "source": {
-                                    "type": "base64",
-                                    "media_type": "image/png",
-                                    "data": "GEMINI_TOOL_IMAGE_SENTINEL"
-                                }
-                            }
-                        ]
-                    }]
-                }
-            ]
-        });
-
-        let result = anthropic_to_gemini(input).unwrap();
-        let parts = result["contents"][1]["parts"].as_array().unwrap();
-        let response = &parts[0]["functionResponse"]["response"]["content"];
-
-        assert!(response.as_str().unwrap().contains("caption"));
-        assert!(response
-            .as_str()
-            .unwrap()
-            .contains("tool result media attached"));
-        assert!(!response
-            .as_str()
-            .unwrap()
-            .contains("GEMINI_TOOL_IMAGE_SENTINEL"));
-        assert_eq!(
-            parts[1]["text"],
-            "[cc-switch: media output of tool call call_image]"
+    fn direct_response_maps_usage_incomplete_and_grounding_without_partial_tools() {
+        let tools = context(
+            json!({"tools":[{"type":"function","name":"lookup","parameters":{"type":"object","properties":{"city":{"type":"string"}}}},{"type":"web_search"}]}),
         );
-        assert_eq!(parts[2]["inlineData"]["mimeType"], "image/png");
-        assert_eq!(parts[2]["inlineData"]["data"], "GEMINI_TOOL_IMAGE_SENTINEL");
-    }
-
-    #[test]
-    fn anthropic_to_gemini_clamps_json_string_residual_base64_before_serializing() {
-        let residual_base64 = "A".repeat(20_000);
-        let encoded = json!({
-            "content": [
-                {
-                    "type": "image_url",
-                    "image_url": {
-                        "url": "data:image/png;base64,GEMINI_STRING_IMAGE_SENTINEL"
-                    }
-                },
-                {"type": "video", "data": residual_base64}
-            ]
-        })
-        .to_string();
-        let input = json!({
-            "messages": [
-                {
-                    "role": "assistant",
-                    "content": [{
-                        "type": "tool_use",
-                        "id": "call_string",
-                        "name": "inspect",
-                        "input": {}
-                    }]
-                },
-                {
-                    "role": "user",
-                    "content": [{
-                        "type": "tool_result",
-                        "tool_use_id": "call_string",
-                        "content": encoded
-                    }]
-                }
-            ]
-        });
-
-        let result = anthropic_to_gemini(input).unwrap();
-        let serialized = result.to_string();
-
-        assert!(serialized.contains("[cc-switch: omitted 20000 bytes]"));
-        assert!(!serialized.contains(&"A".repeat(64)));
+        let response = gemini_to_responses(json!({
+            "responseId":"gemini-1","modelVersion":"gemini-3-pro",
+            "candidates":[{"content":{"parts":[{"text":"Searching."},{"functionCall":{"name":"lookup","args":{"city":"Tokyo"}}}]},"finishReason":"MAX_TOKENS","groundingMetadata":{"webSearchQueries":["weather"]}}],
+            "usageMetadata":{"promptTokenCount":10,"cachedContentTokenCount":2,"candidatesTokenCount":5,"totalTokenCount":15}
+        }), None, None, None, &tools, None).unwrap();
+        assert_eq!(response["status"], "incomplete");
         assert_eq!(
-            result["contents"][1]["parts"][2]["inlineData"]["data"],
-            "GEMINI_STRING_IMAGE_SENTINEL"
+            response["incomplete_details"]["reason"],
+            "max_output_tokens"
         );
-    }
-
-    #[test]
-    fn anthropic_to_gemini_keeps_remote_tool_image_in_legacy_response() {
-        let remote_image = json!({
-            "type": "image",
-            "source": {
-                "type": "url",
-                "url": "https://example.com/tool-image.png"
-            }
-        });
-        let input = json!({
-            "messages": [
-                {
-                    "role": "assistant",
-                    "content": [{
-                        "type": "tool_use",
-                        "id": "call_remote",
-                        "name": "inspect",
-                        "input": {}
-                    }]
-                },
-                {
-                    "role": "user",
-                    "content": [{
-                        "type": "tool_result",
-                        "tool_use_id": "call_remote",
-                        "content": [remote_image.clone()]
-                    }]
-                }
-            ]
-        });
-
-        let result = anthropic_to_gemini(input).unwrap();
-        let parts = result["contents"][1]["parts"].as_array().unwrap();
-
-        assert_eq!(parts.len(), 1);
+        assert_eq!(response["output"][0]["type"], "web_search_call");
+        assert_eq!(response["output"][1]["content"][0]["text"], "Searching.");
+        assert!(!response.to_string().contains("function_call"));
+        assert_eq!(response["usage"]["input_tokens"], 10);
         assert_eq!(
-            parts[0]["functionResponse"]["response"]["content"][0],
-            remote_image
+            response["usage"]["input_tokens_details"]["cached_tokens"],
+            2
         );
-        assert!(!result.to_string().contains("fileData"));
-        assert!(!result
-            .to_string()
-            .contains(TOOL_RESULT_MEDIA_ATTACHED_MARKER));
+        assert_eq!(response["usage"]["output_tokens"], 5);
     }
 
     #[test]
-    fn anthropic_to_gemini_does_not_strip_unconvertible_tool_data_url() {
-        let malformed_image = json!({
-            "type": "image_url",
-            "image_url": {
-                "url": "data:image/png,NOT_BASE64"
-            }
-        });
-        let input = json!({
-            "messages": [
-                {
-                    "role": "assistant",
-                    "content": [{
-                        "type": "tool_use",
-                        "id": "call_malformed",
-                        "name": "inspect",
-                        "input": {}
-                    }]
-                },
-                {
-                    "role": "user",
-                    "content": [{
-                        "type": "tool_result",
-                        "tool_use_id": "call_malformed",
-                        "content": [malformed_image.clone()]
-                    }]
-                }
-            ]
-        });
-
-        let result = anthropic_to_gemini(input).unwrap();
-        let parts = result["contents"][1]["parts"].as_array().unwrap();
-
-        assert_eq!(parts.len(), 1);
-        assert_eq!(
-            parts[0]["functionResponse"]["response"]["content"][0],
-            malformed_image
-        );
-        assert!(!result.to_string().contains("inlineData"));
-        assert!(!result
-            .to_string()
-            .contains(TOOL_RESULT_MEDIA_ATTACHED_MARKER));
-    }
-
-    #[test]
-    fn anthropic_to_gemini_does_not_embed_image_only_tool_result_as_json() {
-        let input = json!({
-            "messages": [
-                {
-                    "role": "assistant",
-                    "content": [{
-                        "type": "tool_use",
-                        "id": "call_image",
-                        "name": "inspect",
-                        "input": {}
-                    }]
-                },
-                {
-                    "role": "user",
-                    "content": [{
-                        "type": "tool_result",
-                        "tool_use_id": "call_image",
-                        "content": [{
-                            "type": "image",
-                            "source": {
-                                "type": "base64",
-                                "media_type": "image/webp",
-                                "data": "IMAGE_ONLY_SENTINEL"
-                            }
-                        }]
-                    }]
-                }
-            ]
-        });
-
-        let result = anthropic_to_gemini(input).unwrap();
-        let parts = result["contents"][1]["parts"].as_array().unwrap();
-        let response = &parts[0]["functionResponse"]["response"]["content"];
-
-        assert!(response.is_string());
-        assert!(!response.as_str().unwrap().contains("IMAGE_ONLY_SENTINEL"));
-        assert_eq!(parts[2]["inlineData"]["mimeType"], "image/webp");
-        assert_eq!(parts[2]["inlineData"]["data"], "IMAGE_ONLY_SENTINEL");
-    }
-
-    #[test]
-    fn anthropic_to_gemini_3_uses_multimodal_function_response_parts() {
-        let store = GeminiShadowStore::with_limits(8, 4);
-        store.record_assistant_turn(
-            "provider-a",
-            "session-1",
+    fn direct_response_and_shadow_share_synthesized_tool_call_id() {
+        let tools = context(json!({
+            "tools": [{
+                "type": "function",
+                "name": "lookup",
+                "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}
+            }]
+        }));
+        let shadow = GeminiShadowStore::default();
+        let response = gemini_to_responses(
             json!({
-                "parts": [{
-                    "functionCall": {
-                        "id": "call_image",
-                        "name": "inspect",
-                        "args": {}
-                    },
-                    "thoughtSignature": "signature-image"
+                "responseId": "gemini-id-parity",
+                "modelVersion": "gemini-3-pro",
+                "candidates": [{
+                    "content": {"parts": [{
+                        "functionCall": {"name": "lookup", "args": {"city": "Tokyo"}},
+                        "thoughtSignature": "sig-id-parity"
+                    }]},
+                    "finishReason": "STOP"
                 }]
             }),
-            vec![GeminiToolCallMeta::new(
-                Some("call_image"),
-                "inspect",
-                json!({}),
-                Some("signature-image"),
-            )],
-        );
-        let input = json!({
-            "model": "gemini-3-pro-preview",
-            "messages": [
-                {
-                    "role": "assistant",
-                    "content": [{
-                        "type": "tool_use",
-                        "id": "call_image",
-                        "name": "inspect",
-                        "input": {}
-                    }]
-                },
-                {
-                    "role": "user",
-                    "content": [{
-                        "type": "tool_result",
-                        "tool_use_id": "call_image",
-                        "content": [{
-                            "type": "image",
-                            "source": {
-                                "type": "base64",
-                                "media_type": "image/jpeg",
-                                "data": "GEMINI_3_IMAGE_SENTINEL"
-                            }
-                        }]
-                    }]
-                }
-            ]
-        });
-
-        let result = anthropic_to_gemini_with_shadow(
-            input,
-            Some(&store),
-            Some("provider-a"),
-            Some("session-1"),
+            Some(&shadow),
+            Some("provider"),
+            Some("session"),
+            &tools,
+            None,
         )
         .unwrap();
-        assert_eq!(
-            result["contents"][0]["parts"][0]["thoughtSignature"],
-            "signature-image"
-        );
-        let parts = result["contents"][1]["parts"].as_array().unwrap();
-        let function_response = &parts[0]["functionResponse"];
+        let call_id = response["output"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["type"] == "function_call")
+            .unwrap()["call_id"]
+            .as_str()
+            .unwrap();
+        let stored = shadow
+            .get_session("provider", "session")
+            .unwrap()
+            .turns
+            .pop()
+            .unwrap();
 
-        assert_eq!(parts.len(), 1);
+        assert_eq!(
+            stored.assistant_content["parts"][0]["functionCall"]["id"],
+            call_id
+        );
+        assert_eq!(stored.tool_calls[0].id.as_deref(), Some(call_id));
+    }
+
+    #[test]
+    fn direct_request_preserves_tool_result_error_media_and_unknown_part_handling() {
+        let input = json!({
+            "model": "gemini-3-pro",
+            "tools": [{
+                "type": "function",
+                "name": "lookup",
+                "parameters": {"type": "object", "properties": {}}
+            }],
+            "input": [
+                {"type": "function_call", "call_id": "call-1", "name": "lookup", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "call-1", "output": [
+                    {"type": "input_text", "text": TOOL_RESULT_ERROR_MARKER},
+                    {"type": "output_text", "text": "Image attached."},
+                    {"type": "input_image", "image_url": "data:image/png;base64,aGVsbG8="},
+                    {"type": "future_part", "payload": {"x": 1}}
+                ]}
+            ]
+        });
+        let tools = context(input.clone());
+        let (request, _) =
+            responses_to_gemini(&input, None, None, None, &tools, true, GeminiThinking::Auto)
+                .unwrap();
+        let function_response = request["contents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|content| content["parts"].as_array().into_iter().flatten())
+            .find_map(|part| part.get("functionResponse"))
+            .unwrap();
+        let expected_unknown_part = canonical_json_string(&json!({
+            "type": "future_part",
+            "payload": {"x": 1}
+        }));
+        let response_content = function_response["response"]["content"].as_str().unwrap();
+
+        assert_eq!(
+            response_content,
+            format!(
+                "Image attached.\n{TOOL_RESULT_MEDIA_ATTACHED_MARKER}\n{expected_unknown_part}"
+            )
+        );
+        assert!(!response_content.contains(TOOL_RESULT_ERROR_MARKER));
         assert_eq!(
             function_response["parts"][0]["inlineData"]["mimeType"],
-            "image/jpeg"
+            "image/png"
         );
         assert_eq!(
             function_response["parts"][0]["inlineData"]["data"],
-            "GEMINI_3_IMAGE_SENTINEL"
-        );
-        assert!(!function_response["response"]["content"]
-            .as_str()
-            .unwrap()
-            .contains("GEMINI_3_IMAGE_SENTINEL"));
-    }
-
-    #[test]
-    fn anthropic_to_gemini_resolves_tool_result_name_from_shadow_content() {
-        let store = GeminiShadowStore::with_limits(8, 4);
-        store.record_assistant_turn(
-            "provider-a",
-            "session-1",
-            json!({
-                "parts": [{
-                    "functionCall": {
-                        "id": "call_1",
-                        "name": "get_weather",
-                        "args": { "city": "Tokyo" }
-                    }
-                }]
-            }),
-            vec![],
-        );
-
-        let input = json!({
-            "messages": [
-                {
-                    "role": "user",
-                    "content": [
-                        { "type": "tool_result", "tool_use_id": "call_1", "content": "Sunny" }
-                    ]
-                }
-            ]
-        });
-
-        let result = anthropic_to_gemini_with_shadow(
-            input,
-            Some(&store),
-            Some("provider-a"),
-            Some("session-1"),
-        )
-        .unwrap();
-
-        assert_eq!(
-            result["contents"][0]["parts"][0]["functionResponse"]["name"],
-            "get_weather"
+            "aGVsbG8="
         );
     }
 
     #[test]
-    fn anthropic_to_gemini_rejects_tool_result_without_resolvable_name() {
-        let input = json!({
-            "messages": [
-                {
-                    "role": "user",
-                    "content": [
-                        { "type": "tool_result", "tool_use_id": "call_1", "content": "Sunny" }
-                    ]
-                }
-            ]
-        });
-
-        let error = anthropic_to_gemini(input).unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("Unable to resolve Gemini functionResponse.name"));
-    }
-
-    #[test]
-    fn anthropic_to_gemini_uses_parameters_json_schema_for_rich_tool_schema() {
-        let input = json!({
-            "tools": [
-                {
-                    "name": "search",
-                    "description": "Search data",
-                    "input_schema": {
-                        "$schema": "https://json-schema.org/draft/2020-12/schema",
-                        "type": "object",
-                        "properties": {
-                            "query": { "type": "string" }
-                        },
-                        "required": ["query"],
-                        "additionalProperties": false
-                    }
-                }
-            ]
-        });
-
-        let result = anthropic_to_gemini(input).unwrap();
-        let declaration = &result["tools"][0]["functionDeclarations"][0];
-
-        assert!(declaration.get("parameters").is_none());
-        assert!(declaration.get("parametersJsonSchema").is_some());
-        assert!(declaration["parametersJsonSchema"].get("$schema").is_none());
-        assert_eq!(
-            declaration["parametersJsonSchema"]["additionalProperties"],
-            false
-        );
-    }
-
-    #[test]
-    fn gemini_to_anthropic_maps_text_and_usage() {
-        let input = json!({
-            "responseId": "resp_1",
-            "modelVersion": "gemini-2.5-pro",
-            "candidates": [{
-                "finishReason": "STOP",
-                "content": {
-                    "parts": [{ "text": "Hello from Gemini" }]
-                }
-            }],
-            "usageMetadata": {
-                "promptTokenCount": 12,
-                "totalTokenCount": 20,
-                "cachedContentTokenCount": 3
-            }
-        });
-
-        let result = gemini_to_anthropic(input).unwrap();
-        assert_eq!(result["id"], "resp_1");
-        assert_eq!(result["content"][0]["type"], "text");
-        assert_eq!(result["content"][0]["text"], "Hello from Gemini");
-        assert_eq!(result["stop_reason"], "end_turn");
-        // input_tokens = promptTokenCount(12) - cachedContentTokenCount(3) = 9（fresh input）。
-        // Gemini 的 promptTokenCount 含缓存命中，但 Anthropic 语义要求 input 不含 cache、
-        // cache_read 单列；二者相加(9+3)=总输入 12。扣减避免本路径以 app_type=claude
-        // 记账时把缓存 token 双重计费。
-        assert_eq!(result["usage"]["input_tokens"], 9);
-        assert_eq!(result["usage"]["output_tokens"], 8);
-        assert_eq!(result["usage"]["cache_read_input_tokens"], 3);
-    }
-
-    #[test]
-    fn gemini_to_anthropic_maps_function_calls_to_tool_use() {
-        let input = json!({
-            "responseId": "resp_2",
-            "modelVersion": "gemini-2.5-pro",
-            "candidates": [{
-                "finishReason": "STOP",
-                "content": {
-                    "parts": [{
-                        "functionCall": {
-                            "id": "call_1",
-                            "name": "get_weather",
-                            "args": { "city": "Tokyo" }
-                        }
-                    }]
-                }
-            }],
-            "usageMetadata": {
-                "promptTokenCount": 10,
-                "totalTokenCount": 15
-            }
-        });
-
-        let result = gemini_to_anthropic(input).unwrap();
-        assert_eq!(result["content"][0]["type"], "tool_use");
-        assert_eq!(result["content"][0]["id"], "call_1");
-        assert_eq!(result["stop_reason"], "tool_use");
-    }
-
-    #[test]
-    fn gemini_to_anthropic_rectifies_tool_args_from_schema_hints() {
-        let input = json!({
-            "responseId": "resp_2",
-            "modelVersion": "gemini-2.5-pro",
-            "candidates": [{
-                "finishReason": "STOP",
-                "content": {
-                    "parts": [{
-                        "functionCall": {
-                            "id": "call_1",
-                            "name": "Skill",
-                            "args": {
-                                "name": "git-commit",
-                                "parameters": {
-                                    "args": ["详细分析内容 编写提交信息 分多次提交代码"]
-                                }
-                            }
-                        }
-                    }]
-                }
-            }]
-        });
-        let hints = extract_anthropic_tool_schema_hints(&json!({
-            "tools": [{
-                "name": "Skill",
-                "input_schema": {
-                    "type": "object",
-                    "properties": {
-                        "skill": { "type": "string" },
-                        "args": { "type": "string" }
-                    },
-                    "required": ["skill"]
-                }
-            }]
-        }));
-
-        let result =
-            gemini_to_anthropic_with_shadow_and_hints(input, None, None, None, Some(&hints))
-                .unwrap();
-
-        assert_eq!(result["content"][0]["input"]["skill"], "git-commit");
-        assert_eq!(
-            result["content"][0]["input"]["args"],
-            "详细分析内容 编写提交信息 分多次提交代码"
-        );
-        assert!(result["content"][0]["input"].get("name").is_none());
-        assert!(result["content"][0]["input"].get("parameters").is_none());
-    }
-
-    #[test]
-    fn gemini_to_anthropic_preserves_legitimate_parameters_arg() {
-        let input = json!({
-            "responseId": "resp_params",
-            "modelVersion": "gemini-2.5-pro",
-            "candidates": [{
-                "finishReason": "STOP",
-                "content": {
-                    "parts": [{
-                        "functionCall": {
-                            "id": "call_1",
-                            "name": "ConfigTool",
-                            "args": {
-                                "parameters": {
-                                    "mode": "safe",
-                                    "retries": 2
-                                }
-                            }
-                        }
-                    }]
-                }
-            }]
-        });
-        let hints = extract_anthropic_tool_schema_hints(&json!({
-            "tools": [{
-                "name": "ConfigTool",
-                "input_schema": {
-                    "type": "object",
-                    "properties": {
-                        "parameters": {
-                            "type": "object",
-                            "properties": {
-                                "mode": { "type": "string" },
-                                "retries": { "type": "integer" }
-                            }
-                        }
-                    },
-                    "required": ["parameters"]
-                }
-            }]
-        }));
-
-        let result =
-            gemini_to_anthropic_with_shadow_and_hints(input, None, None, None, Some(&hints))
-                .unwrap();
-
-        assert_eq!(result["content"][0]["input"]["parameters"]["mode"], "safe");
-        assert_eq!(result["content"][0]["input"]["parameters"]["retries"], 2);
-    }
-
-    #[test]
-    fn gemini_to_anthropic_maps_blocked_prompt_to_refusal() {
-        let input = json!({
-            "responseId": "resp_3",
-            "modelVersion": "gemini-2.5-flash",
-            "promptFeedback": { "blockReason": "SAFETY" },
-            "usageMetadata": {
-                "promptTokenCount": 4,
-                "totalTokenCount": 4
-            }
-        });
-
-        let result = gemini_to_anthropic(input).unwrap();
-        assert_eq!(result["stop_reason"], "refusal");
-        assert_eq!(result["content"][0]["type"], "text");
-        assert!(result["content"][0]["text"]
-            .as_str()
-            .unwrap()
-            .contains("SAFETY"));
-    }
-
-    #[test]
-    fn shadow_replay_aligns_to_latest_turns_after_client_truncation() {
-        let store = GeminiShadowStore::with_limits(8, 4);
-        // Record 3 shadow turns (assistant messages 0, 1, 2)
-        for i in 0..3 {
-            store.record_assistant_turn(
-                "prov",
-                "sess",
-                json!({
-                    "parts": [{
-                        "functionCall": {
-                            "id": format!("call_{i}"),
-                            "name": format!("tool_{i}"),
-                            "args": {}
-                        }
-                    }]
-                }),
-                vec![],
-            );
-        }
-
-        // Client truncates history: only sends assistant messages 1 and 2
-        let input = json!({
-            "messages": [
-                {
-                    "role": "assistant",
-                    "content": [
-                        { "type": "tool_use", "id": "call_1", "name": "tool_1", "input": {} }
-                    ]
-                },
-                {
-                    "role": "user",
-                    "content": [
-                        { "type": "tool_result", "tool_use_id": "call_1", "content": "ok" }
-                    ]
-                },
-                {
-                    "role": "assistant",
-                    "content": [
-                        { "type": "tool_use", "id": "call_2", "name": "tool_2", "input": {} }
-                    ]
-                },
-                {
-                    "role": "user",
-                    "content": [
-                        { "type": "tool_result", "tool_use_id": "call_2", "content": "ok" }
-                    ]
-                }
-            ]
-        });
-
-        let result =
-            anthropic_to_gemini_with_shadow(input, Some(&store), Some("prov"), Some("sess"))
-                .unwrap();
-
-        // Shadow turns[1] (tool_1) should align with first assistant message,
-        // shadow turns[2] (tool_2) with the second — not turns[0] and turns[1].
-        assert_eq!(
-            result["contents"][0]["parts"][0]["functionCall"]["name"],
-            "tool_1"
-        );
-        assert_eq!(
-            result["contents"][2]["parts"][0]["functionCall"]["name"],
-            "tool_2"
-        );
-    }
-
-    #[test]
-    fn shadow_replay_matches_tool_use_turn_by_id_when_position_drifts() {
-        let store = GeminiShadowStore::with_limits(8, 4);
-        store.record_assistant_turn(
-            "prov",
-            "sess",
-            json!({
-                "parts": [{
-                    "functionCall": {
-                        "id": "call_1",
-                        "name": "Bash",
-                        "args": { "command": "ls -R" }
-                    },
-                    "thoughtSignature": "sig-tool-1"
-                }]
-            }),
-            vec![GeminiToolCallMeta::new(
-                Some("call_1"),
-                "Bash",
-                json!({ "command": "ls -R" }),
-                Some("sig-tool-1"),
-            )],
-        );
-
-        let input = json!({
-            "messages": [
-                {
-                    "role": "assistant",
-                    "content": [
-                        {
-                            "type": "tool_use",
-                            "id": "call_1",
-                            "name": "default_api:Bash",
-                            "input": { "command": "ls -R" }
-                        }
-                    ]
-                },
-                {
-                    "role": "user",
-                    "content": [
-                        { "type": "tool_result", "tool_use_id": "call_1", "content": "ok" }
-                    ]
-                },
-                {
-                    "role": "assistant",
-                    "content": [
-                        { "type": "text", "text": "local-only assistant turn without Gemini shadow" }
-                    ]
-                }
-            ]
-        });
-
-        let result =
-            anthropic_to_gemini_with_shadow(input, Some(&store), Some("prov"), Some("sess"))
-                .unwrap();
-
-        assert_eq!(
-            result["contents"][0]["parts"][0]["functionCall"]["name"],
-            "Bash"
-        );
-        assert_eq!(
-            result["contents"][0]["parts"][0]["thoughtSignature"],
-            "sig-tool-1"
-        );
-    }
-
-    /// Regression for P1: two shadow turns whose suffix-normalized names
-    /// collide (e.g. `server_a:search` / `server_b:search` both normalize to
-    /// `search`). When the incoming assistant tool_use carries a valid,
-    /// different id, exact-id matching must win over the normalized-name
-    /// clause — otherwise replay picks the wrong shadow turn and later
-    /// tool_result resolution mis-routes.
-    #[test]
-    fn shadow_replay_prefers_exact_id_match_over_normalized_name_collision() {
-        let store = GeminiShadowStore::with_limits(8, 4);
-        store.record_assistant_turn(
-            "prov",
-            "sess",
-            json!({
-                "parts": [{
-                    "functionCall": {
-                        "id": "call_a",
-                        "name": "server_a:search",
-                        "args": { "q": "alpha" }
-                    },
-                    "thoughtSignature": "sig-a"
-                }]
-            }),
-            vec![GeminiToolCallMeta::new(
-                Some("call_a"),
-                "server_a:search",
-                json!({ "q": "alpha" }),
-                Some("sig-a"),
-            )],
-        );
-        store.record_assistant_turn(
-            "prov",
-            "sess",
-            json!({
-                "parts": [{
-                    "functionCall": {
-                        "id": "call_b",
-                        "name": "server_b:search",
-                        "args": { "q": "beta" }
-                    },
-                    "thoughtSignature": "sig-b"
-                }]
-            }),
-            vec![GeminiToolCallMeta::new(
-                Some("call_b"),
-                "server_b:search",
-                json!({ "q": "beta" }),
-                Some("sig-b"),
-            )],
-        );
-
-        // Two assistant turns: the first references call_b, the second
-        // call_a. Positional fallback would align msg[0] to turn 0 (call_a)
-        // and msg[1] to turn 1 (call_b) — both wrong. The old `||` chain
-        // would also mis-match through the normalized "search" name.
-        let input = json!({
-            "messages": [
-                {
-                    "role": "assistant",
-                    "content": [
-                        { "type": "tool_use", "id": "call_b", "name": "server_b:search", "input": { "q": "beta" } }
-                    ]
-                },
-                {
-                    "role": "user",
-                    "content": [
-                        { "type": "tool_result", "tool_use_id": "call_b", "content": "ok-b" }
-                    ]
-                },
-                {
-                    "role": "assistant",
-                    "content": [
-                        { "type": "tool_use", "id": "call_a", "name": "server_a:search", "input": { "q": "alpha" } }
-                    ]
-                },
-                {
-                    "role": "user",
-                    "content": [
-                        { "type": "tool_result", "tool_use_id": "call_a", "content": "ok-a" }
-                    ]
-                }
-            ]
-        });
-
-        let result =
-            anthropic_to_gemini_with_shadow(input, Some(&store), Some("prov"), Some("sess"))
-                .unwrap();
-
-        // msg[0] replays shadow turn 1 (server_b:search) because id=call_b.
-        assert_eq!(
-            result["contents"][0]["parts"][0]["functionCall"]["name"],
-            "server_b:search"
-        );
-        assert_eq!(
-            result["contents"][0]["parts"][0]["thoughtSignature"],
-            "sig-b"
-        );
-        // msg[2] replays shadow turn 0 (server_a:search) because id=call_a,
-        // even though turn 1 was already consumed above.
-        assert_eq!(
-            result["contents"][2]["parts"][0]["functionCall"]["name"],
-            "server_a:search"
-        );
-        assert_eq!(
-            result["contents"][2]["parts"][0]["thoughtSignature"],
-            "sig-a"
-        );
-    }
-
-    /// When the incoming tool_use carries no id (or only empty-string ids),
-    /// the layered matcher must still fall back to name-based matching so
-    /// that shadow replay keeps working for providers that omit ids.
-    #[test]
-    fn shadow_replay_falls_back_to_name_when_ids_absent() {
-        let store = GeminiShadowStore::with_limits(8, 4);
-        store.record_assistant_turn(
-            "prov",
-            "sess",
-            json!({
-                "parts": [{
-                    "functionCall": {
-                        "name": "lookup",
-                        "args": {}
-                    },
-                    "thoughtSignature": "sig-lookup"
-                }]
-            }),
-            vec![GeminiToolCallMeta::new(
-                None::<&str>,
-                "lookup",
-                json!({}),
-                Some("sig-lookup"),
-            )],
-        );
-
-        // id is an empty string; extract_assistant_tool_use_keys filters it
-        // out, so tool_use_ids is empty and matching must go through names.
-        // A trailing user text turn keeps the assistant turn well-formed
-        // without feeding a tool_result back (which would require a real id).
-        let input = json!({
-            "messages": [
-                {
-                    "role": "assistant",
-                    "content": [
-                        { "type": "tool_use", "id": "", "name": "lookup", "input": {} }
-                    ]
-                },
-                {
-                    "role": "user",
-                    "content": "ack"
-                }
-            ]
-        });
-
-        let result =
-            anthropic_to_gemini_with_shadow(input, Some(&store), Some("prov"), Some("sess"))
-                .unwrap();
-
-        assert_eq!(
-            result["contents"][0]["parts"][0]["functionCall"]["name"],
-            "lookup"
-        );
-        assert_eq!(
-            result["contents"][0]["parts"][0]["thoughtSignature"],
-            "sig-lookup"
-        );
-    }
-
-    /// Regression for P1: Gemini 2.x may return parallel calls without ids.
-    /// Each Anthropic-visible tool_use must carry a unique id so the Claude
-    /// Code client can map tool_result responses back correctly.
-    #[test]
-    fn gemini_to_anthropic_synthesizes_unique_ids_for_missing_functioncall_ids() {
-        let input = json!({
-            "responseId": "r1",
-            "modelVersion": "gemini-2.5-pro",
-            "candidates": [{
-                "finishReason": "STOP",
-                "content": {
-                    "parts": [
-                        { "functionCall": { "name": "foo", "args": {} } },
-                        { "functionCall": { "name": "foo", "args": { "k": 1 } } }
-                    ]
-                }
-            }]
-        });
-
-        let result = gemini_to_anthropic(input).unwrap();
-        let id0 = result["content"][0]["id"].as_str().unwrap();
-        let id1 = result["content"][1]["id"].as_str().unwrap();
-        assert!(is_synthesized_tool_call_id(id0));
-        assert!(is_synthesized_tool_call_id(id1));
-        assert_ne!(id0, id1, "synthesized ids must be unique per call");
-    }
-
-    /// Ensures the proxy does not leak synthesized ids back to Gemini when
-    /// Claude Code replies with a tool_result: the id must be stripped from
-    /// both `functionCall.id` and `functionResponse.id`.
-    #[test]
-    fn tool_result_with_synthesized_id_omits_id_in_gemini_request() {
-        let synth = synthesize_tool_call_id();
-        let input = json!({
-            "messages": [
-                {
-                    "role": "assistant",
-                    "content": [
-                        { "type": "tool_use", "id": &synth, "name": "get_weather", "input": { "city": "X" } }
-                    ]
-                },
-                {
-                    "role": "user",
-                    "content": [
-                        { "type": "tool_result", "tool_use_id": &synth, "content": "sunny" }
-                    ]
-                }
-            ]
-        });
-
-        let result = anthropic_to_gemini(input).unwrap();
-        let fc = &result["contents"][0]["parts"][0]["functionCall"];
-        assert!(
-            fc.get("id").is_none(),
-            "synthesized id must not leak upstream in functionCall"
-        );
-        assert_eq!(fc["name"], "get_weather");
-        let fr = &result["contents"][1]["parts"][0]["functionResponse"];
-        assert!(
-            fr.get("id").is_none(),
-            "synthesized id must not leak upstream in functionResponse"
-        );
-        assert_eq!(fr["name"], "get_weather");
-    }
-
-    /// Genuine Gemini-assigned ids must round-trip unchanged so that Gemini
-    /// can correlate the tool result with its own prior functionCall entry.
-    #[test]
-    fn tool_result_with_genuine_gemini_id_round_trips() {
-        let input = json!({
-            "messages": [
-                {
-                    "role": "assistant",
-                    "content": [
-                        { "type": "tool_use", "id": "call_real_1", "name": "get_weather", "input": {} }
-                    ]
-                },
-                {
-                    "role": "user",
-                    "content": [
-                        { "type": "tool_result", "tool_use_id": "call_real_1", "content": "ok" }
-                    ]
-                }
-            ]
-        });
-
-        let result = anthropic_to_gemini(input).unwrap();
-        assert_eq!(
-            result["contents"][0]["parts"][0]["functionCall"]["id"],
-            "call_real_1"
-        );
-        assert_eq!(
-            result["contents"][1]["parts"][0]["functionResponse"]["id"],
-            "call_real_1"
-        );
-    }
-
-    /// Shadow replay must also strip synthesized ids when it reconstructs
-    /// the assistant's `functionCall` parts from a previously recorded turn.
-    #[test]
-    fn shadow_replay_strips_synthesized_id_from_function_call() {
-        let store = GeminiShadowStore::with_limits(8, 4);
-        let synth = synthesize_tool_call_id();
-        store.record_assistant_turn(
-            "prov",
-            "sess",
-            json!({
-                "parts": [{
-                    "functionCall": {
-                        "id": &synth,
-                        "name": "get_weather",
-                        "args": { "city": "Tokyo" }
-                    }
-                }]
-            }),
-            vec![GeminiToolCallMeta::new(
-                Some(synth.clone()),
-                "get_weather",
-                json!({ "city": "Tokyo" }),
-                None::<String>,
-            )],
-        );
-
-        let input = json!({
-            "messages": [
-                {
-                    "role": "assistant",
-                    "content": [
-                        { "type": "tool_use", "id": &synth, "name": "get_weather", "input": { "city": "Tokyo" } }
-                    ]
-                },
-                {
-                    "role": "user",
-                    "content": [
-                        { "type": "tool_result", "tool_use_id": &synth, "content": "sunny" }
-                    ]
-                }
-            ]
-        });
-
-        let result =
-            anthropic_to_gemini_with_shadow(input, Some(&store), Some("prov"), Some("sess"))
-                .unwrap();
-        // The assistant message was replayed from shadow; its synthesized id
-        // must be absent from the upstream functionCall representation.
-        assert!(result["contents"][0]["parts"][0]["functionCall"]
-            .get("id")
-            .is_none());
-        // And the tool_result round-trip must still resolve the name via the
-        // shadow map even when the id is synthesized.
-        assert_eq!(
-            result["contents"][1]["parts"][0]["functionResponse"]["name"],
-            "get_weather"
-        );
-    }
-
-    // ------------------------------------------------------------------
-    // Non-streaming shadow id coherence regressions.
-    //
-    // When Gemini returns a `functionCall` without an id (common in 2.x
-    // parallel calls) the proxy must synthesize a single id that is
-    // consistent across:
-    //   (a) the Anthropic `content[tool_use].id` sent to the client
-    //   (b) `shadow_content.parts[].functionCall.id` recorded in shadow
-    //   (c) `shadow_turn.tool_calls[].id` recorded in shadow
-    // Previously the non-streaming path generated independent UUIDs in (a)
-    // and (c), so the next round's `tool_result(tool_use_id=A)` would
-    // fail to resolve through `tool_name_by_id` (populated from (c)).
-    // ------------------------------------------------------------------
-
-    /// The id surfaced to the Anthropic client must equal the id recorded
-    /// in the shadow's `tool_calls` metadata and the shadow's serialized
-    /// `functionCall.id`. All three are read back as the same string.
-    #[test]
-    fn non_stream_shadow_id_matches_client_visible_id() {
-        let store = GeminiShadowStore::with_limits(8, 4);
-        let body = json!({
-            "responseId": "r-coherence",
-            "modelVersion": "gemini-2.5-pro",
-            "candidates": [{
-                "finishReason": "STOP",
-                "content": {
-                    "parts": [{
-                        "functionCall": { "name": "get_weather", "args": { "city": "Tokyo" } }
-                    }]
-                }
-            }]
-        });
-
-        let response = gemini_to_anthropic_with_shadow_and_hints(
-            body,
-            Some(&store),
-            Some("prov"),
-            Some("sess"),
-            None,
-        )
-        .unwrap();
-
-        let client_id = response["content"][0]["id"].as_str().unwrap();
-        assert!(
-            is_synthesized_tool_call_id(client_id),
-            "client-facing id must be synthesized for no-id Gemini responses"
-        );
-
-        let snapshot = store.get_session("prov", "sess").expect("shadow recorded");
-        // (c) tool_calls metadata must agree with the client-visible id.
-        let shadow_tool_call_id = snapshot.turns[0].tool_calls[0]
-            .id
-            .as_deref()
-            .expect("tool_calls id populated");
-        assert_eq!(
-            shadow_tool_call_id, client_id,
-            "shadow.tool_calls id must equal client-visible id"
-        );
-        // (b) assistant_content parts must agree too, so that
-        // `merge_tool_names_from_parts` sees the same id on replay.
-        let shadow_part_id = snapshot.turns[0].assistant_content["parts"][0]["functionCall"]["id"]
-            .as_str()
-            .expect("assistant_content functionCall id populated");
-        assert_eq!(
-            shadow_part_id, client_id,
-            "shadow assistant_content functionCall.id must equal client-visible id"
-        );
-    }
-
-    /// Scenario A: the client-side history was truncated so the next
-    /// request only contains `[tool_result(tool_use_id=A)]` without a
-    /// preceding assistant echo. The request must still resolve because
-    /// `build_tool_name_map_from_shadow_turns` now surfaces the same id
-    /// the client was given.
-    #[test]
-    fn non_stream_missing_id_scenario_a_truncated_history_resolves() {
-        let store = GeminiShadowStore::with_limits(8, 4);
-        let turn1 = json!({
-            "responseId": "r-truncated",
-            "modelVersion": "gemini-2.5-pro",
-            "candidates": [{
-                "finishReason": "STOP",
-                "content": {
-                    "parts": [{
-                        "functionCall": { "name": "get_weather", "args": { "city": "Tokyo" } }
-                    }]
-                }
-            }]
-        });
-        let anthropic_response = gemini_to_anthropic_with_shadow_and_hints(
-            turn1,
-            Some(&store),
-            Some("prov"),
-            Some("sess"),
-            None,
-        )
-        .unwrap();
-        let client_id = anthropic_response["content"][0]["id"]
-            .as_str()
-            .unwrap()
-            .to_string();
-
-        // Turn 2 — client replays ONLY the tool_result. No assistant echo.
-        let turn2_input = json!({
-            "messages": [
-                {
-                    "role": "user",
-                    "content": [
-                        { "type": "tool_result", "tool_use_id": &client_id, "content": "sunny" }
-                    ]
-                }
-            ]
-        });
-        let result =
-            anthropic_to_gemini_with_shadow(turn2_input, Some(&store), Some("prov"), Some("sess"))
-                .expect("scenario A must resolve tool name through shadow");
-        assert_eq!(
-            result["contents"][0]["parts"][0]["functionResponse"]["name"],
-            "get_weather"
-        );
-    }
-
-    /// Scenario B: the client replays the full history. The proxy picks
-    /// the shadow-replay branch (not `convert_message_content_to_parts`),
-    /// which strips the synthesized id from the outgoing `functionCall`.
-    /// `tool_name_by_id` must still have been populated from the shadow
-    /// so the following `tool_result(A)` resolves.
-    #[test]
-    fn non_stream_missing_id_scenario_b_full_history_replay_resolves() {
-        let store = GeminiShadowStore::with_limits(8, 4);
-        let turn1 = json!({
-            "responseId": "r-full",
-            "modelVersion": "gemini-2.5-pro",
-            "candidates": [{
-                "finishReason": "STOP",
-                "content": {
-                    "parts": [{
-                        "functionCall": { "name": "get_weather", "args": { "city": "Tokyo" } }
-                    }]
-                }
-            }]
-        });
-        let anthropic_response = gemini_to_anthropic_with_shadow_and_hints(
-            turn1,
-            Some(&store),
-            Some("prov"),
-            Some("sess"),
-            None,
-        )
-        .unwrap();
-        let client_id = anthropic_response["content"][0]["id"]
-            .as_str()
-            .unwrap()
-            .to_string();
-
-        // Turn 2 — full history: assistant tool_use + tool_result.
-        let turn2_input = json!({
-            "messages": [
-                {
-                    "role": "assistant",
-                    "content": [
-                        {
-                            "type": "tool_use",
-                            "id": &client_id,
-                            "name": "get_weather",
-                            "input": { "city": "Tokyo" }
-                        }
-                    ]
-                },
-                {
-                    "role": "user",
-                    "content": [
-                        { "type": "tool_result", "tool_use_id": &client_id, "content": "sunny" }
-                    ]
-                }
-            ]
-        });
-        let result =
-            anthropic_to_gemini_with_shadow(turn2_input, Some(&store), Some("prov"), Some("sess"))
-                .expect("scenario B must resolve tool name through shadow replay");
-
-        // Shadow-replay path: `functionCall.id` is stripped for the
-        // assistant turn (the synthesized id must not leak upstream).
-        assert!(
-            result["contents"][0]["parts"][0]["functionCall"]
-                .get("id")
-                .is_none(),
-            "synthesized id must not leak to Gemini in shadow replay"
-        );
-        assert_eq!(
-            result["contents"][0]["parts"][0]["functionCall"]["name"],
-            "get_weather"
-        );
-        // The tool_result round-trip resolves through the shadow map.
-        assert_eq!(
-            result["contents"][1]["parts"][0]["functionResponse"]["name"],
-            "get_weather"
-        );
-    }
-
-    /// Regression: when Gemini returns an id, nothing is synthesized.
-    /// The original id is round-tripped in both the Anthropic response
-    /// and the shadow store, and it flows back to Gemini on the next
-    /// functionResponse.
-    #[test]
-    fn non_stream_preserves_original_gemini_id_when_present() {
-        let store = GeminiShadowStore::with_limits(8, 4);
-        let body = json!({
-            "responseId": "r-preserve",
-            "modelVersion": "gemini-2.5-pro",
-            "candidates": [{
-                "finishReason": "STOP",
-                "content": {
-                    "parts": [{
-                        "functionCall": {
-                            "id": "call_real_1",
-                            "name": "get_weather",
-                            "args": { "city": "Tokyo" }
-                        }
-                    }]
-                }
-            }]
-        });
-
-        let response = gemini_to_anthropic_with_shadow_and_hints(
-            body,
-            Some(&store),
-            Some("prov"),
-            Some("sess"),
-            None,
-        )
-        .unwrap();
-        assert_eq!(response["content"][0]["id"], "call_real_1");
-        let snapshot = store.get_session("prov", "sess").unwrap();
-        assert_eq!(
-            snapshot.turns[0].tool_calls[0].id.as_deref(),
-            Some("call_real_1")
-        );
-        assert_eq!(
-            snapshot.turns[0].assistant_content["parts"][0]["functionCall"]["id"],
-            "call_real_1"
-        );
-    }
-
-    /// Defensive: if a shadow turn somehow carries a synthesized
-    /// `functionCall.id` (e.g. recorded by this path), replaying it via
-    /// `anthropic_to_gemini_with_shadow` must strip the id before sending
-    /// upstream, so Gemini never sees the internal identifier.
-    #[test]
-    fn non_stream_synthesized_id_not_leaked_to_gemini_via_shadow_replay() {
-        let store = GeminiShadowStore::with_limits(8, 4);
-        let synth = synthesize_tool_call_id();
-        store.record_assistant_turn(
-            "prov",
-            "sess",
-            json!({
-                "parts": [{
-                    "functionCall": {
-                        "id": &synth,
-                        "name": "get_weather",
-                        "args": { "city": "Tokyo" }
-                    }
-                }]
-            }),
-            vec![GeminiToolCallMeta::new(
-                Some(synth.clone()),
-                "get_weather",
-                json!({ "city": "Tokyo" }),
-                None::<String>,
-            )],
-        );
-
-        let input = json!({
-            "messages": [
-                {
-                    "role": "assistant",
-                    "content": [
-                        {
-                            "type": "tool_use",
-                            "id": &synth,
-                            "name": "get_weather",
-                            "input": { "city": "Tokyo" }
-                        }
-                    ]
-                },
-                {
-                    "role": "user",
-                    "content": [
-                        { "type": "tool_result", "tool_use_id": &synth, "content": "sunny" }
-                    ]
-                }
-            ]
-        });
-        let result =
-            anthropic_to_gemini_with_shadow(input, Some(&store), Some("prov"), Some("sess"))
-                .unwrap();
-        assert!(
-            result["contents"][0]["parts"][0]["functionCall"]
-                .get("id")
-                .is_none(),
-            "shadow replay must strip synthesized functionCall.id"
-        );
-        assert!(
-            result["contents"][1]["parts"][0]["functionResponse"]
-                .get("id")
-                .is_none(),
-            "functionResponse.id must also be omitted for synthesized ids"
-        );
-    }
-
-    #[test]
-    fn anthropic_to_gemini_maps_structured_output_schema() {
-        let input = json!({
-            "model": "gemini-2.5-pro",
-            "max_tokens": 256,
-            "output_config": {
-                "format": {
-                    "type": "json_schema",
-                    "schema": {
-                        "type": "object",
-                        "properties": {"ok": {"type": "boolean"}},
-                        "required": ["ok"]
-                    }
-                }
-            }
-        });
-
-        let result = anthropic_to_gemini(input).unwrap();
-        assert_eq!(
-            result["generationConfig"]["responseMimeType"],
-            "application/json"
-        );
-        assert_eq!(
-            result["generationConfig"]["responseJsonSchema"]["required"],
-            json!(["ok"])
-        );
-    }
-
-    #[test]
-    fn gemini_3_parallel_calls_preserve_signatures_and_fill_missing_ones() {
-        let store = GeminiShadowStore::with_limits(8, 4);
-        let shadow_parts = json!([
-            {
-                "functionCall": {"id": "call_1", "name": "first", "args": {}},
-                "thoughtSignature": "sig-first"
-            },
-            {"functionCall": {"id": "call_2", "name": "second", "args": {}}},
-            {"functionCall": {"id": "call_3", "name": "third", "args": {}}}
-        ]);
-        let expected_parts = json!([
-            {
-                "functionCall": {"id": "call_1", "name": "first", "args": {}},
-                "thoughtSignature": "sig-first"
-            },
-            {
-                "functionCall": {"id": "call_2", "name": "second", "args": {}},
-                "thoughtSignature": GEMINI_SKIP_THOUGHT_SIGNATURE
-            },
-            {
-                "functionCall": {"id": "call_3", "name": "third", "args": {}},
-                "thoughtSignature": GEMINI_SKIP_THOUGHT_SIGNATURE
-            }
-        ]);
-        store.record_assistant_turn(
-            "prov",
-            "sess",
-            json!({"parts": shadow_parts}),
-            vec![GeminiToolCallMeta::new(
-                Some("call_1"),
-                "first",
-                json!({}),
-                Some("sig-first"),
-            )],
-        );
-
-        let input = json!({
-            "model": "gemini-3.1-pro",
-            "messages": [{
-                "role": "assistant",
-                "content": [
-                    {"type": "tool_use", "id": "call_1", "name": "first", "input": {}},
-                    {"type": "tool_use", "id": "call_2", "name": "second", "input": {}},
-                    {"type": "tool_use", "id": "call_3", "name": "third", "input": {}}
+    fn direct_request_uses_gemini_3_missing_signature_fallback() {
+        let make_request = |model: &str| {
+            let input = json!({
+                "model": model,
+                "tools": [{
+                    "type": "function",
+                    "name": "lookup",
+                    "parameters": {"type": "object", "properties": {}}
+                }],
+                "input": [
+                    {"role": "user", "content": "Look it up."},
+                    {"type": "function_call", "call_id": "call_1", "name": "lookup", "arguments": "{}"},
+                    {"type": "function_call_output", "call_id": "call_1", "output": "done"}
                 ]
-            }]
-        });
+            });
+            let tools = context(input.clone());
+            responses_to_gemini(&input, None, None, None, &tools, true, GeminiThinking::Auto)
+                .unwrap()
+                .0
+        };
 
-        let result =
-            anthropic_to_gemini_with_shadow(input, Some(&store), Some("prov"), Some("sess"))
-                .unwrap();
-
-        assert_eq!(result["contents"][0]["parts"], expected_parts);
-    }
-
-    #[test]
-    fn gemini_3_falls_back_for_every_call_while_gemini_2_stays_unchanged() {
-        let history = json!([
-            {"role": "assistant", "content": [
-                {"type": "tool_use", "id": "call_1", "name": "first", "input": {}},
-                {"type": "tool_use", "id": "call_2", "name": "second", "input": {}},
-                {"type": "tool_use", "id": "call_3", "name": "third", "input": {}}
-            ]},
-            {"role": "user", "content": [
-                {"type": "tool_result", "tool_use_id": "call_1", "content": "done"},
-                {"type": "tool_result", "tool_use_id": "call_2", "content": "done"},
-                {"type": "tool_result", "tool_use_id": "call_3", "content": "done"}
-            ]}
-        ]);
-        let gemini_3 = json!({
-            "model": "gemini-3.1-pro",
-            "messages": history.clone()
-        });
-        let result = anthropic_to_gemini(gemini_3).unwrap();
-        let parts = result["contents"][0]["parts"].as_array().unwrap();
-        assert_eq!(parts.len(), 3);
-        for part in parts {
-            assert_eq!(part["thoughtSignature"], GEMINI_SKIP_THOUGHT_SIGNATURE);
-        }
-
-        let gemini_2 = json!({"model": "gemini-2.5-pro", "messages": history});
-        let result = anthropic_to_gemini(gemini_2).unwrap();
-        for part in result["contents"][0]["parts"].as_array().unwrap() {
-            assert!(part.get("thoughtSignature").is_none());
-        }
-    }
-
-    #[test]
-    fn disabling_signature_replay_uses_fallback_for_gemini_3() {
-        let store = GeminiShadowStore::with_limits(8, 4);
-        store.record_assistant_turn(
-            "prov",
-            "sess",
-            json!({
-                "parts": [{
-                    "functionCall": {"id": "call_1", "name": "lookup", "args": {}},
-                    "thoughtSignature": "private-signature"
-                }]
-            }),
-            vec![GeminiToolCallMeta::new(
-                Some("call_1"),
-                "lookup",
-                json!({}),
-                Some("private-signature"),
-            )],
-        );
-        let input = json!({
-            "model": "gemini-3.1-pro",
-            "messages": [
-                {"role": "assistant", "content": [{
-                    "type": "tool_use", "id": "call_1", "name": "lookup", "input": {}
-                }]},
-                {"role": "user", "content": [{
-                    "type": "tool_result", "tool_use_id": "call_1", "content": "done"
-                }]}
-            ]
-        });
-
-        let result = anthropic_to_gemini_with_shadow_and_options(
-            input,
-            Some(&store),
-            Some("prov"),
-            Some("sess"),
-            false,
-        )
-        .unwrap();
+        let gemini_3 = make_request("gemini-3-pro");
         assert_eq!(
-            result["contents"][0]["parts"][0]["functionCall"]["name"],
-            "lookup"
-        );
-        assert_eq!(
-            result["contents"][1]["parts"][0]["functionResponse"]["name"],
-            "lookup"
-        );
-        assert_eq!(
-            result["contents"][0]["parts"][0]["thoughtSignature"],
+            gemini_3["contents"][1]["parts"][0]["thoughtSignature"],
             GEMINI_SKIP_THOUGHT_SIGNATURE
         );
-        assert!(!result.to_string().contains("private-signature"));
-    }
 
-    #[test]
-    fn thinking_level_support_starts_with_gemini_3() {
-        assert!(supports_gemini_thinking_level("gemini-3-pro"));
-        assert!(supports_gemini_thinking_level(
-            "google/models/gemini-4.1-pro"
-        ));
-        assert!(!supports_gemini_thinking_level("gemini-2.5-flash"));
-        assert!(!supports_gemini_thinking_level("not-gemini-3-pro"));
+        let gemini_2 = make_request("gemini-2.5-pro");
+        assert!(gemini_2["contents"][1]["parts"][0]
+            .get("thoughtSignature")
+            .is_none());
     }
 }

@@ -13,12 +13,11 @@ use crate::{
             gemini_shadow::GeminiShadowStore,
             responses_late_arguments::create_late_arguments_repair_stream,
             streaming_codex_anthropic::{
-                create_responses_sse_stream_from_anthropic_with_context,
                 create_responses_sse_stream_from_anthropic_with_history,
                 responses_sse_events_from_anthropic_message,
             },
             streaming_codex_chat::create_responses_sse_stream_from_chat_with_context,
-            streaming_gemini::create_anthropic_sse_stream_from_gemini,
+            streaming_gemini::create_responses_sse_stream_from_gemini,
             transform_codex_anthropic,
             transform_codex_chat::{self, CodexToolContext},
             transform_codex_responses_namespace::{restore_response_namespaces, NamespacedName},
@@ -48,7 +47,7 @@ pub(crate) struct ResponseOptions {
     pub gemini_provider_id: Option<String>,
     pub gemini_session_id: Option<String>,
     pub gemini_tool_schema_hints:
-        Option<crate::proxy::providers::transform_gemini::AnthropicToolSchemaHints>,
+        Option<crate::proxy::providers::transform_gemini::GeminiToolSchemaHints>,
 }
 const MAX_RESPONSE_BODY_BYTES: usize = 128 * 1024 * 1024;
 
@@ -181,17 +180,16 @@ pub(crate) async fn handle(
         return Ok(build(status, headers, Body::from(bytes), false));
     }
     if protocol == Protocol::GeminiNative && status.is_success() && is_sse {
-        let gemini_stream = create_anthropic_sse_stream_from_gemini(
+        let responses_stream = create_responses_sse_stream_from_gemini(
             upstream.bytes_stream(),
             Some(gemini_shadow),
             options.gemini_provider_id.clone(),
             options.gemini_session_id.clone(),
             options.gemini_tool_schema_hints.clone(),
+            context,
+            options.model.clone(),
         );
-        let anthropic_stream = repair_anthropic_sse_tail(gemini_stream);
-        return Ok(sse_response(Body::from_stream(
-            create_responses_sse_stream_from_anthropic_with_context(anthropic_stream, context),
-        )));
+        return Ok(sse_response(Body::from_stream(responses_stream)));
     }
     if !status.is_success() {
         let (headers, status, bytes) = decode_response(upstream).await?;
@@ -226,30 +224,31 @@ pub(crate) async fn handle(
                 &text,
             )
         })?;
-        let mut anthropic =
-            crate::proxy::providers::transform_gemini::gemini_to_anthropic_with_shadow_and_hints(
-                value,
-                Some(&gemini_shadow),
-                options.gemini_provider_id.as_deref(),
-                options.gemini_session_id.as_deref(),
-                options.gemini_tool_schema_hints.as_ref(),
-            )?;
-        if anthropic
+        let response = crate::proxy::providers::transform_gemini::gemini_to_responses(
+            value,
+            Some(&gemini_shadow),
+            options.gemini_provider_id.as_deref(),
+            options.gemini_session_id.as_deref(),
+            &context,
+            options.gemini_tool_schema_hints.as_ref(),
+        )?;
+        let mut response = response;
+        if response
             .get("model")
             .and_then(Value::as_str)
             .is_none_or(str::is_empty)
         {
-            anthropic["model"] = serde_json::json!(options.model);
+            response["model"] = serde_json::json!(options.model);
         }
         if options.streaming {
-            let events = responses_sse_events_from_anthropic_message(&anthropic, context);
+            let events =
+                crate::proxy::providers::streaming_gemini::responses_sse_events_from_gemini_response(
+                    &response, &context,
+                );
             return Ok(sse_response(Body::from_stream(futures::stream::iter(
                 events.into_iter().map(Ok::<Bytes, std::io::Error>),
             ))));
         }
-        let response = transform_codex_anthropic::anthropic_response_to_responses_with_context(
-            anthropic, &context,
-        )?;
         return json_response(status, headers, &response);
     }
     if (protocol == Protocol::ChatCompletions && (options.streaming || is_sse))
