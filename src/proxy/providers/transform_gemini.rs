@@ -559,13 +559,9 @@ fn convert_messages_to_contents(
         };
 
         if role == "assistant" && requires_thought_signatures {
-            if let Some(first_function_call_index) = parts
-                .iter()
-                .position(|part| part.get("functionCall").is_some())
-            {
-                if !has_thought_signature(&parts[first_function_call_index]) {
-                    parts[first_function_call_index]["thoughtSignature"] =
-                        json!(GEMINI_SKIP_THOUGHT_SIGNATURE);
+            for part in &mut parts {
+                if part.get("functionCall").is_some() && !has_thought_signature(part) {
+                    part["thoughtSignature"] = json!(GEMINI_SKIP_THOUGHT_SIGNATURE);
                 }
             }
         }
@@ -2918,9 +2914,9 @@ mod tests {
     }
 
     #[test]
-    fn gemini_3_parallel_calls_only_require_first_call_signature() {
+    fn gemini_3_parallel_calls_preserve_signatures_and_fill_missing_ones() {
         let store = GeminiShadowStore::with_limits(8, 4);
-        let expected_parts = json!([
+        let shadow_parts = json!([
             {
                 "functionCall": {"id": "call_1", "name": "first", "args": {}},
                 "thoughtSignature": "sig-first"
@@ -2928,10 +2924,24 @@ mod tests {
             {"functionCall": {"id": "call_2", "name": "second", "args": {}}},
             {"functionCall": {"id": "call_3", "name": "third", "args": {}}}
         ]);
+        let expected_parts = json!([
+            {
+                "functionCall": {"id": "call_1", "name": "first", "args": {}},
+                "thoughtSignature": "sig-first"
+            },
+            {
+                "functionCall": {"id": "call_2", "name": "second", "args": {}},
+                "thoughtSignature": GEMINI_SKIP_THOUGHT_SIGNATURE
+            },
+            {
+                "functionCall": {"id": "call_3", "name": "third", "args": {}},
+                "thoughtSignature": GEMINI_SKIP_THOUGHT_SIGNATURE
+            }
+        ]);
         store.record_assistant_turn(
             "prov",
             "sess",
-            json!({"parts": expected_parts.clone()}),
+            json!({"parts": shadow_parts}),
             vec![GeminiToolCallMeta::new(
                 Some("call_1"),
                 "first",
@@ -2960,7 +2970,7 @@ mod tests {
     }
 
     #[test]
-    fn gemini_3_falls_back_only_for_first_call_while_gemini_2_stays_unchanged() {
+    fn gemini_3_falls_back_for_every_call_while_gemini_2_stays_unchanged() {
         let history = json!([
             {"role": "assistant", "content": [
                 {"type": "tool_use", "id": "call_1", "name": "first", "input": {}},
@@ -2979,9 +2989,10 @@ mod tests {
         });
         let result = anthropic_to_gemini(gemini_3).unwrap();
         let parts = result["contents"][0]["parts"].as_array().unwrap();
-        assert_eq!(parts[0]["thoughtSignature"], GEMINI_SKIP_THOUGHT_SIGNATURE);
-        assert!(parts[1].get("thoughtSignature").is_none());
-        assert!(parts[2].get("thoughtSignature").is_none());
+        assert_eq!(parts.len(), 3);
+        for part in parts {
+            assert_eq!(part["thoughtSignature"], GEMINI_SKIP_THOUGHT_SIGNATURE);
+        }
 
         let gemini_2 = json!({"model": "gemini-2.5-pro", "messages": history});
         let result = anthropic_to_gemini(gemini_2).unwrap();
