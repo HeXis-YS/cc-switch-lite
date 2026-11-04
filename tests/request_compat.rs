@@ -200,16 +200,53 @@ async fn anthropic_web_search_compat_can_be_disabled_without_leaking_to_gemini()
     assert!(disabled.body.get("tools").is_none());
     assert!(disabled.body.get("tool_choice").is_none());
 
+    let mut gemini_provider = provider(Protocol::GeminiNative, "https://example.test/v1");
     let native_gemini = prepare(
-        input,
-        &provider(Protocol::GeminiNative, "https://example.test/v1"),
+        json!({
+            "model": "gemini-3-pro",
+            "input": "Search for current information.",
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "lookup",
+                    "parameters": { "type": "object", "properties": { "q": { "type": "string" } } }
+                },
+                {
+                    "type": "web_search",
+                    "external_web_access": true,
+                    "filters": { "allowed_domains": ["example.com"] }
+                }
+            ],
+            "tool_choice": "auto"
+        }),
+        &gemini_provider,
         &HeaderMap::new(),
         &CompatConfig::default(),
         &CodexChatHistoryStore::default(),
     )
     .await
     .unwrap();
-    assert!(native_gemini.body.get("tools").is_none());
+    assert_eq!(
+        native_gemini.body["tools"][0]["functionDeclarations"][0]["name"],
+        "lookup"
+    );
+    assert_eq!(
+        native_gemini.body["tools"][1],
+        json!({ "googleSearch": {} })
+    );
+
+    gemini_provider.compat.web_search = WebSearchCompat::Off;
+    let disabled_gemini = prepare(
+        input,
+        &gemini_provider,
+        &HeaderMap::new(),
+        &CompatConfig::default(),
+        &CodexChatHistoryStore::default(),
+    )
+    .await
+    .unwrap();
+    assert!(disabled_gemini.body.get("tools").is_none());
+    assert!(disabled_gemini.body.get("toolConfig").is_none());
 }
 
 #[tokio::test]

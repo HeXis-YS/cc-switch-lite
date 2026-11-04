@@ -255,6 +255,9 @@ pub fn create_anthropic_sse_stream_from_gemini<E: std::error::Error + Send + 'st
         let mut next_content_index: u32 = 0;
         let mut open_indices: HashSet<u32> = HashSet::new();
         let mut tool_call_snapshots: Vec<GeminiToolCallMeta> = Vec::new();
+        let mut seen_web_search_queries: HashSet<String> = HashSet::new();
+        let mut pending_web_search_queries: Vec<(String, String)> = Vec::new();
+        let mut next_web_search_index: usize = 0;
         let mut text_thought_signature: Option<String> = None;
         let mut latest_usage: Option<Value> = None;
         let mut latest_finish_reason: Option<String> = None;
@@ -344,6 +347,40 @@ pub fn create_anthropic_sse_stream_from_gemini<E: std::error::Error + Send + 'st
                             }
                             if let Some(usage) = chunk_json.get("usageMetadata") {
                                 latest_usage = Some(usage.clone());
+                            }
+                            if blocked_text.is_none() {
+                                for query in super::transform_gemini::extract_gemini_web_search_queries(candidate) {
+                                    if !seen_web_search_queries.insert(query.clone()) {
+                                        continue;
+                                    }
+                                    let call_id = super::transform_gemini::gemini_web_search_call_id(
+                                        message_id.as_deref(),
+                                        next_web_search_index,
+                                    );
+                                    next_web_search_index += 1;
+                                    if text_block_index.is_none() {
+                                        let index = next_content_index;
+                                        next_content_index += 1;
+                                        let start_event = json!({
+                                            "type": "content_block_start",
+                                            "index": index,
+                                            "content_block": {
+                                                "type": "server_tool_use",
+                                                "id": call_id,
+                                                "name": "web_search",
+                                                "input": { "query": query }
+                                            }
+                                        });
+                                        yield Ok(encode_sse("content_block_start", &start_event));
+                                        let stop_event = json!({
+                                            "type": "content_block_stop",
+                                            "index": index
+                                        });
+                                        yield Ok(encode_sse("content_block_stop", &stop_event));
+                                    } else {
+                                        pending_web_search_queries.push((call_id, query));
+                                    }
+                                }
                             }
                             if let Some(parts) = candidate
                                 .get("content")
@@ -464,6 +501,29 @@ pub fn create_anthropic_sse_stream_from_gemini<E: std::error::Error + Send + 'st
 
         if let Some(index) = text_block_index {
             if open_indices.remove(&index) {
+                let stop_event = json!({
+                    "type": "content_block_stop",
+                    "index": index
+                });
+                yield Ok(encode_sse("content_block_stop", &stop_event));
+            }
+        }
+
+        if blocked_text.is_none() {
+            for (call_id, query) in pending_web_search_queries {
+                let index = next_content_index;
+                next_content_index += 1;
+                let start_event = json!({
+                    "type": "content_block_start",
+                    "index": index,
+                    "content_block": {
+                        "type": "server_tool_use",
+                        "id": call_id,
+                        "name": "web_search",
+                        "input": { "query": query }
+                    }
+                });
+                yield Ok(encode_sse("content_block_start", &start_event));
                 let stop_event = json!({
                     "type": "content_block_stop",
                     "index": index

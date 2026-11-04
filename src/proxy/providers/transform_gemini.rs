@@ -107,30 +107,46 @@ pub fn anthropic_to_gemini_with_shadow_and_options(
         result["generationConfig"] = generation_config;
     }
 
+    let mut has_function_declarations = false;
+    let mut has_web_search = false;
     if let Some(tools) = body.get("tools").and_then(|value| value.as_array()) {
-        let function_declarations: Vec<Value> = tools
-            .iter()
-            .filter(|tool| tool.get("type").and_then(|value| value.as_str()) != Some("BatchTool"))
-            .map(|tool| {
-                build_gemini_function_declaration(
-                    tool.get("name")
-                        .and_then(|value| value.as_str())
-                        .unwrap_or(""),
-                    tool.get("description").and_then(|value| value.as_str()),
-                    tool.get("input_schema")
-                        .cloned()
-                        .unwrap_or_else(|| json!({})),
-                )
-            })
-            .collect();
+        let mut function_declarations = Vec::new();
+        for tool in tools {
+            if tool.get("type").and_then(Value::as_str) == Some("BatchTool") {
+                continue;
+            }
+            if is_anthropic_web_search_tool(tool) {
+                has_web_search = true;
+                continue;
+            }
+            function_declarations.push(build_gemini_function_declaration(
+                tool.get("name")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or(""),
+                tool.get("description").and_then(|value| value.as_str()),
+                tool.get("input_schema")
+                    .cloned()
+                    .unwrap_or_else(|| json!({})),
+            ));
+        }
 
+        has_function_declarations = !function_declarations.is_empty();
+        let mut gemini_tools = Vec::new();
         if !function_declarations.is_empty() {
-            result["tools"] = json!([{ "functionDeclarations": function_declarations }]);
+            gemini_tools.push(json!({ "functionDeclarations": function_declarations }));
+        }
+        if has_web_search {
+            gemini_tools.push(json!({ "googleSearch": {} }));
+        }
+        if !gemini_tools.is_empty() {
+            result["tools"] = Value::Array(gemini_tools);
         }
     }
 
-    if let Some(tool_config) = map_tool_choice(body.get("tool_choice"))? {
-        result["toolConfig"] = tool_config;
+    if !has_web_search || has_function_declarations {
+        if let Some(tool_config) = map_tool_choice(body.get("tool_choice"))? {
+            result["toolConfig"] = tool_config;
+        }
     }
 
     Ok(result)
@@ -229,8 +245,21 @@ pub fn gemini_to_anthropic_with_shadow_and_hints(
         }
     }
 
+    let response_id = body.get("responseId").and_then(Value::as_str);
     let mut content = Vec::new();
     let mut has_tool_use = false;
+
+    for (index, query) in extract_gemini_web_search_queries(candidate)
+        .into_iter()
+        .enumerate()
+    {
+        content.push(json!({
+            "type": "server_tool_use",
+            "id": gemini_web_search_call_id(response_id, index),
+            "name": "web_search",
+            "input": { "query": query }
+        }));
+    }
 
     for part in &rectified_parts {
         if part.get("thought").and_then(|value| value.as_bool()) == Some(true) {
@@ -899,6 +928,33 @@ fn plan_gemini_tool_result(content: Option<&Value>) -> (Value, Vec<Value>) {
     );
 
     (normalize_tool_result_response(Some(&cleaned)), gemini_parts)
+}
+
+fn is_anthropic_web_search_tool(tool: &Value) -> bool {
+    tool.get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|tool_type| tool_type == "web_search" || tool_type.starts_with("web_search_"))
+}
+
+pub(crate) fn extract_gemini_web_search_queries(candidate: &Value) -> Vec<String> {
+    candidate
+        .get("groundingMetadata")
+        .and_then(|metadata| metadata.get("webSearchQueries"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::trim)
+        .filter(|query| !query.is_empty())
+        .map(ToString::to_string)
+        .collect()
+}
+
+pub(crate) fn gemini_web_search_call_id(response_id: Option<&str>, index: usize) -> String {
+    match response_id.map(str::trim).filter(|id| !id.is_empty()) {
+        Some(id) => format!("{id}_search_{index}"),
+        None => format!("gemini_search_{}_{index}", uuid::Uuid::new_v4().simple()),
+    }
 }
 
 fn is_gemini_3_series(model: &str) -> bool {

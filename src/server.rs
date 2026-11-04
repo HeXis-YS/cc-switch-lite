@@ -170,8 +170,10 @@ async fn forward(
     query: Option<&str>,
 ) -> Result<Response, ProxyError> {
     let mut retried = false;
-    let accept_web_search =
-        provider.protocol == Protocol::Messages && provider.compat.web_search.is_enabled();
+    let accept_web_search = matches!(
+        provider.protocol,
+        Protocol::Messages | Protocol::GeminiNative
+    ) && provider.compat.web_search.is_enabled();
     let context = build_codex_tool_context_from_request_with_web_search(
         &input,
         accept_web_search,

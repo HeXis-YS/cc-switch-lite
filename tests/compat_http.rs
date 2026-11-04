@@ -1244,3 +1244,86 @@ async fn anthropic_hosted_web_search_replays_raw_blocks_in_the_next_turn() {
     );
     assert_eq!(assistant["content"][2]["text"], "It is sunny.");
 }
+
+#[tokio::test]
+async fn gemini_native_web_search_maps_grounding_queries_and_skips_history_replay() {
+    let fixture = Fixture::new(
+        Protocol::GeminiNative,
+        vec![
+            Reply::json(
+                StatusCode::OK,
+                json!({
+                    "responseId": "gem_resp_1",
+                    "modelVersion": "gemini-3-pro",
+                    "candidates": [{
+                        "content": {
+                            "role": "model",
+                            "parts": [{"text": "Rust 1.90 is out."}]
+                        },
+                        "finishReason": "STOP",
+                        "groundingMetadata": {
+                            "webSearchQueries": ["rust latest release"]
+                        }
+                    }],
+                    "usageMetadata": {"promptTokenCount": 6, "candidatesTokenCount": 4, "totalTokenCount": 10}
+                }),
+            ),
+            Reply::sse(vec![
+                "data: {\"responseId\":\"gem_resp_2\",\"modelVersion\":\"gemini-3-pro\",\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"Details: \"}]}}],\"usageMetadata\":{\"promptTokenCount\":10,\"totalTokenCount\":12}}\n\n",
+                "data: {\"responseId\":\"gem_resp_2\",\"modelVersion\":\"gemini-3-pro\",\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"Details: edition 2024.\"}]},\"finishReason\":\"STOP\",\"groundingMetadata\":{\"webSearchQueries\":[\"rust 1.90 release notes\",\"rust 1.90 release notes\"]}}],\"usageMetadata\":{\"promptTokenCount\":10,\"candidatesTokenCount\":6,\"totalTokenCount\":16}}\n\n",
+            ]),
+        ],
+        |_| {},
+    )
+    .await;
+
+    let first = fixture
+        .send(json!({
+            "model": "gemini-3-pro",
+            "stream": false,
+            "input": "What is the latest Rust release?",
+            "tools": [{"type": "web_search", "external_web_access": true}]
+        }))
+        .await;
+    assert_eq!(first.status(), StatusCode::OK);
+    let first: Value = first.json().await.unwrap();
+    assert_eq!(first["output"][0]["type"], "web_search_call");
+    assert_eq!(first["output"][0]["id"], "ws_gem_resp_1_search_0");
+    assert_eq!(first["output"][0]["status"], "completed");
+    assert_eq!(
+        first["output"][0]["action"],
+        json!({"type": "search", "query": "rust latest release"})
+    );
+    assert_eq!(first["output"][1]["type"], "message");
+    assert_eq!(
+        first["output"][1]["content"][0]["text"],
+        "Rust 1.90 is out."
+    );
+
+    let second = fixture
+        .send(json!({
+            "model": "gemini-3-pro",
+            "stream": true,
+            "input": [
+                {"type": "message", "role": "user", "content": "What is the latest Rust release?"},
+                {"type": "web_search_call", "id": "ws_gem_resp_1_search_0", "status": "completed", "action": {"type": "search", "query": "rust latest release"}},
+                {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "Rust 1.90 is out."}]},
+                {"type": "message", "role": "user", "content": "Check the release notes."}
+            ],
+            "tools": [{"type": "web_search"}]
+        }))
+        .await;
+    assert_eq!(second.status(), StatusCode::OK);
+    let stream_text = second.text().await.unwrap();
+    assert!(stream_text.contains("\"type\":\"web_search_call\""));
+    assert!(stream_text.contains("\"id\":\"ws_gem_resp_2_search_0\""));
+    assert!(stream_text.contains("\"query\":\"rust 1.90 release notes\""));
+    assert!(stream_text.contains("Details: edition 2024."));
+
+    let calls = fixture.mock.calls.lock().await;
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[0]["tools"], json!([{"googleSearch": {}}]));
+    assert!(calls[0].get("toolConfig").is_none());
+    assert_eq!(calls[1]["tools"], json!([{"googleSearch": {}}]));
+    assert_eq!(calls[1]["contents"].as_array().unwrap().len(), 3);
+}

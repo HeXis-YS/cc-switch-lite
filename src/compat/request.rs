@@ -341,12 +341,13 @@ pub(crate) async fn prepare_attempt(
                 .pointer("/reasoning/effort")
                 .and_then(Value::as_str)
                 .map(ToOwned::to_owned);
-            let tool_context =
+            let mut tool_context =
                 providers::transform_codex_chat::build_codex_tool_context_from_request_with_web_search(
                     &input,
-                    false,
+                    provider.compat.web_search.is_enabled(),
                     Some(provider.id.clone()),
                 );
+            mark_gemini_web_search_history_unavailable(&input, &mut tool_context);
             let anthropic =
                 providers::transform_codex_anthropic::responses_request_to_anthropic_with_context(
                     input.clone(),
@@ -500,6 +501,27 @@ async fn attach_anthropic_web_search_history(
                 tool_context.mark_web_search_shadow_unavailable(response_item_id.to_string());
                 log::warn!("[Codex/Anthropic] Dropping historical web_search_call cached for a different Provider");
             }
+        }
+    }
+}
+
+fn mark_gemini_web_search_history_unavailable(input: &Value, tool_context: &mut CodexToolContext) {
+    if !tool_context.accepts_web_search() || tool_context.is_compaction_request() {
+        return;
+    }
+    let Some(items) = input.get("input").and_then(Value::as_array) else {
+        return;
+    };
+    for item in items {
+        if item.get("type").and_then(Value::as_str) != Some("web_search_call") {
+            continue;
+        }
+        if let Some(response_item_id) = item
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+        {
+            tool_context.mark_web_search_shadow_unavailable(response_item_id.to_string());
         }
     }
 }
