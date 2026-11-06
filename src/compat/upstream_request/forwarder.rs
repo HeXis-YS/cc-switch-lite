@@ -62,8 +62,6 @@ pub(super) fn endpoint_shape(
         Protocol::Responses => false,
         Protocol::ChatCompletions => base_url_is_full_endpoint(base_url, "/chat/completions"),
         Protocol::Messages => base_url_is_full_endpoint(base_url, "/v1/messages"),
-        // Gemini URLs are model- and stream-aware and are resolved by build_context.
-        Protocol::GeminiNative => false,
     };
 
     if is_full_url || automatically_full {
@@ -78,8 +76,6 @@ pub(super) fn effective_endpoint(protocol: Protocol, query: Option<&str>) -> Str
         Protocol::Responses => "/responses",
         Protocol::ChatCompletions => "/chat/completions",
         Protocol::Messages => "/v1/messages",
-        // Gemini URLs are model- and stream-aware and are resolved by build_context.
-        Protocol::GeminiNative => "/v1beta/models",
     };
     match query {
         Some(query) if !query.is_empty() => format!("{endpoint}?{query}"),
@@ -391,38 +387,6 @@ pub(super) fn conversation_fingerprint(body: &Value) -> Option<String> {
         })
     {
         hasher.update(without_cache_control(first_user).to_string().as_bytes());
-        fed = true;
-    }
-    if !fed {
-        return None;
-    }
-    let digest = format!("{:x}", hasher.finalize());
-    Some(format!("ccsw-{}", &digest[..32]))
-}
-
-/// Responses input has a different shape from Anthropic Messages history.
-/// Keep this fingerprint isolated to the Gemini Responses bridge so the
-/// existing session identity of Messages clients remains byte-for-byte stable.
-pub(super) fn gemini_conversation_fingerprint(body: &Value) -> Option<String> {
-    let mut hasher = Sha256::new();
-    let mut fed = false;
-    if let Some(system) = body.get("instructions").or_else(|| body.get("system")) {
-        hasher.update(without_cache_control(system).to_string().as_bytes());
-        fed = true;
-    }
-    if let Some(first_user) = body
-        .get("input")
-        .and_then(Value::as_array)
-        .and_then(|items| {
-            items
-                .iter()
-                .find(|item| item.get("role").and_then(Value::as_str) == Some("user"))
-        })
-    {
-        hasher.update(without_cache_control(first_user).to_string().as_bytes());
-        fed = true;
-    } else if let Some(input) = body.get("input").and_then(Value::as_str) {
-        hasher.update(input.as_bytes());
         fed = true;
     }
     if !fed {
@@ -862,41 +826,6 @@ mod tests {
             conversation_fingerprint(&first),
             conversation_fingerprint(&later),
             "cache_control placement must not change the session id"
-        );
-    }
-
-    #[test]
-    fn responses_conversation_fingerprint_uses_first_user_input() {
-        let first = json!({
-            "model": "gemini-3-pro",
-            "instructions": "Be concise",
-            "input": [
-                {"role": "user", "content": [{"type": "input_text", "text": "Find the answer"}]},
-                {"type": "function_call", "call_id": "call_1", "name": "lookup", "arguments": "{}"}
-            ]
-        });
-        let later = json!({
-            "model": "gemini-3-pro",
-            "instructions": "Be concise",
-            "input": [
-                {"role": "user", "content": [{"type": "input_text", "text": "Find the answer"}]},
-                {"type": "function_call", "call_id": "call_1", "name": "lookup", "arguments": "{}"},
-                {"type": "function_call_output", "call_id": "call_1", "output": "found"}
-            ]
-        });
-        let other = json!({
-            "model": "gemini-3-pro",
-            "instructions": "Be concise",
-            "input": [{"role": "user", "content": [{"type": "input_text", "text": "Different request"}]}]
-        });
-
-        assert_eq!(
-            gemini_conversation_fingerprint(&first),
-            gemini_conversation_fingerprint(&later)
-        );
-        assert_ne!(
-            gemini_conversation_fingerprint(&first),
-            gemini_conversation_fingerprint(&other)
         );
     }
 

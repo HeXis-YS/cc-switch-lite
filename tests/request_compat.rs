@@ -28,7 +28,6 @@ async fn codex_output_schema_survives_protocol_preparation() {
     for protocol in [
         Protocol::ChatCompletions,
         Protocol::Messages,
-        Protocol::GeminiNative,
         Protocol::Responses,
     ] {
         let input = json!({"model":"claude-opus-4-6","input":"Return the answer",
@@ -54,13 +53,6 @@ async fn codex_output_schema_survives_protocol_preparation() {
                 );
                 assert_eq!(out.body["output_config"]["effort"], "high");
             }
-            Protocol::GeminiNative => {
-                assert_eq!(
-                    out.body["generationConfig"]["responseMimeType"],
-                    "application/json"
-                );
-                assert_eq!(out.body["generationConfig"]["responseJsonSchema"], schema);
-            }
             Protocol::Responses => assert_eq!(out.body["text"]["format"], format),
         }
     }
@@ -79,11 +71,7 @@ async fn codex_output_schema_survives_protocol_preparation() {
 
 #[tokio::test]
 async fn output_formats_are_mapped_or_rejected_before_forwarding() {
-    for protocol in [
-        Protocol::ChatCompletions,
-        Protocol::Messages,
-        Protocol::GeminiNative,
-    ] {
+    for protocol in [Protocol::ChatCompletions, Protocol::Messages] {
         for format in [
             json!({"type":"unknown"}),
             json!({"type":"json_schema","schema":null}),
@@ -167,7 +155,7 @@ async fn anthropic_default_budget_preserves_explicit_client_limit() {
 }
 
 #[tokio::test]
-async fn anthropic_web_search_compat_can_be_disabled_without_leaking_to_gemini() {
+async fn anthropic_web_search_compat_can_be_disabled() {
     let input = json!({
         "model": "claude-sonnet-5",
         "input": "Search for current information.",
@@ -199,54 +187,6 @@ async fn anthropic_web_search_compat_can_be_disabled_without_leaking_to_gemini()
     .unwrap();
     assert!(disabled.body.get("tools").is_none());
     assert!(disabled.body.get("tool_choice").is_none());
-
-    let mut gemini_provider = provider(Protocol::GeminiNative, "https://example.test/v1");
-    let native_gemini = prepare(
-        json!({
-            "model": "gemini-3-pro",
-            "input": "Search for current information.",
-            "tools": [
-                {
-                    "type": "function",
-                    "name": "lookup",
-                    "parameters": { "type": "object", "properties": { "q": { "type": "string" } } }
-                },
-                {
-                    "type": "web_search",
-                    "external_web_access": true,
-                    "filters": { "allowed_domains": ["example.com"] }
-                }
-            ],
-            "tool_choice": "auto"
-        }),
-        &gemini_provider,
-        &HeaderMap::new(),
-        &CompatConfig::default(),
-        &CodexChatHistoryStore::default(),
-    )
-    .await
-    .unwrap();
-    assert_eq!(
-        native_gemini.body["tools"][0]["functionDeclarations"][0]["name"],
-        "lookup"
-    );
-    assert_eq!(
-        native_gemini.body["tools"][1],
-        json!({ "googleSearch": {} })
-    );
-
-    gemini_provider.compat.web_search = WebSearchCompat::Off;
-    let disabled_gemini = prepare(
-        input,
-        &gemini_provider,
-        &HeaderMap::new(),
-        &CompatConfig::default(),
-        &CodexChatHistoryStore::default(),
-    )
-    .await
-    .unwrap();
-    assert!(disabled_gemini.body.get("tools").is_none());
-    assert!(disabled_gemini.body.get("toolConfig").is_none());
 }
 
 #[tokio::test]

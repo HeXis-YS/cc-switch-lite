@@ -32,8 +32,6 @@ pub struct ProviderCompat {
     pub meta: CompatMeta,
     #[serde(default = "empty_object")]
     pub settings_config: Value,
-    #[serde(default, skip_serializing_if = "GeminiCompat::is_default")]
-    pub gemini: GeminiCompat,
     #[serde(default, skip_serializing_if = "WebSearchCompat::is_auto")]
     pub web_search: WebSearchCompat,
 }
@@ -56,42 +54,11 @@ impl WebSearchCompat {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum GeminiThinking {
-    #[default]
-    Auto,
-    Off,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct GeminiCompat {
-    pub thought_signature_replay: bool,
-    pub thinking: GeminiThinking,
-}
-
-impl Default for GeminiCompat {
-    fn default() -> Self {
-        Self {
-            thought_signature_replay: true,
-            thinking: GeminiThinking::Auto,
-        }
-    }
-}
-
-impl GeminiCompat {
-    fn is_default(&self) -> bool {
-        self == &Self::default()
-    }
-}
-
 impl Default for ProviderCompat {
     fn default() -> Self {
         Self {
             meta: CompatMeta::default(),
             settings_config: empty_object(),
-            gemini: GeminiCompat::default(),
             web_search: WebSearchCompat::default(),
         }
     }
@@ -106,7 +73,6 @@ pub fn upstream_provider(provider: &Provider) -> crate::provider::Provider {
         Protocol::Responses => "responses",
         Protocol::ChatCompletions => "chat",
         Protocol::Messages => "anthropic",
-        Protocol::GeminiNative => "gemini",
     };
     settings["config"] = json!(format!(
         "base_url = {}\nwire_api = {}\n",

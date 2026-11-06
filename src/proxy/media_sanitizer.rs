@@ -44,9 +44,7 @@ pub fn replace_images_for_text_only_model(
 }
 
 pub fn contains_image_blocks(body: &Value) -> bool {
-    messages_have_image_blocks(body)
-        || responses_input_has_image_blocks(body.get("input"))
-        || gemini_contents_have_image_blocks(body)
+    messages_have_image_blocks(body) || responses_input_has_image_blocks(body.get("input"))
 }
 
 pub fn replace_image_blocks_with_marker(body: &mut Value) -> usize {
@@ -145,7 +143,6 @@ fn replace_images_in_body(body: &mut Value) -> usize {
             .get_mut("input")
             .map(replace_images_in_responses_input)
             .unwrap_or(0)
-        + replace_images_in_gemini_contents(body)
 }
 
 fn replace_images_in_message(message: &mut Value) -> usize {
@@ -238,99 +235,6 @@ fn messages_have_image_blocks(body: &Value) -> bool {
                         && tool_output_contains_media(content, ToolMediaScope::ImagesOnly))
             })
         })
-}
-
-fn gemini_contents_have_image_blocks(body: &Value) -> bool {
-    body.get("contents")
-        .and_then(Value::as_array)
-        .is_some_and(|contents| {
-            contents.iter().any(|content| {
-                content
-                    .get("parts")
-                    .and_then(Value::as_array)
-                    .is_some_and(|parts| parts.iter().any(gemini_part_has_image))
-            })
-        })
-}
-
-fn gemini_part_has_image(part: &Value) -> bool {
-    gemini_media_payload_is_image(part.get("inlineData").or_else(|| part.get("inline_data")))
-        || gemini_media_payload_is_image(part.get("fileData").or_else(|| part.get("file_data")))
-        || part
-            .get("functionResponse")
-            .or_else(|| part.get("function_response"))
-            .and_then(|response| response.get("parts"))
-            .and_then(Value::as_array)
-            .is_some_and(|parts| parts.iter().any(gemini_part_has_image))
-}
-
-fn gemini_media_payload_is_image(payload: Option<&Value>) -> bool {
-    payload
-        .and_then(|payload| payload.get("mimeType").or_else(|| payload.get("mime_type")))
-        .and_then(Value::as_str)
-        .is_some_and(|mime_type| {
-            mime_type
-                .get(..6)
-                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("image/"))
-        })
-}
-
-fn replace_images_in_gemini_contents(body: &mut Value) -> usize {
-    body.get_mut("contents")
-        .and_then(Value::as_array_mut)
-        .map(|contents| {
-            contents
-                .iter_mut()
-                .filter_map(|content| content.get_mut("parts").and_then(Value::as_array_mut))
-                .map(|parts| {
-                    parts
-                        .iter_mut()
-                        .map(replace_images_in_gemini_part)
-                        .sum::<usize>()
-                })
-                .sum()
-        })
-        .unwrap_or(0)
-}
-
-fn replace_images_in_gemini_part(part: &mut Value) -> usize {
-    if gemini_media_payload_is_image(part.get("inlineData").or_else(|| part.get("inline_data")))
-        || gemini_media_payload_is_image(part.get("fileData").or_else(|| part.get("file_data")))
-    {
-        *part = json!({"text":UNSUPPORTED_IMAGE_MARKER});
-        return 1;
-    }
-
-    let response_key = if part.get("functionResponse").is_some() {
-        "functionResponse"
-    } else {
-        "function_response"
-    };
-    let Some(function_response) = part.get_mut(response_key) else {
-        return 0;
-    };
-    let Some(media_parts) = function_response
-        .get_mut("parts")
-        .and_then(Value::as_array_mut)
-    else {
-        return 0;
-    };
-
-    let before = media_parts.len();
-    media_parts.retain(|media_part| !gemini_part_has_image(media_part));
-    let replaced = before.saturating_sub(media_parts.len());
-    if replaced > 0 {
-        if let Some(response) = function_response
-            .get_mut("response")
-            .and_then(Value::as_object_mut)
-        {
-            response.insert(
-                "cc_switch_media".to_string(),
-                Value::String(UNSUPPORTED_IMAGE_MARKER.to_string()),
-            );
-        }
-    }
-    replaced
 }
 
 fn responses_input_has_image_blocks(input: Option<&Value>) -> bool {
@@ -1079,74 +983,6 @@ mod tests {
         assert_eq!(replaced, 1);
         assert!(rewritten.contains(UNSUPPORTED_IMAGE_MARKER));
         assert!(!rewritten.contains("STRINGIFIED_CHAT_TOOL_SENTINEL"));
-    }
-
-    #[test]
-    fn detects_and_replaces_gemini_native_image_parts() {
-        let mut body = json!({
-            "contents": [{
-                "role": "user",
-                "parts": [
-                    {
-                        "functionResponse": {
-                            "name": "inspect",
-                            "response": {"content": "done"}
-                        }
-                    },
-                    {
-                        "inlineData": {
-                            "mimeType": "image/png",
-                            "data": "GEMINI_INLINE_SENTINEL"
-                        }
-                    }
-                ]
-            }]
-        });
-
-        assert!(contains_image_blocks(&body));
-        let replaced = replace_image_blocks_with_marker(&mut body);
-
-        assert_eq!(replaced, 1);
-        assert_eq!(
-            body["contents"][0]["parts"][1]["text"],
-            UNSUPPORTED_IMAGE_MARKER
-        );
-        assert!(!body.to_string().contains("GEMINI_INLINE_SENTINEL"));
-    }
-
-    #[test]
-    fn detects_and_removes_nested_gemini_function_response_media() {
-        let mut body = json!({
-            "contents": [{
-                "role": "user",
-                "parts": [{
-                    "functionResponse": {
-                        "name": "inspect",
-                        "response": {"content": "done"},
-                        "parts": [{
-                            "inlineData": {
-                                "mimeType": "image/webp",
-                                "data": "GEMINI_FUNCTION_SENTINEL"
-                            }
-                        }]
-                    }
-                }]
-            }]
-        });
-
-        assert!(contains_image_blocks(&body));
-        let replaced = replace_image_blocks_with_marker(&mut body);
-
-        assert_eq!(replaced, 1);
-        assert!(body["contents"][0]["parts"][0]["functionResponse"]["parts"]
-            .as_array()
-            .unwrap()
-            .is_empty());
-        assert_eq!(
-            body["contents"][0]["parts"][0]["functionResponse"]["response"]["cc_switch_media"],
-            UNSUPPORTED_IMAGE_MARKER
-        );
-        assert!(!body.to_string().contains("GEMINI_FUNCTION_SENTINEL"));
     }
 
     #[test]

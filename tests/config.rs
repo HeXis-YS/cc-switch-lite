@@ -197,31 +197,6 @@ fn documented_examples_are_valid() {
 }
 
 #[test]
-fn gemini_native_protocol_and_compat_defaults_parse_from_yaml() {
-    let base = VALID_CONFIG_YAML.replace("protocol: responses", "protocol: gemini_native");
-    let config: Config = serde_saphyr::from_str(&base).unwrap();
-    config.validate().unwrap();
-    assert_eq!(config.providers[0].protocol, Protocol::GeminiNative);
-    assert!(config.providers[0].compat.gemini.thought_signature_replay);
-    assert_eq!(
-        config.providers[0].compat.gemini.thinking,
-        cc_switch_lite::compat::request::GeminiThinking::Auto
-    );
-
-    let configured = base.replace(
-        "    api_key: \"test-private-key\"",
-        "    api_key: \"test-private-key\"\n    compat:\n      gemini:\n        thought_signature_replay: false\n        thinking: off",
-    );
-    let config: Config = serde_saphyr::from_str(&configured).unwrap();
-    config.validate().unwrap();
-    assert!(!config.providers[0].compat.gemini.thought_signature_replay);
-    assert_eq!(
-        config.providers[0].compat.gemini.thinking,
-        cc_switch_lite::compat::request::GeminiThinking::Off
-    );
-}
-
-#[test]
 fn provider_web_search_mode_defaults_to_auto_and_parses_off() {
     let config: Config = serde_saphyr::from_str(VALID_CONFIG_YAML).unwrap();
     assert_eq!(
@@ -238,19 +213,6 @@ fn provider_web_search_mode_defaults_to_auto_and_parses_off() {
         config.providers[0].compat.web_search,
         cc_switch_lite::compat::request::WebSearchCompat::Off
     );
-}
-
-#[test]
-fn gemini_native_rejects_api_key_query_auth_even_for_full_urls() {
-    let mut config = valid_config();
-    config.providers[0].protocol = Protocol::GeminiNative;
-    config.providers[0].base_url =
-        "https://example.com/v1beta/models/gemini-2.5-flash:generateContent?key=private-key".into();
-    config.providers[0].compat.meta.is_full_url = Some(true);
-
-    let error = config.validate().unwrap_err().to_string();
-    assert!(error.contains("api_key header"));
-    assert!(!error.contains("private-key"));
 }
 
 #[test]

@@ -37,7 +37,7 @@ fn requests_preserve_baseline() {
         json!({"model":"gpt-5","input":"hello","stream":true,"reasoning":{"effort":"high"}}),
         json!({"model":"claude-opus-4-6","instructions":"be useful","input":[{"role":"user","content":[{"type":"input_text","text":"你好"},{"type":"input_image","image_url":"data:image/png;base64,YQ=="}]}]}),
         json!({"model":"kimi-k2.5","input":[{"type":"function_call","call_id":"call_1","name":"weather","arguments":"{\"z\":2,\"a\":1}"},{"type":"function_call_output","call_id":"call_1","output":"sunny"}],"tools":[{"type":"function","name":"weather","parameters":{"type":"object","properties":{"city":{"type":"string"}}}}]}),
-        json!({"model":"gemini-3-pro","input":[{"role":"assistant","content":"<think>reason</think>answer"},{"role":"user","content":"continue"}],"reasoning":{"effort":"none"}}),
+        json!({"model":"chat-test-model","input":[{"role":"assistant","content":"<think>reason</think>answer"},{"role":"user","content":"continue"}],"reasoning":{"effort":"none"}}),
         json!({"model":"claude-mythos-5","max_output_tokens":16000,"reasoning":{"effort":"high"},"input":"think"}),
         json!({"model":"gpt-5","input":[{"type":"function_call_output","call_id":"missing","output":"orphan"}]}),
         json!({"model":"gpt-5","input":"hi","tools":[{"type":"namespace","name":"functions","tools":[{"type":"function","name":"read","parameters":{"type":"object"}}]}]}),
@@ -208,7 +208,7 @@ async fn request_pipeline_preserves_baseline() {
             Protocol::ChatCompletions,
             "chat",
             "https://example.org/v1",
-            json!({"model":"gemini-3-pro","input":[{"type":"function_call","call_id":"call_1","name":"read","arguments":"{}"},{"type":"function_call_output","call_id":"call_1","output":"ok"}]}),
+            json!({"model":"chat-test-model","input":[{"type":"function_call","call_id":"call_1","name":"read","arguments":"{}"},{"type":"function_call_output","call_id":"call_1","output":"ok"}]}),
         ),
         (
             Protocol::Messages,

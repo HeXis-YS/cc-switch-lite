@@ -103,7 +103,7 @@
   },
   {
     "Ok": {
-      "model": "gemini-3-pro",
+      "model": "chat-test-model",
       "messages": [
         {
           "role": "user",

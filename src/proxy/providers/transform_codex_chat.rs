@@ -7,9 +7,8 @@
 //! OpenAI-compatible Chat Completions endpoint.
 
 use super::codex_chat_common::{
-    append_reasoning_content, copy_tool_call_extra_content, extract_reasoning_field_text,
-    extract_reasoning_summary_text, response_function_call_item,
-    response_function_call_item_with_namespace,
+    append_reasoning_content, extract_reasoning_field_text, extract_reasoning_summary_text,
+    response_function_call_item, response_function_call_item_with_namespace,
 };
 use super::inline_think::split_leading_think_block;
 use super::transform::unwrap_chat_completion_envelope;
@@ -579,7 +578,7 @@ fn apply_reasoning_options(
             result["reasoning_effort"] = json!(mapped);
         }
         // OpenRouter 原生归一化对象：reasoning.effort 会被 OpenRouter 翻译成各底层模型
-        // （OpenAI/Grok/Gemini/Anthropic）的正确推理参数，覆盖面比顶层 OpenAI 别名更全。
+        // （OpenAI/Grok/Anthropic）的正确推理参数，覆盖面比顶层 OpenAI 别名更全。
         // 本转换从空对象构造、不残留原始 reasoning 对象，故不会出现 reasoning 与
         // reasoning_effort 并存触发 400 的情况（参见 openclaw#24119）。
         "reasoning.effort" => {
@@ -942,22 +941,19 @@ fn append_responses_item_as_chat_message(
     match item_type {
         Some("function_call") => {
             append_unique_pending_reasoning(pending_reasoning, responses_item_reasoning_text(item));
-            let mut tool_call = responses_function_call_to_chat_tool_call(item, tool_context);
-            copy_tool_call_extra_content(&mut tool_call, item);
+            let tool_call = responses_function_call_to_chat_tool_call(item, tool_context);
             register_known_tool_call_id(known_tool_call_ids, &tool_call);
             pending_tool_calls.push(tool_call);
         }
         Some("custom_tool_call") => {
             append_unique_pending_reasoning(pending_reasoning, responses_item_reasoning_text(item));
-            let mut tool_call = responses_custom_tool_call_to_chat_tool_call(item, tool_context);
-            copy_tool_call_extra_content(&mut tool_call, item);
+            let tool_call = responses_custom_tool_call_to_chat_tool_call(item, tool_context);
             register_known_tool_call_id(known_tool_call_ids, &tool_call);
             pending_tool_calls.push(tool_call);
         }
         Some("tool_search_call") => {
             append_unique_pending_reasoning(pending_reasoning, responses_item_reasoning_text(item));
-            let mut tool_call = responses_tool_search_call_to_chat_tool_call(item);
-            copy_tool_call_extra_content(&mut tool_call, item);
+            let tool_call = responses_tool_search_call_to_chat_tool_call(item);
             register_known_tool_call_id(known_tool_call_ids, &tool_call);
             pending_tool_calls.push(tool_call);
         }
@@ -1357,7 +1353,7 @@ fn append_orphan_tool_output_as_user_message(messages: &mut Vec<Value>, item: &V
 /// 纯文本序列化，不给无媒体输出多加一层 JSON 包装。
 ///
 /// 孤儿路径的媒体就挂在这条 user 消息自己的后续 parts 里，占位符用
-/// `TOOL_RESULT_MEDIA_ATTACHED_MARKER`（与 Anthropic/Gemini/Responses
+/// `TOOL_RESULT_MEDIA_ATTACHED_MARKER`（与 Anthropic/Responses
 /// bridge 的"媒体已作为原生媒体挂载"用词一致）。
 fn plan_orphan_tool_output_body(output: Option<&Value>) -> (String, Vec<Value>) {
     if let Some(plan) = output.cloned().and_then(|output| {
@@ -2375,7 +2371,7 @@ fn chat_tool_call_to_response_item(
     let arguments = canonicalize_tool_arguments(function.get("arguments"));
 
     let item_id = response_tool_call_item_id_from_chat_name(&call_id, name, tool_context);
-    let mut item = response_tool_call_item_from_chat_name(
+    response_tool_call_item_from_chat_name(
         &item_id,
         "completed",
         &call_id,
@@ -2383,9 +2379,7 @@ fn chat_tool_call_to_response_item(
         &arguments,
         reasoning,
         tool_context,
-    );
-    copy_tool_call_extra_content(&mut item, tool_call);
-    item
+    )
 }
 
 fn chat_legacy_function_call_to_response_item(
@@ -2703,9 +2697,9 @@ pub fn chat_error_to_response_error(body: Option<&Value>) -> Value {
         .or_else(|| source.pointer("/base_resp/status_code").cloned())
         .unwrap_or(serde_json::Value::Null);
 
-    // Gemini uses numeric HTTP codes (or no code at all) for this error. Codex
-    // only recognizes context_length_exceeded as a context-budget failure;
-    // INVALID_ARGUMENT/upstream_error cannot trigger its compaction recovery.
+    // Some Chat gateways use numeric HTTP codes (or no code at all) for this
+    // error. Codex only recognizes context_length_exceeded as a context-budget
+    // failure; generic bad-request errors cannot trigger compaction recovery.
     if message
         .to_ascii_lowercase()
         .contains("input token count exceeds the maximum number of tokens allowed")
@@ -6561,10 +6555,10 @@ mod tests {
     }
 
     #[test]
-    fn gemini_input_overflow_errors() {
+    fn chat_input_overflow_errors() {
         let message = "The input token count exceeds the maximum number of tokens allowed 1048576.";
         for input in [
-            json!({ "error": { "code": 400, "status": "INVALID_ARGUMENT", "message": message } }),
+            json!({ "error": { "code": 400, "status": "bad_request", "message": message } }),
             json!({ "error": { "type": "invalid_request_error", "message": message } }),
             json!({ "detail": message }),
             json!(message),
@@ -6574,7 +6568,7 @@ mod tests {
             assert_eq!(result["error"]["message"], message);
         }
         let ordinary_error = json!({ "error": {
-            "code": 400, "status": "INVALID_ARGUMENT",
+            "code": 400, "status": "bad_request",
             "message": "max_output_tokens exceeds the maximum number of tokens allowed 65536."
         } });
         assert_eq!(

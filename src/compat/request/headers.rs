@@ -31,23 +31,18 @@ pub(super) fn prepare_headers(source: HeaderSource<'_>) -> Result<HeaderMap, Pro
     } = source;
     let codex_responses_to_anthropic = provider.protocol == Protocol::Messages;
     let codex_responses_to_chat = provider.protocol == Protocol::ChatCompletions;
-    let codex_responses_to_gemini = provider.protocol == Protocol::GeminiNative;
-    let force_identity_encoding = codex_responses_to_chat
-        || codex_responses_to_anthropic
-        || codex_responses_to_gemini
-        || request_is_streaming;
+    let force_identity_encoding =
+        codex_responses_to_chat || codex_responses_to_anthropic || request_is_streaming;
     let upstream_host = url
         .parse::<http::Uri>()
         .ok()
         .and_then(|u| u.authority().map(|a| a.to_string()));
     let auth_name = if codex_responses_to_anthropic {
         "x-api-key"
-    } else if codex_responses_to_gemini {
-        "x-goog-api-key"
     } else {
         "authorization"
     };
-    let auth_value = if codex_responses_to_anthropic || codex_responses_to_gemini {
+    let auth_value = if codex_responses_to_anthropic {
         provider.api_key.clone()
     } else {
         format!("Bearer {}", provider.api_key)
@@ -177,10 +172,7 @@ pub(super) fn prepare_headers(source: HeaderSource<'_>) -> Result<HeaderMap, Pro
         }
 
         // --- Codex/OpenAI fingerprint headers are not Anthropic protocol headers. ---
-        if should_strip_codex_client_fingerprint_header(
-            key_str,
-            codex_responses_to_anthropic || codex_responses_to_gemini,
-        ) {
+        if should_strip_codex_client_fingerprint_header(key_str, codex_responses_to_anthropic) {
             continue;
         }
 

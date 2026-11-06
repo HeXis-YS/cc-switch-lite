@@ -5,22 +5,6 @@ Migration source: commit `214e75ba7f625c679dd4e61df166ec4463245fe7`, `src-tauri/
 including the user's local commits noted below.
 Copyright (c) 2025 Jason Young, MIT; see `LICENSE-cc-switch`.
 
-## Native Gemini conversion
-
-The native Gemini URL resolver and conversion helpers were selected from the
-same MIT source revision: `src/proxy/gemini_url.rs` and
-`src/proxy/providers/{gemini_schema,gemini_shadow,transform_gemini,streaming_gemini}.rs`.
-The local proxy connects them through Responses → Anthropic Messages → Gemini
-requests and Gemini → Anthropic Messages → Responses replies. Local changes
-cover Provider-scoped process memory, optional thought-signature replay,
-synthetic tool-call IDs, Responses JSON-schema mapping, Gemini 3+ thinking
-levels, and terminal-event handling for incomplete streams.
-
-This integration uses API-key authentication through `x-goog-api-key`. It does
-not implement Google OAuth, Vertex AI URL construction, or remote media fetches.
-Images and documents are sent as Base64 `inlineData`; unsupported remote media
-sources fail before an upstream request.
-
 Selected fixes from public `cc-switch v4.0.21` (`c4db63c60d2a1ddcb4bd9f81152b9c6126413659`):
 
 - `80640b52`: unwrap non-streaming Chat completion `data` envelopes. The owned

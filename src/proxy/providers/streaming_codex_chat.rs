@@ -4,7 +4,7 @@
 
 use super::codex_responses_sse as sse;
 use super::{
-    codex_chat_common::{extract_reasoning_field_text, tool_call_extra_content},
+    codex_chat_common::extract_reasoning_field_text,
     codex_compaction,
     inline_think::InlineThinkSplitter,
     transform_codex_chat::{
@@ -47,8 +47,6 @@ struct ToolCallState {
     name: String,
     arguments: String,
     reasoning_content: String,
-    /// 上游 tool call 的 `extra_content`（Gemini thought signature），完成时原样挂回。
-    extra_content: Option<Value>,
     added: bool,
     done: bool,
 }
@@ -330,9 +328,6 @@ impl ChatToResponsesState {
             }
             if !args_delta.is_empty() {
                 state.arguments.push_str(&args_delta);
-            }
-            if let Some(extra) = tool_call_extra_content(tool_call) {
-                state.extra_content = Some(extra.clone());
             }
             if state.reasoning_content.is_empty() {
                 if let Some(reasoning) = reasoning.map(str::trim).filter(|value| !value.is_empty())
@@ -657,7 +652,7 @@ impl ChatToResponsesState {
             let output_index = state.output_index.unwrap_or(0);
             let arguments = canonicalize_tool_arguments_str(&state.arguments);
             let is_custom_tool = self.tool_context.is_custom_tool_chat_name(&state.name);
-            let mut item = response_tool_call_item_from_chat_name(
+            let item = response_tool_call_item_from_chat_name(
                 &state.item_id,
                 "completed",
                 &state.call_id,
@@ -666,9 +661,6 @@ impl ChatToResponsesState {
                 Some(&state.reasoning_content),
                 &self.tool_context,
             );
-            if let (Some(extra), Some(obj)) = (&state.extra_content, item.as_object_mut()) {
-                obj.insert("extra_content".to_string(), extra.clone());
-            }
             state.done = true;
             self.output_items.push((output_index, item.clone()));
 
@@ -1025,36 +1017,6 @@ mod tests {
         assert!(output.contains("event: response.function_call_arguments.done"));
         assert!(output.contains("\"type\":\"function_call\""));
         assert!(output.contains("\"call_id\":\"call_1\""));
-    }
-
-    #[tokio::test]
-    async fn keeps_gemini_tool_call_extra_content_on_done_item() {
-        let output = collect(vec![
-            "data: {\"id\":\"chatcmpl_gemini\",\"model\":\"gemini-4-argon\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"exec_command\",\"arguments\":\"{\\\"cmd\\\":\\\"ls\\\"}\"},\"extra_content\":{\"google\":{\"thought_signature\":\"sig-abc\"}}}]},\"finish_reason\":\"tool_calls\"}]}\n\n",
-            "data: [DONE]\n\n",
-        ])
-        .await;
-
-        let events = parse_sse_events(&output);
-        let done = events
-            .iter()
-            .find(|event| {
-                event["type"] == "response.output_item.done"
-                    && event["item"]["type"] == "function_call"
-            })
-            .unwrap();
-        assert_eq!(
-            done["item"]["extra_content"]["google"]["thought_signature"],
-            "sig-abc"
-        );
-        let completed = events
-            .iter()
-            .find(|event| event["type"] == "response.completed")
-            .unwrap();
-        assert_eq!(
-            completed["response"]["output"][0]["extra_content"]["google"]["thought_signature"],
-            "sig-abc"
-        );
     }
 
     #[tokio::test]
@@ -1512,7 +1474,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn gemini_sse_numeric_error_code_preserves_message() {
+    async fn sse_numeric_error_code_preserves_message() {
         for prefix in ["", "event: error\n"] {
             let chunk = format!(
                 "{prefix}data: {{\"error\":{{\"code\":429,\"status\":\"RESOURCE_EXHAUSTED\",\"message\":\"Quota exceeded for metric\"}}}}\n\n"
@@ -1534,7 +1496,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn gemini_sse_overflow_preserves_the_code_codex_uses_for_compaction() {
+    async fn sse_context_overflow_preserves_the_code_codex_uses_for_compaction() {
         let output = collect(vec![
             "data: {\"error\":{\"code\":400,\"status\":\"INVALID_ARGUMENT\",\"message\":\"The input token count exceeds the maximum number of tokens allowed 1048576.\"}}\n\n",
             "data: [DONE]\n\n",

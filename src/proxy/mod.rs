@@ -2,7 +2,6 @@ pub mod body_filter;
 pub mod cache_injector;
 pub mod content_encoding;
 pub mod error;
-pub mod gemini_url;
 pub mod json_canonical;
 pub mod media_sanitizer;
 pub(crate) mod mime;

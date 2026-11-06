@@ -87,7 +87,7 @@ fn hyphenated_codex_headers_do_not_identify_other_clients() {
     let mut headers = HeaderMap::new();
     headers.insert("session-id", "native-session-123456789".parse().unwrap());
     headers.insert("thread-id", "native-thread-123456789".parse().unwrap());
-    for client_format in ["claude", "claude-desktop", "grokbuild", "gemini"] {
+    for client_format in ["claude", "claude-desktop", "grokbuild"] {
         let result = extract_session_id(&headers, &json!({}), client_format);
         assert_eq!(result.source, SessionIdSource::Generated, "{client_format}");
         assert!(!result.client_provided);

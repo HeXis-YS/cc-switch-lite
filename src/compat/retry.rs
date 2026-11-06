@@ -50,33 +50,6 @@ pub fn validate_anthropic_body(body: &[u8]) -> Result<(), ProxyError> {
     Ok(())
 }
 
-pub fn validate_gemini_body(body: &[u8]) -> Result<(), ProxyError> {
-    let Some(message) = gemini_error_envelope_message(body) else {
-        return Ok(());
-    };
-    Err(ProxyError::TransformError(format!(
-        "Gemini upstream returned a 2xx error envelope: {message}"
-    )))
-}
-
-fn gemini_error_envelope_message(body: &[u8]) -> Option<String> {
-    let value: Value = serde_json::from_slice(body).ok()?;
-    let error = value.get("error")?;
-    let status = error.get("status").and_then(Value::as_str);
-    let message = error
-        .get("message")
-        .and_then(Value::as_str)
-        .or_else(|| error.as_str())
-        .unwrap_or("upstream error");
-    if status.is_none() && error.get("message").is_none() {
-        return None;
-    }
-    Some(match status {
-        Some(status) => format!("{status}: {message}"),
-        None => message.to_string(),
-    })
-}
-
 fn codex_anthropic_error_envelope_message(body: &[u8]) -> Option<String> {
     let value: Value = serde_json::from_slice(body).ok()?;
     if value.get("type").and_then(Value::as_str) != Some("error") && value.get("error").is_none() {
@@ -186,26 +159,4 @@ pub async fn hold_encrypted_agent_task_stream(
     *response.status_mut() = status;
     *response.headers_mut() = headers;
     Ok(response.into())
-}
-
-#[cfg(test)]
-mod gemini_validation_tests {
-    use super::validate_gemini_body;
-
-    #[test]
-    fn detects_gemini_error_status_in_a_success_body() {
-        let result = validate_gemini_body(
-            br#"{"error":{"status":"INVALID_ARGUMENT","message":"bad request"}}"#,
-        );
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("INVALID_ARGUMENT"));
-    }
-
-    #[test]
-    fn leaves_prompt_feedback_for_refusal_conversion() {
-        assert!(validate_gemini_body(
-            br#"{"promptFeedback":{"blockReason":"SAFETY"},"usageMetadata":{"promptTokenCount":2,"totalTokenCount":2}}"#
-        )
-        .is_ok());
-    }
 }

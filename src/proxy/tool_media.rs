@@ -21,12 +21,6 @@ const MAX_MEDIA_TRAVERSAL_DEPTH: usize = 32;
 pub(crate) enum ToolMediaScope {
     /// Used by the existing image-capability sanitizer and its retry path.
     ImagesOnly,
-    /// Used by Gemini Native `generateContent`, whose existing bridge only
-    /// promises inline base64 image input. Remote URLs and malformed data URLs
-    /// must stay in the legacy tool-result representation.
-    #[allow(dead_code)]
-    // Retained upstream variant; native image-only consumers are outside the Codex route.
-    InlineImagesOnly,
     /// Used by Chat conversion bridges, where user messages can carry all
     /// currently mapped Chat input modalities.
     AllSupported,
@@ -47,10 +41,6 @@ pub(crate) struct ChatToolOutputMediaPlan {
 impl ToolMediaScope {
     fn allows(self, kind: ToolMediaKind) -> bool {
         matches!(kind, ToolMediaKind::Image) || matches!(self, Self::AllSupported)
-    }
-
-    fn accepts_chat_part(self, part: &Value) -> bool {
-        !matches!(self, Self::InlineImagesOnly) || chat_image_part_has_inline_data(part)
     }
 }
 
@@ -157,7 +147,7 @@ pub(crate) fn chat_media_part_from_tool_part(part: &Value, scope: ToolMediaScope
         }),
     }?;
 
-    scope.accepts_chat_part(&chat_part).then_some(chat_part)
+    Some(chat_part)
 }
 
 /// Map a Responses `input_file` block to the Chat file payload. Kept here so
@@ -577,18 +567,6 @@ fn image_url_content_part(image_url: Value) -> Value {
     Value::Object(content_part)
 }
 
-fn chat_image_part_has_inline_data(part: &Value) -> bool {
-    part.pointer("/image_url/url")
-        .and_then(Value::as_str)
-        .is_some_and(|url| {
-            let trimmed = url.trim();
-            let Some(comma_index) = trimmed.find(',') else {
-                return false;
-            };
-            comma_index + 1 < trimmed.len() && is_image_base64_data_url(trimmed)
-        })
-}
-
 fn merge_top_level_detail(part: &Value, image_url: &mut Map<String, Value>) {
     if image_url.get("detail").is_none() {
         if let Some(detail) = part.get("detail") {
@@ -791,43 +769,6 @@ mod tests {
         assert!(!tool_output_contains_media(
             &remote,
             ToolMediaScope::ImagesOnly
-        ));
-    }
-
-    #[test]
-    fn inline_image_scope_rejects_remote_and_malformed_data_urls() {
-        let inline = json!({
-            "type": "image_url",
-            "image_url": {"url": "data:image/png;base64,YWJj"}
-        });
-        let remote = json!({
-            "type": "image_url",
-            "image_url": {"url": "https://example.com/image.png"}
-        });
-        let missing_base64 = json!({
-            "type": "image_url",
-            "image_url": {"url": "data:image/png,YWJj"}
-        });
-        let empty_data = json!({
-            "type": "image_url",
-            "image_url": {"url": "data:image/png;base64,"}
-        });
-
-        assert!(tool_output_contains_media(
-            &inline,
-            ToolMediaScope::InlineImagesOnly
-        ));
-        assert!(!tool_output_contains_media(
-            &remote,
-            ToolMediaScope::InlineImagesOnly
-        ));
-        assert!(!tool_output_contains_media(
-            &missing_base64,
-            ToolMediaScope::InlineImagesOnly
-        ));
-        assert!(!tool_output_contains_media(
-            &empty_data,
-            ToolMediaScope::InlineImagesOnly
         ));
     }
 

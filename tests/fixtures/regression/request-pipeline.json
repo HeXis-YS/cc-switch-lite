@@ -42,11 +42,6 @@
         "role": "assistant",
         "tool_calls": [
           {
-            "extra_content": {
-              "google": {
-                "thought_signature": "skip_thought_signature_validator"
-              }
-            },
             "function": {
               "arguments": "{}",
               "name": "read"
@@ -62,7 +57,7 @@
         "tool_call_id": "call_1"
       }
     ],
-    "model": "gemini-3-pro"
+    "model": "chat-test-model"
   },
   {
     "max_tokens": 128000,

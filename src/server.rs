@@ -8,7 +8,7 @@ use crate::{
             unreadable_agent_task_error,
         },
         providers::{
-            codex_chat_history::CodexChatHistoryStore, gemini_shadow::GeminiShadowStore,
+            codex_chat_history::CodexChatHistoryStore,
             transform_codex_chat::build_codex_tool_context_from_request_with_web_search,
         },
     },
@@ -30,7 +30,6 @@ struct App {
     config: Config,
     client: reqwest::Client,
     history: Arc<CodexChatHistoryStore>,
-    gemini_shadow: Arc<GeminiShadowStore>,
 }
 pub fn router(config: Config) -> anyhow::Result<Router> {
     config.validate()?;
@@ -46,7 +45,6 @@ pub fn router(config: Config) -> anyhow::Result<Router> {
             config,
             client,
             history: Arc::default(),
-            gemini_shadow: Arc::default(),
         })))
 }
 pub async fn serve(config: Config) -> anyhow::Result<()> {
@@ -170,10 +168,8 @@ async fn forward(
     query: Option<&str>,
 ) -> Result<Response, ProxyError> {
     let mut retried = false;
-    let accept_web_search = matches!(
-        provider.protocol,
-        Protocol::Messages | Protocol::GeminiNative
-    ) && provider.compat.web_search.is_enabled();
+    let accept_web_search =
+        provider.protocol == Protocol::Messages && provider.compat.web_search.is_enabled();
     let context = build_codex_tool_context_from_request_with_web_search(
         &input,
         accept_web_search,
@@ -181,7 +177,7 @@ async fn forward(
     );
     let mut request_context =
         request::build_context(provider.protocol, provider, headers, &input, query);
-    let mut stable_response_options = request_context.response_options(model, streaming);
+    let stable_response_options = request_context.response_options(model, streaming);
     loop {
         let prepared = request::prepare_attempt(
             &mut request_context,
@@ -190,11 +186,8 @@ async fn forward(
             headers,
             &app.config.compat,
             &app.history,
-            Some(&app.gemini_shadow),
         )
         .await?;
-        stable_response_options.gemini_tool_schema_hints =
-            prepared.gemini_tool_schema_hints.clone();
         let attempted = transport::send(app, provider.protocol, &prepared).await;
         match attempted {
             Ok(upstream) => {
@@ -204,7 +197,6 @@ async fn forward(
                     stable_response_options,
                     context,
                     app.history.clone(),
-                    app.gemini_shadow.clone(),
                 )
                 .await;
             }
