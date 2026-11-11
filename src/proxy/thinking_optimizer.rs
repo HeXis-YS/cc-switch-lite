@@ -45,16 +45,22 @@ fn normalize_model_name(model: &str) -> String {
 }
 
 /// The Opus 5.5 compatibility behavior, also enabled for the explicitly selected
-/// Sonnet 5.5, Fable 5.1, and Haiku 5.5 models. Haiku 5.5 is unverified upstream.
+/// Sonnet 5.5, Fable 5.1/5.2, and Haiku 5.5 models. Haiku 5.5 is unverified upstream.
 pub(crate) fn supports_unsigned_adaptive_tools(model: &str) -> bool {
     let normalized = normalize_model_name(model);
-    ["opus-5-5", "sonnet-5-5", "fable-5-1", "haiku-5-5"]
-        .iter()
-        .any(|needle| {
-            normalized
-                .split_once(needle)
-                .is_some_and(|(_, suffix)| suffix.is_empty() || suffix.starts_with('-'))
-        })
+    [
+        "opus-5-5",
+        "sonnet-5-5",
+        "fable-5-1",
+        "fable-5-2",
+        "haiku-5-5",
+    ]
+    .iter()
+    .any(|needle| {
+        normalized
+            .split_once(needle)
+            .is_some_and(|(_, suffix)| suffix.is_empty() || suffix.starts_with('-'))
+    })
 }
 
 #[cfg(test)]
@@ -66,6 +72,7 @@ mod tests {
         for model in [
             "claude-sonnet-5",
             "anthropic/claude-fable-5",
+            "claude-fable-5.2",
             "claude-mythos-5",
             "claude-opus-5",
             "claude-opus-4.8",
@@ -78,6 +85,7 @@ mod tests {
             "claude-opus-5",
             "claude-opus-5-5",
             "claude-fable-5-1",
+            "claude-fable-5-2",
             "claude-mythos-5-1",
         ] {
             assert!(adaptive_thinking_is_default(model), "model={model}");
@@ -86,6 +94,9 @@ mod tests {
             assert!(!adaptive_thinking_is_default(model), "model={model}");
         }
         assert!(thinking_cannot_be_disabled("claude-fable-5"));
+        assert!(thinking_cannot_be_disabled("claude-fable-5.2"));
         assert!(!thinking_cannot_be_disabled("claude-sonnet-5"));
+        assert!(supports_unsigned_adaptive_tools("claude-fable-5.2"));
+        assert!(!supports_unsigned_adaptive_tools("claude-fable-5-20"));
     }
 }

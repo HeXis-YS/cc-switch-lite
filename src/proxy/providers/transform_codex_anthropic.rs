@@ -2514,6 +2514,7 @@ mod tests {
             "claude-opus-5-5",
             "claude-sonnet-5-5",
             "claude-fable-5-1",
+            "claude-fable-5.2",
             "claude-haiku-5-5",
         ] {
             let input = json!({
@@ -2557,6 +2558,7 @@ mod tests {
             "claude-opus-5",
             "claude-sonnet-5",
             "claude-fable-5",
+            "claude-fable-5-20",
             "claude-opus-5-50",
         ] {
             assert!(!crate::proxy::thinking_optimizer::supports_unsigned_adaptive_tools(model));

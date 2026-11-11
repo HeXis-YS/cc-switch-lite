@@ -49,7 +49,7 @@ Chat 和 Messages 的截断通过 `response.incomplete` 报告；未完成的工
 Messages 不支持无 schema 的 `json_object` 请求。实际 schema 和模型支持由上游校验。
 
 Messages 转换对 Opus 5.5 应用 [cc-switch #8048](https://github.com/farion1231/cc-switch/pull/8048)，
-并按本项目指定范围对 Sonnet 5.5、Fable 5.1、Haiku 5.5 启用相同行为：保留 adaptive thinking，允许完整的无签名工具历史。
+并对 Sonnet 5.5、Fable 5.1/5.2、Haiku 5.5 启用相同行为：保留 adaptive thinking，允许完整的无签名工具历史。
 强制工具选择转为 `auto` 并追加调用指令；指定工具时仅保留该工具。这是尽力满足调用意图，不能保证强制调用。
 **Haiku 5.5 未经验证**，该兼容行为是否适用于真实上游尚未确认；本地回归测试不代表这些模型已通过远程供应商验证。
 
